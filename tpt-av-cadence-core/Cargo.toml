@@ -1,0 +1,13 @@
+[package]
+name = "tpt-av-cadence-core"
+description = "Core traits and types for the tpt-cadence audio codec suite: the Decoder trait, StreamInfo, format enums, and error handling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+byteorder = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

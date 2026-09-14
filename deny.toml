@@ -1,0 +1,36 @@
+# cargo-deny configuration for tpt-cadence.
+#
+# The project's core tenet is a purely permissive dependency tree: no GPL,
+# LGPL, AGPL, or MPL may appear anywhere in the graph. Run with:
+#
+#   cargo deny check licenses
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+
+# Everything we allow, everything transitively pulled in must be on this list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    # unicode-ident (transitive via thiserror/proc-macro2 toolchain crates)
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "AGPL-3.0",
+    "MPL-2.0",
+]
+
+confidence-threshold = 0.93

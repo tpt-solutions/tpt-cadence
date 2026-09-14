@@ -1,0 +1,15 @@
+[package]
+name = "tpt-av-cadence-opus"
+description = "Opus (RFC 6716) decoder for the tpt-cadence audio codec suite."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tpt-av-cadence-core = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

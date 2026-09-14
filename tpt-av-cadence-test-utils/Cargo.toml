@@ -1,0 +1,12 @@
+[package]
+name = "tpt-av-cadence-test-utils"
+description = "Shared conformance-testing harness for tpt-cadence: FFmpeg comparison, fuzz helpers, and checksum utilities."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tpt-av-cadence-core = { workspace = true }
+thiserror = { workspace = true }

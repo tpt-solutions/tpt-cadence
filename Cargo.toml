@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "tpt-av-cadence-core",
+    "tpt-av-cadence-pcm",
+    "tpt-av-cadence-wav",
+    "tpt-av-cadence-aiff",
+    "tpt-av-cadence-flac",
+    "tpt-av-cadence-opus",
+    "tpt-av-cadence-aac",
+    "tpt-av-cadence-mp3",
+    "tpt-av-cadence-vorbis",
+    "tpt-av-cadence-test-utils",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tpt-solutions/tpt-cadence"
+rust-version = "1.75"
+
+[workspace.dependencies]
+tpt-av-cadence-core = { path = "tpt-av-cadence-core", version = "0.1.0" }
+tpt-av-cadence-test-utils = { path = "tpt-av-cadence-test-utils", version = "0.1.0" }
+byteorder = "1.5"
+thiserror = "2"
+log = "0.4"
+proptest = "1"
+
+[profile.release]
+lto = "thin"

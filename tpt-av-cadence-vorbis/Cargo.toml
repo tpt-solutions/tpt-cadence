@@ -1,0 +1,12 @@
+[package]
+name = "tpt-av-cadence-vorbis"
+description = "vorbis decoder for the tpt-cadence audio codec suite (under construction)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tpt-av-cadence-core = { workspace = true }
+log = { workspace = true }
