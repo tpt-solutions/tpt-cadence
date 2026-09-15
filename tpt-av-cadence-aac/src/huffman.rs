@@ -78,7 +78,6 @@ impl HuffmanTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn write_bits(pairs: &[(u32, u32)]) -> Vec<u8> {
         // packs (len, code) pairs MSB-first

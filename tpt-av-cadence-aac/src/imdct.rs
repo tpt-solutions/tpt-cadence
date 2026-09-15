@@ -60,50 +60,49 @@ pub fn kbd_window(n: usize, alpha: f64) -> Vec<f32> {
 /// `input` holds N/2 spectral coefficients; `output` receives N samples.
 #[allow(clippy::needless_range_loop)]
 pub struct Mdct {
-    /// cos table: table[n * half + k].
+    /// cos table: table[n * m + k], n over the full 2M synthesis.
     table: Box<[f32]>,
-    n: usize,
+    m: usize,
 }
 
 impl Mdct {
-    /// Builds the synthesis table with the given overall scale folded in.
-    pub fn with_scale(n: usize, scale: f64) -> Self {
-        let half = n / 2;
-        let mut table = vec![0.0f32; half * n];
-        for k in 0..half {
-            for ni in 0..n {
-                let angle = std::f64::consts::PI / n as f64
-                    * (ni as f64 + n as f64 / 4.0 + 0.5)
+    /// M = number of spectral coefficients; synthesis is 2M samples:
+    /// x(n) = (−1/M)·Σ X(k)·cos(π/(2M)·(n + M/2 + ½)·(2k+1)).
+    /// (The −1/M scale is the ISO normalization; the sign is the standard
+    /// MDCT phase convention.)
+    pub fn new(m: usize) -> Self {
+        let mut table = vec![0.0f32; 2 * m * m];
+        let scale = -1.0 / m as f64;
+        for n in 0..2 * m {
+            for k in 0..m {
+                let angle = std::f64::consts::PI / (2.0 * m as f64)
+                    * (n as f64 + m as f64 / 2.0 + 0.5)
                     * (2.0 * k as f64 + 1.0);
-                table[ni * half + k] = (scale * angle.cos()) as f32;
+                table[n * m + k] = (scale * angle.cos()) as f32;
             }
         }
         Mdct {
             table: table.into_boxed_slice(),
-            n,
+            m,
         }
     }
 
-    pub fn new(n: usize) -> Self {
-        Self::with_scale(n, 2.0 / n as f64)
-    }
-
-    /// `output[n] = Σ_k input[k] · table[n][k]` (the 2/N scale is folded in).
+    /// `input` holds M spectral coefficients; `output` receives 2M samples.
     #[allow(clippy::needless_range_loop)]
     pub fn imdct(&self, input: &[f32], output: &mut [f32]) {
-        let half = self.n / 2;
-        for ni in 0..self.n {
-            let row = &self.table[ni * half..ni * half + half];
+        let m = self.m;
+        for n in 0..2 * m {
+            let row = &self.table[n * m..n * m + m];
             let mut acc = 0.0f32;
-            for k in 0..half {
+            for k in 0..m {
                 acc += input[k] * row[k];
             }
-            output[ni] = acc;
+            output[n] = acc;
         }
     }
 }
 
-/// Overlap-add windowing (FFmpeg `vector_fmul_window`).
+// Overlap-add windowing (FFmpeg `vector_fmul_window`).
 ///
 /// `dst[i] = saved[i]·win[i] − buf[i]·win[len2·2−1−i]` for the first half
 /// and the mirrored sum for the second half, where `len2` is half the
@@ -146,14 +145,79 @@ mod tests {
     }
 
     #[test]
-    fn imdct_is_linear_and_matches_definition() {
-        let n = 8;
-        let mdct = Mdct::new(n);
+    fn imdct_matches_definition() {
+        // M = 4 coefficients → 8 synthesis samples.
+        let m = 4;
+        let mdct = Mdct::new(m);
         let input = [1.0f32, 0.0, 0.0, 0.0];
         let mut output = [0.0f32; 8];
         mdct.imdct(&input, &mut output);
-        // x(0) = (2/8)·cos(π/8·(0+2+0.5)·1) = 0.25·cos(π·2.5/8)
-        let expect0 = (0.25f64 * (std::f64::consts::PI / 8.0 * 2.5).cos()) as f32;
+        // x(0) = (−1/4)·cos(π/8·(0 + 2 + 0.5)·1) = −0.25·cos(π·2.5/8)
+        let expect0 = (-0.25f64 * (std::f64::consts::PI / 8.0 * 2.5).cos()) as f32;
         assert!((output[0] - expect0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mdct_tdac_perfect_reconstruction() {
+        // Analysis (same kernel, windowed) + synthesis + overlap-add must
+        // reconstruct a random signal exactly when the window pair satisfies
+        // w_first(n)² + w_second(n)² = 1.
+        let m = 128usize;
+        let half = sine_half(m);
+        let win: Vec<f32> = half.iter().chain(half.iter().rev()).copied().collect();
+
+        let mut state = 123456789u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let hops = 8;
+        let signal: Vec<f32> = (0..(hops + 2) * m)
+            .map(|_| (next() % 2000) as f32 / 16384.0 - 0.06)
+            .collect();
+
+        {
+            let mdct = Mdct::new(m);
+            let mut out = vec![0.0f32; (hops + 2) * m];
+            for hop in 0..hops {
+                let block = &signal[hop * m..hop * m + 2 * m];
+                let mut coeffs = vec![0.0f32; m];
+                #[allow(clippy::needless_range_loop)]
+                for k in 0..m {
+                    let mut acc = 0.0f64;
+                    for n in 0..2 * m {
+                        let angle = std::f64::consts::PI / (2.0 * m as f64)
+                            * (n as f64 + m as f64 / 2.0 + 0.5)
+                            * (2.0 * k as f64 + 1.0);
+                        acc += (block[n] * win[n]) as f64 * angle.cos();
+                    }
+                    // ISO analysis carries a leading −2.
+                    coeffs[k] = (-2.0 * acc) as f32;
+                }
+                let mut y = vec![0.0f32; 2 * m];
+                mdct.imdct(&coeffs, &mut y);
+                for n in 0..2 * m {
+                    y[n] *= win[n];
+                }
+                for n in 0..2 * m {
+                    out[hop * m + n] += y[n];
+                }
+            }
+            let mut max_err = 0.0f32;
+            for t in m..hops * m {
+                max_err = max_err.max((out[t] - signal[t]).abs());
+            }
+            assert!(max_err < 1e-3, "TDAC PR failed: max_err = {max_err}");
+        }
+    }
+
+    /// Half-window: sin(π(n+½)/(2·M)) ascending — pair condition holds with
+    /// its own reversal.
+    pub fn sine_half(m: usize) -> Vec<f32> {
+        (0..m)
+            .map(|i| ((i as f64 + 0.5) * std::f64::consts::PI / (2.0 * m as f64)).sin() as f32)
+            .collect()
     }
 }

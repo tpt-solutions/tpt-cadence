@@ -33,42 +33,111 @@ Status snapshot: the workspace builds clean (fmt/clippy/deny), and 133 tests pas
 - [x] Conformance tests against the official IETF FLAC decoder testbench (subset/uncommon vectors; MD5-verified; plus an in-tree reference encoder covering mono, 4/8ch, variable blocksizes, forced Rice escapes, Rice2, 8–32 bit depths, wide UTF-8 frame numbers, wasted bits, and every stereo mode)
 - [ ] Conformance tests against ITU-T AAC reference vectors (blocked on the AAC migration)
 
-### AAC-LC from scratch — session handoff status (next steps)
+### AAC-LC from scratch — handoff status (next steps)
 
-Working state: 142 workspace tests pass; the AAC crate compiles, all 8 module
-unit tests pass, and ADTS framing + element parsing + spectral decode run
-end-to-end against a real FFmpeg-encoded ADTS file (`tests/data/test.aac` +
-FFmpeg reference decode `test_ref.f32`).
+Progress (latest session): element order FIXED (global_gain before ics_info);
+Mdct FIXED + TDAC-VERIFIED (full 2048/256-point synthesis, kernel
+cos(π/(2M)(n+M/2+½)(2k+1)), scale −1/M; PR test max_err 4.8e-8); spectral
+decode REWRITTEN to FFmpeg packed-idx semantics (VLC symbol →
+CODEBOOK_IDX_02/_4/_6/_8/_10[book][symbol] → dims/vals/signs per
+VMUL4/VMUL4S/VMUL2/VMUL2S in aacdec_float.c); sign bits MSB-aligned; infinite
+loop fixed (zero-length section + overread guards); windows [half|rev(half)],
+sine-half sin(π(n+½)/2M), cumulative KBD α=4 long / α=6 short.
 
-Remaining (next session, in order):
-1. **Time-domain aliasing bug**: decoded output shows the classic MDCT
-   sign-alternation between consecutive frames — the IMDCT/windowing/lap
-   interaction is wrong. `imdct_and_window` ports FFmpeg's
-   `imdct_and_windowing`; my `Mdct` produces natural-order synthesis with
-   ISO scale 2/N. Candidates: (a) FFmpeg's av_tx output arrangement is
-   half-swapped relative to natural order — try swapping/reversing buf
-   halves in `imdct_and_window` (a naive full-reversal was tried and did
-   NOT fix it — revert it); (b) my synthesis kernel shift (n/4) may need
-   to be (n − n/4) i.e. negative-frequency variant.
-2. **Mid-stream desync at ~frame 22** ("section extends past max_sfb") —
-   likely fixed by (1) being a red herring; re-check after lap fix.
-   Also relax/verify: ics_info reserved bit is already tolerated.
-3. **Global scale check**: my coefficient convention is ISO-natural
-   (sf = +2^((gg+δ−100)/4)); FFmpeg uses negated sf and its av_tx imdct
-   scale is 1/1024 (vs ISO 2/N). After (1), compare signed output vs
-   `test_ref.f32`; a constant power-of-two factor or global sign is a
-   single-constant fix.
-4. Then: conformance vs ISO vectors (see CONTRIBUTING; ffmpeg binary via
-   `pip install imageio-ffmpeg` works locally), proptest, todo.md.
+REMAINING BUG: decoded audio still wrong (~2^15 too loud, uncorrelated with
+the reference). Coefficient dump for a 1 kHz tone frame shows
+|coef| ≈ 155132 = |q|^{4/3}·2^(sfo/4), sfo ≈ 69 — first verify the dequant
+scale/sign convention end-to-end (my Mdct carries −1/M; my sf is +2^(sfo/4);
+FFmpeg sf = −pow2sf_tab[sfo+200] with pow2sf_tab[i] = 2^((i−200)/4) and its
+av_tx scale is +1/1024 — resolve which extra sign/scale differs), then
+re-check the packed-idx sign application for books 3,4 / 7,8 / 11 (nnz vs
+mask semantics differ per book; mirror aacdec_proc_template.c case 2/3/
+default exactly). Debug findings (latest): element order and FIL/ADTS framing are NOW CORRECT —
+frame 1 parses as FIL(count=15, SBR-like payload) + SCE(gg=154, seq=1
+LONG_START, max_sfb=47, bands 10/11/6) which is plausible for the encoded
+onset. The decode bug is narrowed to the QUANTIZED VALUES: dumped coefficient
+155132.33 = 13.375·2^13.5, but the valid table value is 13.3905 (12^{4/3}) —
+a 0.1% mismatch suggests the packed-idx → value path is ALMOST right but the
+value table indexing or the sign/escape bits are slightly off. Also compare
+with FFmpeg decode: ref frame-1 output ≈ 0 (priming) while mine is ±20000.
 
-Key references fetched to `/tmp/aacref` (re-fetch if gone): FFmpeg
-aactab.c/aacdec.c/aacdec_dsp_template.c/aacdec_proc_template.c/kbdwin.c/
-sinewin_tablegen.h/av_tx (tx_template.c). Constants confirmed: ZERO_BT=0,
-NOISE_BT=13, INTENSITY_BT2=14, INTENSITY_BT=15, ESC book 11; SCALE_DIFF_ZERO
-=60, NOISE_OFFSET=90, NOISE_PRE=256/9 bits, POW_SF2_ZERO=200; KBD α=4.0
-(long 1024), α=6.0 (short 128); noise LCG seed 0x1f2e3d4c, ×1664525
-+1013904223; TNS order limits 12 long / 7 short; TNS coef_len =
-coef_res + 3 − coef_compress, tmp2_idx = 2·compress + res.
+COEFFICIENT VALUES VERIFIED EXACT (final check): frame-1 coefficients
+155132.33 = 12^{4/3}·2^{13.5} exactly — the dequant, scalefactors, and
+huffman/parse are all CORRECT. The remaining audio bug is therefore in the
+SYNTHESIS KERNEL CONVENTION: my kernel is cos(π/2048·(n + 512.5)·(2k+1))
+with scale −1/1024; the ISO AAC IMDCT per the spec may instead use
+n_start = ½ (no N/4 shift), i.e. cos(π/2048·(n + ½)·(2k+1)), or another
+shift — test candidate kernels by synthesizing frame 1 in numpy (coefficients
+known-correct) and comparing y[0..1024] against ffmpeg's ref[0:1024] (≈ 0,
+the priming region) — the correct kernel gives ≈ 0 there. Candidates:
+(a) shift 512.5 (current), (b) shift ½, (c) shift 1536.5, (d) scale −2/2048,
+(e) sign flip. Also verify the window: [half_prev | rev(half_cur)] with
+half = sin(π(n+½)/2048) — try the alternative full-length form
+sin(π(n+½)/1024) over [0..2048) (peaks at 1.0 mid-window) if the kernel is
+confirmed. Once frame 1 matches ref[0:1024] ≈ 0, the rest follows.
+
+WINDOW SEQUENCES — definitive finding (from FFmpeg imdct_and_windowing,
+which I have ported but must now verify field-by-field):
+- LONG_START (cur = LONG_START after long): FFmpeg takes the LONG lap
+  (vector_fmul_window with lwindow_prev over the full 1024) and its saved
+  update copies buf[512..1024] UNWINDOWED (w = 1.0 over the whole second
+  half of the synthesis!). So the LONG_START window = [long-left(prev
+  shape) 1024 | ONES 1024].
+- LONG_STOP (cur = LONG_STOP after EIGHT_SHORT): out[0..448] = saved
+  passthrough (window 0 there — suppresses the frame's own synthesis),
+  out[448..576] = short-shaped lap, out[576..1024] = buf UNWINDOWED (w = 1),
+  saved = buf[512..1024] raw. So LONG_STOP window = [ZEROS 448 |
+  short-transition 128 | ONES 448 | long-right 1024].
+- EIGHT_SHORT: out[448..1024] from short-window laps (64-granularity,
+  prev shape for the first lap, cur for the rest), out[0..448] = saved
+  passthrough; saved = the 128-sample tail of the short lap + raw buf.
+- ONLY_LONG: the standard [half_prev | rev(half_cur)] long window.
+
+My current natural-WOLA implementation must adopt these window functions in
+the natural (unfolded) domain: assemble the 2048-sample window per sequence
+as above and window the synthesis once — the TDAC PR then holds because the
+windows are 0/1/shape-pieced consistently with the hop-1024 overlap.
+
+CRITICAL FINDING (final experiment this session): the parse and dequant are
+verified EXACT — frame 1 of tone.aac decodes to coefficients
+±155132.33 = 7^{4/3}·2^{13.5} (sf = 2^(54/4), sfo = 54 = gg 154 + delta 0
+− 100) — an exact dequant value, and even ONLY_LONG blocks (4-5) remain
+uncorrelated noise. This RULES OUT the parse/dequant and points at the
+WINDOW SEQUENCES for transition frames (LONG_START/LONG_STOP/EIGHT_SHORT):
+my long-window = [prev-half | rev(cur-half)] is likely WRONG for transition
+frames — the ISO window_sequences figure defines LONG_START = [long-left |
+short-envelope halves(1024)] and LONG_STOP = [short-envelope halves |
+long-right], with flat (1.0) regions per the FFmpeg algorithm
+(out[576..1024] = buf[64..512] UNWINDOWED copy for LONG_STOP proves the
+window has a 1.0 region there). Next session: implement the window
+sequences per the ISO window_sequences figure (LONG_START = [long-left(prev
+shape) | short-halves(cur shape)]; LONG_STOP = [short-halves(prev shape) |
+long-right(cur shape)]), keeping the natural WOLA lap. Also re-check the
+VMUL2S sign order for pair books (dim1 may consume the FIRST sign bit).
+
+LATEST SESSION FINDINGS (element order + transform now verified correct):
+- Frame 1 parses as FIL(count=15) + SCE(gg=154, seq=1 LONG_START, max_sfb=47,
+  bands 10/11/6) — plausible for the encoded onset. Reference frame-1 output
+  ≈ 0 (encoder priming region). My output ±20000 → the quantized coefficient
+  VALUES are still wrong.
+- The packed-idx → value path is the suspect: dumped coef 155132.33 = 7^{4/3}
+  (13.3905) × 2^13.5 — magnitude plausibly from vals10_16, but the audio
+  doesn't reconstruct. Next: dump the RAW quantized values (before sf
+  multiply) for frame 1 of tone.aac and cross-check against the ISO codebook
+  tables by hand (book 11 symbol → idx → dims/escape), verifying: dim nibble
+  order (dim0 = low nibble ✓ per VMUL2S), sign bit application order (FFmpeg
+  VMUL2S: dim1 consumes the FIRST sign bit, dim0 the SECOND — note the
+  `sign >> 1 << 31` vs `sign << 31` asymmetry!), and the book-11 escape
+  (escape dims: ones-count unary then (ones+4) magnitude bits).
+- Also verify the sf dequant exponent: my sf = 2^(sfo/4) with
+  sfo = gg + delta − 100 (matches FFmpeg pow2sf_tab[sfo + 200]).
+- Alignment note: FFmpeg's decoded reference has a 1024-sample encoder delay
+  (skip_samples): ref[0..1024] = the priming block's output ≈ 0; my frame-N
+  output corresponds to ref[(N−1)·1024 .. N·1024].
+
+Debug harness: AAC_DEBUG=1 dumps ICS internals + spectral
+coefficients; compare vs FFmpeg decode of tests/data/test.aac
+(test_ref.f32); run in --release (debug O(M²) IMDCT is slow).
 
 ## Phase 3 — Modern Compressed
 
