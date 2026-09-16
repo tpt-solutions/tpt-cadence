@@ -40,6 +40,9 @@ pub enum ConformanceError {
     /// Sample counts diverged.
     #[error("length mismatch: tpt produced {tpt} samples, ffmpeg produced {reference}")]
     LengthMismatch { tpt: usize, reference: usize },
+    /// The shared tpt-av-test reference harness failed.
+    #[error(transparent)]
+    ReferenceHarness(#[from] tpt_av_test_reference::ReferenceError),
     /// Process/I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -57,23 +60,22 @@ pub fn ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Decodes `path` with FFmpeg into raw interleaved `f32` samples.
-pub fn decode_with_ffmpeg(path: &Path) -> Result<Vec<f32>, ConformanceError> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "quiet", "-i"])
-        .arg(path)
-        .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
-        .output()?;
-    if !output.status.success() {
-        return Err(ConformanceError::FfmpegFailed(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
-    }
-    Ok(output
-        .stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+/// Decodes `path` with FFmpeg into raw interleaved `f32` samples at the
+/// decoder's own `sample_rate`/`channels` contract.
+///
+/// The subprocess work is delegated to the shared `tpt-av-test` reference
+/// harness so every TPT repository compares against exactly one
+/// implementation of the FFmpeg-subprocess golden master.
+pub fn decode_with_ffmpeg(
+    path: &Path,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<f32>, ConformanceError> {
+    Ok(tpt_av_test_reference::ffmpeg::decode_to_f32le(
+        path,
+        sample_rate,
+        channels,
+    )?)
 }
 
 /// Decodes a file with the suite's decoder and with FFmpeg, then asserts the
@@ -89,7 +91,8 @@ pub fn assert_bit_exact_vs_ffmpeg(
     if !ffmpeg_available() {
         return Err(ConformanceError::ReferenceUnavailable);
     }
-    let reference = decode_with_ffmpeg(file_path)?;
+    let info = tpt_decoder.info();
+    let reference = decode_with_ffmpeg(file_path, info.sample_rate, info.channels)?;
 
     let channels = tpt_decoder.info().channels as usize;
     let mut tpt = Vec::new();

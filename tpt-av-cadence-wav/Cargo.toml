@@ -15,3 +15,4 @@ log = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tpt-av-cadence-test-utils = { workspace = true }
+tpt-av-test-fuzz = { path = "../../tpt-av-test/tpt-av-test-fuzz" }

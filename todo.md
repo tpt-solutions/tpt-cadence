@@ -2,7 +2,7 @@
 
 Tracks all tasks for the whole project, organized by phase. See `DESIGN.md` for full design rationale.
 
-Status snapshot: the workspace builds clean (fmt/clippy/deny), and 133 tests pass, including bit-exact conformance suites for WAV, AIFF, and FLAC (the FLAC suite MD5-verifies against the official IETF decoder testbench vectors, CC0, bundled under `tpt-av-cadence-flac/tests/data/`).
+Status snapshot: the workspace builds clean (fmt/clippy; note: `cargo deny` currently fails against deny.toml's deprecated keys with the newest cargo-deny — config migration pending, and the in-progress MP3 crate has one failing debug-only test `probe_128k`), and ~182 tests pass, including bit-exact conformance suites for WAV, AIFF, and FLAC (the FLAC suite MD5-verifies against the official IETF decoder testbench vectors, CC0, bundled under `tpt-av-cadence-flac/tests/data/`). The Opus crate now has 49 tests (packet/range coder + the full CELT decoder).
 
 ## Phase 0 — Project Setup & Governance
 
@@ -143,10 +143,75 @@ coefficients; compare vs FFmpeg decode of tests/data/test.aac
 
 - [x] Implement Opus packet parser (RFC 6716 §3: TOC, codes 0–3, padding, DTX, 120 ms cap, config tables)
 - [x] Implement the bit-exact range coder (RFC 6716 §4.1 decoder + §5.1 encoder: decode/update, icdf, bit_logp, raw bits, uint, tell) — groundwork shared by SILK and CELT
-- [ ] Implement CELT decoder (MDCT-based, music-optimized)
+- [x] Implement CELT decoder (MDCT-based, music-optimized)
 - [ ] Implement SILK decoder (speech-optimized, LP-based)
 - [ ] Integrate hybrid SILK+CELT mode
 - [ ] Conformance tests against official Opus test vectors
+
+### CELT decoder — status (complete, pending reference conformance)
+
+The full CELT layer is ported from libopus 1.5.2 (float build semantics,
+no `-ffast-math`/`FLOAT_APPROX`) into `src/celt/`, targeting bit-exact
+output with the reference:
+
+- `tables.rs` — static 48 kHz/20 ms mode tables (window, FFT bitrev +
+  twiddles, MDCT twiddles, eband5ms, logN400, band_allocation, CWRS
+  `cache_index50/bits50/caps50`).
+- `fft.rs` / `mdct.rs` — kiss FFT (all butterflies) and the backward MDCT
+  with TDAC overlap-add (verified against naive DFT and the reference's
+  own analytic MDCT oracles).
+- `cwrs.rs` — PVQ pulse decoding over the verbatim 1272-entry `U(N,K)`
+  table (`cwrsi`/`decode_pulses`); exhaustive small (N,K) round trips
+  through the range coder + random large (N,K) inside `fits_in32`.
+- `math.rs` — float-build mathops (`isqrt32`, `fast_atan2f`, `celt_log2/
+  exp2` via f64 `ln`/`exp`, `celt_cos_norm`, `celt_udiv`).
+- `laplace.rs` — coarse-energy Laplace decode/encode round trips.
+- `rate.rs` — `get_pulses`, `bits2pulses`, `pulses2bits`,
+  `clt_compute_allocation` (interp bisection, skip/intensity/dual-stereo
+  signaling, fine-bit assignment with rebalancing), `init_caps`.
+- `quant_bands.rs` — `unquant_coarse_energy` (Laplace + prediction),
+  `unquant_fine_energy`, `unquant_energy_finalise`.
+- `vq.rs` — `alg_unquant`, `exp_rotation` spread rotation,
+  `renormalise_vector`.
+- `bands.rs` — `quant_all_bands` recursion (`compute_theta` with the
+  bitexact cos/log2tan helpers, `quant_band`, `quant_partition` with
+  haar/hadamard TF recombination, folding, stereo split/merge,
+  `special_hybrid_folding`), `denormalise_bands`, `anti_collapse`,
+  `tf_decode`.
+- `pitch.rs` — pitch postfilter (`comb_filter` in place + two-buffer
+  variant) and the PLC pitch search stack (downsample/xcorr/search).
+- `celt_lpc.rs` — autocorr/Levinson/FIR/IIR for packet-loss concealment
+  (note the reference's NEGATED LPC sign convention and the IIR's
+  batch-4 accumulation order, both preserved).
+- `decoder.rs` — `CeltDecoder` assembly: `celt_decode_with_ec` (silence
+  flag, postfilter, transient/intra flags, loss-recovery energy safety,
+  dynalloc, trim, anti-collapse bit, deemphasis, postfilter state
+  machine), `celt_decode_lost` (noise-based AND pitch-based PLC),
+  `celt_synthesis` (mono↔stereo up/downmix paths), `prefilter_and_fold`.
+  All scratch is preallocated in the struct (alloc-free `decode`).
+- `range.rs` fixes: `decode_icdf` reimplemented in libopus's algebraic
+  form (0-terminated tables select the last symbol), `decode_uint`
+  clamps out-of-range values like the reference, added `tell_frac`,
+  `force_tell`, `rng`.
+
+Testing: 49 tests in the crate — round trips (range coder, laplace,
+cwrs, alg_unquant unit-norm invariants), table spot checks, FFT/MDCT
+oracles, comb-filter formula checks, LPC recovery of an AR(2) system,
+PLC pitch search finding a synthetic period, plus never-panic
+smoke/fuzz integration tests over random packets, DTX runs through both
+PLC paths, and cold-start concealment. `cargo clippy --all-targets` and
+`cargo fmt` clean.
+
+Deferred / next:
+- Bit-exact conformance vs official Opus test vectors and libopus
+  binaries still blocked on a gcc/ffmpeg toolchain (none on this machine
+  yet). Reference C sources:
+  `C:\Users\Phillip\AppData\Local\Temp\opencode\opus-1.5.2\celt\` (do
+  not commit).
+- `CeltDecoder` currently drives standalone (CELT-only packets);
+  wiring it into the top-level `Decoder` trait needs the packet TOC →
+  (LM, channels, bandwidth→end band 13/17/19/21, start band) mapping
+  from `opus_decoder.c`, and lands together with SILK/hybrid.
 
 ## Phase 4 — Legacy & Open Source
 

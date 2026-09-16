@@ -10,7 +10,7 @@ use crate::adts::{self, AdtsHeader};
 use crate::audio_specific::AudioSpecificConfig;
 use crate::bitreader::BitReader;
 use crate::huffman::HuffmanTable;
-use crate::imdct::{kbd_window, sine_window, Mdct};
+use crate::imdct::{kbd_window, sine_window, vector_fmul_window, Mdct};
 use crate::pns::NoiseGenerator;
 use crate::stereo;
 use crate::tables;
@@ -58,10 +58,14 @@ struct ChannelState {
     coeffs: Box<[f32]>,
     /// Dequantized time-domain output of the current transform (1024).
     out: Box<[f32]>,
-    /// Overlap-add history (1024 samples; only the first 128 are used
-    /// after EIGHT_SHORT frames).
+    /// Overlap history: the reference decoder's `saved` buffer (512).
     saved: Box<[f32]>,
-    saved_len: usize,
+    /// Per-band codebook assignment (groups × max_sfb ≤ 512 entries).
+    band_type: Box<[u8]>,
+    /// Per-band scalefactor exponents.
+    sfo: Box<[i32]>,
+    /// Per-band dequantized gains.
+    sf: Box<[f32]>,
     tns: Tns,
     /// This frame's window-shape flag (use_kb_window[0]).
     kb_window_cur: bool,
@@ -76,8 +80,10 @@ impl ChannelState {
         ChannelState {
             coeffs: vec![0.0; 1024].into_boxed_slice(),
             out: vec![0.0; 1024].into_boxed_slice(),
-            saved: vec![0.0; 1024].into_boxed_slice(),
-            saved_len: 0,
+            saved: vec![0.0; 512].into_boxed_slice(),
+            band_type: vec![0u8; 512].into_boxed_slice(),
+            sfo: vec![0i32; 512].into_boxed_slice(),
+            sf: vec![0.0f32; 512].into_boxed_slice(),
             tns: Tns::default(),
             kb_window_cur: false,
             kb_window_prev: false,
@@ -151,20 +157,15 @@ pub struct AacDecoder {
     win_long_sine: Box<[f32]>,
     win_short_kb: Box<[f32]>,
     win_short_sine: Box<[f32]>,
-    /// Long-window synthesis (2048).
-    buf_long: Box<[f32]>,
-    /// Short-window synthesis (256).
-    synth_short: Box<[f32]>,
-    /// EIGHT_SHORT overlap accumulator (1152 = 1024 + 128 tail).
-    acc: Box<[f32]>,
-    /// Assembled frame window (2048).
-    win_full: Box<[f32]>,
+    /// Full long-window synthesis (2048), pre-scramble.
+    synth: Box<[f32]>,
+    /// Half-length MDCT output in the reference decoder's layout (1024).
+    buf: Box<[f32]>,
+    /// Short-window lap scratch (128).
+    temp: Box<[f32]>,
     noise: NoiseGenerator,
 
-    /// Per-band scratch (groups × max_sfb ≤ 512 entries).
-    band_type: Box<[u8]>,
-    sfo: Box<[i32]>,
-    sf: Box<[f32]>,
+    /// M/S decision bits for the current common-window CPE (512 entries).
     ms_mask: Box<[bool]>,
     frame_buf: Box<[u8]>,
     /// Copy of the current frame body (avoids holding borrows across the
@@ -302,14 +303,10 @@ impl AacDecoder {
             win_long_sine: sine_window(1024).into_boxed_slice(),
             win_short_kb: kbd_window(128, 6.0).into_boxed_slice(),
             win_short_sine: sine_window(128).into_boxed_slice(),
-            buf_long: vec![0.0; 2048].into_boxed_slice(),
-            synth_short: vec![0.0; 256].into_boxed_slice(),
-            acc: vec![0.0; 1152].into_boxed_slice(),
-            win_full: vec![0.0; 2048].into_boxed_slice(),
+            synth: vec![0.0; 2048].into_boxed_slice(),
+            buf: vec![0.0; 1024].into_boxed_slice(),
+            temp: vec![0.0; 128].into_boxed_slice(),
             noise: NoiseGenerator::new(),
-            band_type: vec![0u8; 512].into_boxed_slice(),
-            sfo: vec![0i32; 512].into_boxed_slice(),
-            sf: vec![0.0f32; 512].into_boxed_slice(),
             ms_mask: vec![false; 512].into_boxed_slice(),
             frame_buf: vec![0u8; FRAME_BUF_LEN].into_boxed_slice(),
             work_buf: vec![0u8; FRAME_BUF_LEN].into_boxed_slice(),
@@ -442,7 +439,19 @@ impl AacDecoder {
         num_blocks: u32,
     ) -> Result<(), CadenceError> {
         // (channel, window info) in output order for this frame.
-        let mut block_channels: Vec<(usize, WindowInfo)> = Vec::new();
+        let mut block_channels = [(
+            0usize,
+            WindowInfo {
+                sequence: ONLY_LONG,
+                num_windows: 1,
+                num_window_groups: 1,
+                group_len: [1; 8],
+                max_sfb: 0,
+                num_swb: 0,
+                sf_index: self.sf_index,
+            },
+        ); MAX_CHANNELS];
+        let mut block_count = 0usize;
 
         for _ in 0..num_blocks {
             let mut iter: u64 = 0;
@@ -453,7 +462,6 @@ impl AacDecoder {
                         "element loop exceeds 400 iterations".to_string(),
                     ));
                 }
-                eprintln!("[el] iter {iter} pos {}", br.pos());
                 if br.overread() {
                     return Err(CadenceError::CorruptData(
                         "bitstream overread while parsing raw_data_block".to_string(),
@@ -463,14 +471,17 @@ impl AacDecoder {
                 match id {
                     SCE | LFE => {
                         let _tag = br.read_bits(4);
-                        let ch = Self::next_free_channel(&block_channels, self.channels)?;
+                        let ch =
+                            Self::next_free_channel(&block_channels[..block_count], self.channels)?;
                         let win = self.decode_ics(br, ch, false, None)?;
-                        block_channels.push((ch, win));
+                        block_channels[block_count] = (ch, win);
+                        block_count += 1;
                     }
                     CPE => {
                         let _tag = br.read_bits(4);
                         let common_window = br.read_bit();
-                        let ch_l = Self::next_free_channel(&block_channels, self.channels)?;
+                        let ch_l =
+                            Self::next_free_channel(&block_channels[..block_count], self.channels)?;
                         let ch_r = ch_l + 1;
                         if ch_r >= self.channels {
                             return Err(CadenceError::CorruptData(
@@ -528,8 +539,10 @@ impl AacDecoder {
                             self.apply_cpe_stereo(ch_l, ch_r, &win, ms_present != 0);
                         }
 
-                        block_channels.push((ch_l, win));
-                        block_channels.push((ch_r, win));
+                        block_channels[block_count] = (ch_l, win);
+                        block_count += 1;
+                        block_channels[block_count] = (ch_r, win);
+                        block_count += 1;
                     }
                     FIL => {
                         let mut count = br.read_bits(4) as usize;
@@ -568,12 +581,25 @@ impl AacDecoder {
         }
 
         // TNS, windowing, and staging for every decoded channel.
-        let mut decoded: Vec<(usize, WindowInfo)> = Vec::new();
-        for (ch, win) in &block_channels {
-            if decoded.iter().any(|(c, _)| c == ch) {
+        let mut decoded = [(
+            0usize,
+            WindowInfo {
+                sequence: ONLY_LONG,
+                num_windows: 1,
+                num_window_groups: 1,
+                group_len: [1; 8],
+                max_sfb: 0,
+                num_swb: 0,
+                sf_index: self.sf_index,
+            },
+        ); MAX_CHANNELS];
+        let mut decoded_count = 0usize;
+        for (ch, win) in &block_channels[..block_count] {
+            if decoded[..decoded_count].iter().any(|(c, _)| c == ch) {
                 continue;
             }
-            decoded.push((*ch, *win));
+            decoded[decoded_count] = (*ch, *win);
+            decoded_count += 1;
             let state = &mut self.channels_state[*ch];
             if std::env::var("AAC_DUMP").is_ok() {
                 let n = self.frame_count;
@@ -583,13 +609,21 @@ impl AacDecoder {
                     dir.join(format!("pre_{n}_{ch}.f32")),
                     f32_slice_bytes(&state.coeffs),
                 );
+                let bands: Vec<u8> = state.band_type[..win.max_sfb.max(1)].to_vec();
+                let sfs: Vec<i32> = state.sfo[..win.max_sfb.max(1)].to_vec();
+                let bands = bands.iter().map(|&b| b.to_string()).collect::<Vec<_>>();
+                let sfs = sfs.iter().map(|&b| b.to_string()).collect::<Vec<_>>();
+                let _ = std::fs::write(
+                    dir.join(format!("meta_{n}_{ch}.txt")),
+                    format!("bands: {}\nsfo: {}\n", bands.join(","), sfs.join(",")),
+                );
                 eprintln!(
-                    "[frame {n} ch{ch}] seq={} kb_prev={} kb_cur={} max_sfb={} tns_filt={}",
+                    "[frame {n} ch{ch}] seq={} kb_prev={} kb_cur={} max_sfb={} tns_n_filt={:?}",
                     win.sequence,
                     state.kb_window_prev,
                     state.kb_window_cur,
                     win.max_sfb,
-                    state.tns.n_filt[..win.num_windows].len().min(8),
+                    &state.tns.n_filt[..win.num_windows],
                 );
             }
             tns::apply(
@@ -610,13 +644,13 @@ impl AacDecoder {
                 );
             }
         }
-        for (ch, win) in &decoded {
+        for (ch, win) in &decoded[..decoded_count] {
             self.imdct_and_window(*ch, win);
         }
 
         // Interleave into staging.
         for i in 0..1024usize {
-            for (ch, _) in &decoded {
+            for (ch, _) in &decoded[..decoded_count] {
                 self.staged.push(self.channels_state[*ch].out[i]);
             }
         }
@@ -725,11 +759,13 @@ impl AacDecoder {
                 br.pos()
             );
         }
-        self.decode_band_types(br, &win)?;
-        self.decode_scalefactors(br, global_gain, &win)?;
+        self.decode_band_types(br, ch, &win)?;
+        self.decode_scalefactors(br, ch, global_gain, &win)?;
         if std::env::var("AAC_DEBUG").is_ok() {
-            let bands: Vec<u8> = self.band_type[..win.max_sfb.min(24)].to_vec();
-            let sfs: Vec<i32> = self.sfo[..win.max_sfb.min(24)].to_vec();
+            let n = win.max_sfb * win.num_window_groups;
+            let state = &self.channels_state[ch];
+            let bands: Vec<u8> = state.band_type[..n].to_vec();
+            let sfs: Vec<i32> = state.sfo[..n].to_vec();
             eprintln!(
                 "[ics ch{ch}] gg={global_gain} seq={} max_sfb={} bands={:?} sfo={:?}",
                 win.sequence, win.max_sfb, bands, sfs
@@ -744,6 +780,7 @@ impl AacDecoder {
     fn decode_band_types(
         &mut self,
         br: &mut BitReader,
+        ch: usize,
         win: &WindowInfo,
     ) -> Result<(), CadenceError> {
         let bits = if win.sequence == EIGHT_SHORT { 3 } else { 5 };
@@ -768,11 +805,9 @@ impl AacDecoder {
                 let mut sect_end = k;
                 loop {
                     let incr = br.read_bits(bits as u32) as usize;
-                    if incr == 0 {
-                        return Err(CadenceError::CorruptData(
-                            "zero-length section (no progress)".to_string(),
-                        ));
-                    }
+                    // A zero increment terminates an escape run (the
+                    // reference decoder accepts it anywhere); the section
+                    // counter above bounds the loop.
                     sect_end += incr;
                     if sect_end > win.max_sfb {
                         return Err(CadenceError::CorruptData(
@@ -784,7 +819,7 @@ impl AacDecoder {
                     }
                 }
                 for sfb in k..sect_end {
-                    self.band_type[g * win.max_sfb + sfb] = band_type;
+                    self.channels_state[ch].band_type[g * win.max_sfb + sfb] = band_type;
                 }
                 k = sect_end;
             }
@@ -797,6 +832,7 @@ impl AacDecoder {
     fn decode_scalefactors(
         &mut self,
         br: &mut BitReader,
+        ch: usize,
         global_gain: u32,
         win: &WindowInfo,
     ) -> Result<(), CadenceError> {
@@ -805,15 +841,16 @@ impl AacDecoder {
         let mut offset_intensity = 0i32;
         let mut noise_flag = true;
 
+        let state = &mut self.channels_state[ch];
         for g in 0..win.num_window_groups {
             for sfb in 0..win.max_sfb {
                 let idx = g * win.max_sfb + sfb;
-                match self.band_type[idx] {
-                    ZERO_BT => self.sfo[idx] = 0,
+                match state.band_type[idx] {
+                    ZERO_BT => state.sfo[idx] = 0,
                     INTENSITY_BT | INTENSITY_BT2 => {
                         offset_intensity += self.sf_book.decode_scalefactor_delta(br)?;
                         let clipped = offset_intensity.clamp(-155, 100);
-                        self.sfo[idx] = clipped - 100;
+                        state.sfo[idx] = clipped - 100;
                     }
                     NOISE_BT => {
                         if noise_flag {
@@ -823,7 +860,7 @@ impl AacDecoder {
                             offset_noise += self.sf_book.decode_scalefactor_delta(br)?;
                         }
                         let clipped = offset_noise.clamp(-100, 155);
-                        self.sfo[idx] = clipped;
+                        state.sfo[idx] = clipped;
                     }
                     _ => {
                         offset_normal += self.sf_book.decode_scalefactor_delta(br)?;
@@ -832,7 +869,7 @@ impl AacDecoder {
                                 "scalefactor out of range".to_string(),
                             ));
                         }
-                        self.sfo[idx] = offset_normal - 100;
+                        state.sfo[idx] = offset_normal - 100;
                     }
                 }
             }
@@ -843,10 +880,10 @@ impl AacDecoder {
         for g in 0..win.num_window_groups {
             for sfb in 0..win.max_sfb {
                 let idx = g * win.max_sfb + sfb;
-                self.sf[idx] = match self.band_type[idx] {
+                state.sf[idx] = match state.band_type[idx] {
                     ZERO_BT => 0.0,
-                    INTENSITY_BT | INTENSITY_BT2 => (-((self.sfo[idx] + 100) as f32) / 4.0).exp2(),
-                    _ => (self.sfo[idx] as f32 / 4.0).exp2(),
+                    INTENSITY_BT | INTENSITY_BT2 => (-((state.sfo[idx] + 100) as f32) / 4.0).exp2(),
+                    _ => (state.sfo[idx] as f32 / 4.0).exp2(),
                 };
             }
         }
@@ -920,7 +957,6 @@ impl AacDecoder {
 
     /// spectral_data: Huffman decode + requantization + PNS + zero bands,
     /// then pulse application.
-    #[allow(clippy::needless_range_loop)]
     #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
     fn decode_spectral(
         &mut self,
@@ -930,9 +966,16 @@ impl AacDecoder {
         pulse: Option<&Pulse>,
     ) -> Result<(), CadenceError> {
         let offsets = win.swb_offsets();
+        let ChannelState {
+            coeffs,
+            band_type,
+            sf,
+            ..
+        } = &mut self.channels_state[ch];
+        let band_type: &[u8] = band_type;
+        let sf: &[f32] = sf;
 
         // Zero the whole transform; bands overwrite their ranges.
-        let coeffs = &mut self.channels_state[ch].coeffs;
         for slot in coeffs.iter_mut() {
             *slot = 0.0;
         }
@@ -942,10 +985,10 @@ impl AacDecoder {
             let group_len = win.group_len[g];
             for sfb in 0..win.max_sfb {
                 let idx = g * win.max_sfb + sfb;
-                let band_type = self.band_type[idx];
+                let band_type = band_type[idx];
                 let start = offsets[sfb] as usize;
                 let off_len = (offsets[sfb + 1] - offsets[sfb]) as usize;
-                let gain = self.sf[idx];
+                let gain = sf[idx];
 
                 for group in 0..group_len {
                     let base = (window_base + group) * BLOCK_LEN + start;
@@ -957,56 +1000,106 @@ impl AacDecoder {
                             }
                         }
                         NOISE_BT => {
-                            self.noise.fill_scaled(out, gain);
+                            // Reference scalefactors are negative; the noise
+                            // band gain inherits that sign.
+                            self.noise.fill_scaled(out, -gain);
                         }
                         cb => {
                             let book = &self.spectral_books[(cb - 1) as usize];
-                            let (idx_table, dim, signed): (&[u16], usize, bool) = match cb {
-                                1..=2 => (&tables::CODEBOOK_IDX_02, 4, true),
-                                3..=4 => (&tables::CODEBOOK_IDX_02, 4, false),
-                                5..=6 => (&tables::CODEBOOK_IDX_4, 2, true),
-                                7..=8 => (&tables::CODEBOOK_IDX_6, 2, false),
-                                9..=10 => (&tables::CODEBOOK_IDX_8, 2, false),
-                                _ => (&tables::CODEBOOK_IDX_10, 2, false),
+                            // VLC symbol → packed descriptor (reference
+                            // `cb_idx`): dims/vals/signs per book class.
+                            let idx_table: &[u16] = match cb {
+                                1..=4 => &tables::CODEBOOK_IDX_02,
+                                5..=6 => &tables::CODEBOOK_IDX_4,
+                                7..=8 => &tables::CODEBOOK_IDX_6,
+                                9..=10 => &tables::CODEBOOK_IDX_8,
+                                _ => &tables::CODEBOOK_IDX_10,
                             };
-                            let has_escape = cb == 11;
+                            let dim: usize = if cb >= 5 { 2 } else { 4 };
 
-                            for _ in 0..off_len / dim {
+                            for k in (0..off_len).step_by(dim) {
                                 let list_index = book.decode(br)?;
-                                // VLC symbols map through the codebook idx
-                                // table to a packed descriptor (FFmpeg
-                                // `cb_idx`).
                                 let packed =
                                     idx_table.get(list_index as usize).copied().unwrap_or(0) as u32;
+                                if std::env::var("AAC_TRACE").is_ok()
+                                    && window_base == 0
+                                    && (band_type == 2 || band_type == 13)
+                                {
+                                    eprintln!("[tr] p={} wb={window_base} sfb={sfb} sym={list_index} packed={packed:#06x}", br.pos());
+                                }
 
-                                if signed {
-                                    // VMUL4: quads from vals0 = {−1, 0, 1},
-                                    // two bits per dim, low bits = dim 0.
-                                    for d in 0..dim {
-                                        let vi = (packed >> (2 * d)) & 3;
-                                        let v = match vi {
-                                            0 => -1.0,
-                                            2 => 1.0,
-                                            _ => 0.0,
-                                        };
-                                        out[d] = v * gain;
+                                if cb <= 4 {
+                                    // Quads: 2-bit value fields, low bits =
+                                    // dim 0.
+                                    if cb <= 2 {
+                                        // Signed values from {−1, 0, +1}.
+                                        for d in 0..4 {
+                                            let vi = (packed >> (2 * d)) & 3;
+                                            let v = match vi {
+                                                0 => -1.0,
+                                                2 => 1.0,
+                                                _ => 0.0,
+                                            };
+                                            out[k + d] = v * gain;
+                                        }
+                                    } else {
+                                        // Unsigned quads with nnz sign bits,
+                                        // consumed in dim order over the
+                                        // nonzero dims.
+                                        let nnz = (packed >> 8) & 15;
+                                        let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
+                                        for d in 0..4 {
+                                            let vi = (packed >> (2 * d)) & 3;
+                                            let mut mag = tables::CODEBOOK_VALS_10_16
+                                                .get(vi as usize)
+                                                .copied()
+                                                .unwrap_or(0.0);
+                                            if vi != 0 {
+                                                if sign_bits & (1 << 31) != 0 {
+                                                    mag = -mag;
+                                                }
+                                                sign_bits <<= 1;
+                                            }
+                                            out[k + d] = mag * gain;
+                                        }
                                     }
-                                } else if has_escape {
-                                    // Book 11 (VMUL2S + escape): dims from
-                                    // 4-bit nibbles; sign bits read up front
-                                    // (MSB first, nnz of them); dims flagged
-                                    // in the escape mask read a unary-length
-                                    // magnitude.
+                                } else if cb <= 10 {
+                                    // Unsigned pairs with nnz sign bits.
+                                    let nnz = (packed >> 8) & 15;
+                                    let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
+                                    for d in 0..2 {
+                                        let vi = (packed >> (4 * d)) & 15;
+                                        let mut mag = tables::CODEBOOK_VALS_10_16
+                                            .get(vi as usize)
+                                            .copied()
+                                            .unwrap_or(0.0);
+                                        if vi != 0 {
+                                            if sign_bits & (1 << 31) != 0 {
+                                                mag = -mag;
+                                            }
+                                            sign_bits <<= 1;
+                                        }
+                                        out[k + d] = mag * gain;
+                                    }
+                                } else if packed == 0 {
+                                    // All-zero pair: no sign bits.
+                                    out[k] = 0.0;
+                                    out[k + 1] = 0.0;
+                                } else {
+                                    // Book 11: nnz sign bits up front, then
+                                    // per dim: escape dims read a unary
+                                    // ones-count + (ones+4) magnitude bits;
+                                    // a sign bit is consumed only for
+                                    // nonzero (escaped or table-valued)
+                                    // dims.
                                     let nnz = (packed >> 12) & 15;
                                     let esc_mask = (packed >> 8) & 15;
-                                    // Sign bits MSB-aligned like SHOW_UBITS.
                                     let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
-                                    for d in 0..dim {
+                                    for d in 0..2 {
                                         let vi = (packed >> (4 * d)) & 15;
+                                        let escaped = (esc_mask >> d) & 1 == 1;
                                         let neg = sign_bits & (1 << 31) != 0;
-                                        let mut mag = if (esc_mask >> d) & 1 == 1 {
-                                            // escape: unary ones + terminator,
-                                            // then (ones + 4) magnitude bits
+                                        let mut mag = if escaped {
                                             let mut ones = 0u32;
                                             loop {
                                                 if !br.read_bit() {
@@ -1031,34 +1124,10 @@ impl AacDecoder {
                                         if neg {
                                             mag = -mag;
                                         }
-                                        out[d] = mag * gain;
-                                        sign_bits <<= 1;
-                                    }
-                                } else {
-                                    // VMUL4S / VMUL2S: unsigned magnitudes
-                                    // with nnz sign bits applied in dim
-                                    // order to the nonzero dims.
-                                    let nnz = (packed >> 8) & 15;
-                                    // MSB-aligned like the reference cache.
-                                    let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
-                                    let nz_mask = (packed >> 12) & 15;
-                                    for d in 0..dim {
-                                        let vi = (packed >> (if dim == 4 { 2 * d } else { 4 * d }))
-                                            & (if dim == 4 { 3 } else { 15 });
-                                        let mut mag = tables::CODEBOOK_VALS_10_16
-                                            .get(vi as usize)
-                                            .copied()
-                                            .unwrap_or(0.0);
-                                        let nonzero = vi != 0;
-                                        if nonzero {
-                                            let neg = sign_bits & (1 << 31) != 0;
-                                            if neg {
-                                                mag = -mag;
-                                            }
+                                        out[k + d] = mag * gain;
+                                        if escaped || vi != 0 {
                                             sign_bits <<= 1;
                                         }
-                                        out[d] = mag * gain;
-                                        let _ = nz_mask;
                                     }
                                 }
                             }
@@ -1081,8 +1150,8 @@ impl AacDecoder {
                 while (offsets[idx + 1] as usize) <= pulse.pos[i] {
                     idx += 1;
                 }
-                let band_sf = self.sf[idx];
-                if self.band_type[idx] != NOISE_BT && band_sf != 0.0 {
+                let band_sf = sf[idx];
+                if band_type[idx] != NOISE_BT && band_sf != 0.0 {
                     let mut ico = -(pulse.amp[i] as f32);
                     if co != 0.0 {
                         co /= band_sf;
@@ -1095,149 +1164,126 @@ impl AacDecoder {
         Ok(())
     }
 
-    /// IMDCT + windowing + weighted overlap-add for one channel
-    /// (ISO/IEC 14496-3 §4.6.4 filter bank; TDAC-verified in imdct.rs).
+    /// IMDCT + windowing + weighted overlap-add for one channel.
+    ///
+    /// Exact port of the reference decoder's `imdct_and_windowing`: the
+    /// half-length MDCT output is kept in the reference `buf` layout, and
+    /// the window sequences are realized through the same lap/saved-update
+    /// structure (all "meaningless" short↔long transitions are treated as
+    /// short↔short, with special handling inside EIGHT_SHORT).
     #[allow(clippy::needless_range_loop)]
     fn imdct_and_window(&mut self, ch: usize, win: &WindowInfo) {
-        let short = win.sequence == EIGHT_SHORT;
-        let _m = if short { 128 } else { 1024 }; // coefficients per transform
-        let kb_prev = self.channels_state[ch].kb_window_prev;
-        let kb_cur = self.channels_state[ch].kb_window_cur;
-
-        // Assemble the frame window: [left half | right half].
-        // Left half = previous frame's shape; right half = current shape.
-        {
-            let cur: &[f32] = if kb_cur {
-                &self.win_short_kb
-            } else {
-                &self.win_short_sine
-            };
-            let prev: &[f32] = if kb_prev {
-                &self.win_short_kb
-            } else {
-                &self.win_short_sine
-            };
-            if short {
-                let win_full = &mut self.win_full;
-                for j in 0..128 {
-                    win_full[j] = prev[j];
-                    win_full[128 + j] = cur[127 - j];
-                    win_full[256 + j] = cur[j];
-                    win_full[384 + j] = cur[127 - j];
-                    win_full[512 + j] = cur[j];
-                    win_full[640 + j] = cur[127 - j];
-                    win_full[768 + j] = cur[j];
-                    win_full[896 + j] = cur[127 - j];
-                    win_full[1024 + j] = cur[j];
-                    win_full[1152 + j] = cur[127 - j];
-                    win_full[1280 + j] = cur[j];
-                    win_full[1408 + j] = cur[127 - j];
-                    win_full[1536 + j] = cur[j];
-                    win_full[1664 + j] = cur[127 - j];
-                    win_full[1792 + j] = cur[j];
-                    win_full[1920 + j] = cur[127 - j];
-                }
-            } else {
-                let left: &[f32] = if kb_prev {
-                    &self.win_long_kb
-                } else {
-                    &self.win_long_sine
-                };
-                let right: &[f32] = if kb_cur {
-                    &self.win_long_kb
-                } else {
-                    &self.win_long_sine
-                };
-                let win_full = &mut self.win_full;
-                win_full[..1024].copy_from_slice(left);
-                for n in 0..1024 {
-                    win_full[1024 + n] = right[1023 - n];
-                }
-            }
-        }
-
-        let saved_len = self.channels_state[ch].saved_len;
-        let state = &mut self.channels_state[ch];
+        let seq_cur = win.sequence;
+        let Self {
+            channels_state,
+            mdct_long,
+            mdct_short,
+            win_long_kb,
+            win_long_sine,
+            win_short_kb,
+            win_short_sine,
+            synth,
+            buf,
+            temp,
+            ..
+        } = self;
+        let state = &mut channels_state[ch];
         let ChannelState {
-            saved, out, coeffs, ..
-        } = state;
-        let saved: &mut Box<[f32]> = saved;
-        let out: &mut Box<[f32]> = out;
+            coeffs,
+            out,
+            saved,
+            window_seq_prev,
+            kb_window_cur,
+            kb_window_prev,
+            ..
+        } = &mut *state;
         let coeffs: &[f32] = coeffs;
 
-        if short {
-            // 8 short IMDCTs (128 coeffs → 256 samples) at hop 128,
-            // overlap-ADDed (consecutive windows overlap by 128).
-            let acc = &mut self.acc;
-            acc.fill(0.0);
-            let mut x = [0.0f32; 256];
+        let seq_prev = *window_seq_prev;
+        *window_seq_prev = seq_cur;
+        let kb_cur = *kb_window_cur;
+        let kb_prev = *kb_window_prev;
+
+        let lwindow_prev: &[f32] = if kb_prev { win_long_kb } else { win_long_sine };
+        let swindow: &[f32] = if kb_cur { win_short_kb } else { win_short_sine };
+        let swindow_prev: &[f32] = if kb_prev {
+            win_short_kb
+        } else {
+            win_short_sine
+        };
+
+        // IMDCT into the half-length buf layout: with y the natural
+        // 2M-point synthesis, buf[i] = y[M/2−1−i] and buf[M/2+i] = −y[M+i].
+        if seq_cur != EIGHT_SHORT {
+            mdct_long.imdct(coeffs, synth);
+            for i in 0..512 {
+                buf[i] = synth[511 - i];
+                buf[512 + i] = -synth[1024 + i];
+            }
+        } else {
+            let mut y = [0.0f32; 256];
             for w in 0..8 {
-                self.mdct_short
-                    .imdct(&coeffs[w * 128..w * 128 + 128], &mut x);
-                let base = w * 128;
-                for j in 0..128 {
-                    acc[base + j] += x[j] * self.win_full[base + j];
-                    acc[base + 128 + j] += x[128 + j] * self.win_full[base + 128 + j];
+                mdct_short.imdct(&coeffs[w * 128..w * 128 + 128], &mut y);
+                let b = w * 128;
+                for i in 0..64 {
+                    buf[b + i] = y[63 - i];
+                    buf[b + 64 + i] = -y[128 + i];
                 }
             }
-            for n in 0..saved_len {
-                acc[n] += saved[n];
-            }
-            out.copy_from_slice(&acc[..1024]);
-            saved[..128].copy_from_slice(&acc[1024..1152]);
-            saved[128..].fill(0.0);
-            self.channels_state[ch].saved_len = 128;
-        } else {
-            self.mdct_long.imdct(coeffs, &mut self.buf_long);
-            // window (in place), overlap-add the left half
-            for n in 0..2048 {
-                self.buf_long[n] *= self.win_full[n];
-            }
-            for n in 0..saved_len {
-                self.buf_long[n] += saved[n];
-            }
-            out.copy_from_slice(&self.buf_long[..1024]);
-            saved.copy_from_slice(&self.buf_long[1024..2048]);
-            self.channels_state[ch].saved_len = 1024;
         }
-    }
 
-    #[allow(dead_code)]
-    fn short_half_cur(&self, kb: bool) -> &[f32] {
-        if kb {
-            &self.win_short_kb
+        let long_lap = (seq_prev == ONLY_LONG || seq_prev == LONG_STOP)
+            && (seq_cur == ONLY_LONG || seq_cur == LONG_START);
+        if long_lap {
+            vector_fmul_window(out, saved, buf, lwindow_prev, 512);
         } else {
-            &self.win_short_sine
+            out[..448].copy_from_slice(&saved[..448]);
+
+            if seq_cur == EIGHT_SHORT {
+                vector_fmul_window(&mut out[448..], &saved[448..], buf, swindow_prev, 64);
+                vector_fmul_window(&mut out[448 + 128..], &buf[64..], &buf[128..], swindow, 64);
+                vector_fmul_window(&mut out[448 + 256..], &buf[192..], &buf[256..], swindow, 64);
+                vector_fmul_window(&mut out[448 + 384..], &buf[320..], &buf[384..], swindow, 64);
+                vector_fmul_window(temp, &buf[448..], &buf[512..], swindow, 64);
+                out[448 + 512..448 + 576].copy_from_slice(&temp[..64]);
+            } else {
+                vector_fmul_window(&mut out[448..], &saved[448..], buf, swindow_prev, 64);
+                out[576..1024].copy_from_slice(&buf[64..512]);
+            }
         }
-    }
 
-    #[allow(dead_code)]
-    fn short_half_prev(&self, kb: bool) -> &[f32] {
-        if kb {
-            &self.win_short_kb
+        // Buffer update.
+        if seq_cur == EIGHT_SHORT {
+            saved[..64].copy_from_slice(&temp[64..128]);
+            vector_fmul_window(&mut saved[64..], &buf[576..], &buf[640..], swindow, 64);
+            vector_fmul_window(&mut saved[192..], &buf[704..], &buf[768..], swindow, 64);
+            vector_fmul_window(&mut saved[320..], &buf[832..], &buf[896..], swindow, 64);
+            saved[448..512].copy_from_slice(&buf[960..1024]);
+        } else if seq_cur == LONG_START {
+            saved[..448].copy_from_slice(&buf[512..960]);
+            saved[448..512].copy_from_slice(&buf[960..1024]);
         } else {
-            &self.win_short_sine
+            saved.copy_from_slice(&buf[512..1024]);
         }
     }
 
     /// M/S + intensity stereo for a common-window channel pair.
+    ///
+    /// Mirrors the reference decoder: the M/S butterfly only touches bands
+    /// whose codebook is below the noise/intensity range in BOTH channels,
+    /// and the intensity scale combines the right channel's band type and
+    /// (when MS data is present) the M/S decision.
     fn apply_cpe_stereo(&mut self, ch_l: usize, ch_r: usize, win: &WindowInfo, ms_present: bool) {
-        // Snapshot the per-band data to avoid overlapping borrows.
-        let band_type: Vec<u8> = self.band_type.to_vec();
-        let sf: Vec<f32> = self.sf.to_vec();
-        let ms_mask: Vec<bool> = self.ms_mask.to_vec();
-        let _ = ms_present;
-
-        let (left, right) = {
+        let (left_state, right_state) = {
             let (a, b) = self.channels_state.split_at_mut(ch_r);
-            (&mut a[ch_l].coeffs, &mut b[0].coeffs)
+            (&mut a[ch_l], &mut b[0])
         };
         stereo::apply_mid_side(
-            left,
-            right,
-            &band_type,
-            &band_type,
-            &ms_mask,
+            &mut left_state.coeffs,
+            &mut right_state.coeffs,
+            &left_state.band_type,
+            &right_state.band_type,
+            &self.ms_mask,
             win.num_window_groups,
             &win.group_len,
             win.max_sfb,
@@ -1249,40 +1295,29 @@ impl AacDecoder {
         for g in 0..win.num_window_groups {
             for sfb in 0..win.max_sfb {
                 let idx = g * win.max_sfb + sfb;
-                let mut c: i32 = match band_type[idx] {
+                let mut c: i32 = match right_state.band_type[idx] {
                     INTENSITY_BT2 => -1,
                     INTENSITY_BT => 1,
                     _ => 0,
                 };
                 if c != 0 {
-                    if ms_present && self.ms_mask_snapshot(idx) {
+                    if ms_present && self.ms_mask.get(idx).copied().unwrap_or(false) {
                         c *= 1 - 2;
                     }
-                    gains[idx] = (c as f32) * sf[idx];
+                    gains[idx] = (c as f32) * right_state.sf[idx];
                 }
             }
         }
-        let (left, right) = {
-            let (a, b) = self.channels_state.split_at_mut(ch_r);
-            (&mut a[ch_l].coeffs, &mut b[0].coeffs)
-        };
         stereo::apply_intensity(
-            left,
-            right,
-            &band_type,
+            &mut left_state.coeffs,
+            &mut right_state.coeffs,
+            &right_state.band_type,
             &gains,
             win.num_window_groups,
             &win.group_len,
             win.max_sfb,
             win.swb_offsets(),
         );
-    }
-}
-
-// Helper referenced above (kept trivial).
-impl AacDecoder {
-    fn ms_mask_snapshot(&self, idx: usize) -> bool {
-        self.ms_mask.get(idx).copied().unwrap_or(false)
     }
 }
 
@@ -1307,7 +1342,6 @@ impl Decoder for AacDecoder {
         self.eof = false;
         for state in &mut self.channels_state {
             state.saved.fill(0.0);
-            state.saved_len = 0;
             state.window_seq_prev = ONLY_LONG;
             state.kb_window_prev = false;
             state.kb_window_cur = false;

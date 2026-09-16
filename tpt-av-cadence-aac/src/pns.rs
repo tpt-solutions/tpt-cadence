@@ -25,12 +25,13 @@ impl NoiseGenerator {
     }
 
     /// Fills `out` with noise scaled so its RMS energy matches
-    /// `scale = sqrtf_energy_target` semantics of the reference decoder:
-    /// out[k] = raw[k] · (sf / sqrt(Σ raw[k]²)).
+    /// `scale = sf / sqrt(Σ raw[k]²)` semantics of the reference decoder.
+    /// Raw values convert to float as *signed* 32-bit (the reference keeps
+    /// the LCG state in an `int`), so half the samples are negative.
     pub fn fill_scaled(&mut self, out: &mut [f32], scale: f32) {
         let mut energy = 0.0f32;
         for slot in out.iter_mut() {
-            let raw = self.next_u32() as f32;
+            let raw = self.next_u32() as i32 as f32;
             *slot = raw;
             energy += raw * raw;
         }

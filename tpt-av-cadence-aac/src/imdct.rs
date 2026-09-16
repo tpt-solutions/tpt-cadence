@@ -30,14 +30,15 @@ pub fn sine_window(n: usize) -> Vec<f32> {
 }
 
 /// Kaiser-Bessel-derived window of length `n` (FFmpeg `kbd_window_init`
-/// cumulative-normalization form, matching the ISO-defined windows).
+/// cumulative form, matching the ISO-defined windows). The Bessel argument
+/// is sqrt(i·(n−i)·alpha²) — the square root goes inside I₀.
 #[allow(clippy::needless_range_loop)]
 pub fn kbd_window(n: usize, alpha: f64) -> Vec<f32> {
     let alpha2 = 4.0 * (alpha * std::f64::consts::PI / n as f64).powi(2);
     let mut temp = vec![0.0f64; n / 2 + 1];
     let mut scale = 0.0f64;
     for i in 0..=n / 2 {
-        temp[i] = bessel_i0((i * (n - i)) as f64 * alpha2).sqrt();
+        temp[i] = bessel_i0(((i * (n - i)) as f64 * alpha2).sqrt());
         scale += temp[i] * (1.0 + ((i != 0 && i != n / 2) as i32 as f64));
     }
     scale = 1.0 / (scale + 1.0);
@@ -67,12 +68,13 @@ pub struct Mdct {
 
 impl Mdct {
     /// M = number of spectral coefficients; synthesis is 2M samples:
-    /// x(n) = (−1/M)·Σ X(k)·cos(π/(2M)·(n + M/2 + ½)·(2k+1)).
-    /// (The −1/M scale is the ISO normalization; the sign is the standard
-    /// MDCT phase convention.)
+    /// x(n) = −1/(M·2^15)·Σ X(k)·cos(π/(2M)·(n + M/2 + ½)·(2k+1)).
+    /// (The −1/M is the ISO normalization; the reference decoder's float
+    /// MDCT additionally scales by 1/2^15 — its scalefactor and quantizer
+    /// tables are built to match — so the factor is repeated here.)
     pub fn new(m: usize) -> Self {
         let mut table = vec![0.0f32; 2 * m * m];
-        let scale = -1.0 / m as f64;
+        let scale = -1.0 / (m as f64 * 32768.0);
         for n in 0..2 * m {
             for k in 0..m {
                 let angle = std::f64::consts::PI / (2.0 * m as f64)
@@ -102,21 +104,21 @@ impl Mdct {
     }
 }
 
-// Overlap-add windowing (FFmpeg `vector_fmul_window`).
+/// Windowed overlap lap (FFmpeg `vector_fmul_window`).
 ///
-/// `dst[i] = saved[i]·win[i] − buf[i]·win[len2·2−1−i]` for the first half
-/// and the mirrored sum for the second half, where `len2` is half the
-/// window length.
-pub fn vector_fmul_window(dst: &mut [f32], saved: &[f32], buf: &[f32], win: &[f32], len2: usize) {
-    let (src0, src1) = (saved, buf);
-    for i in 0..len2 {
-        let j = 2 * len2 - 1 - i;
+/// `dst` receives 2·len samples from `src0` (len), `src1` (len), and the
+/// full 2·len window:
+/// `dst[i] = src0[i]·win[2len−1−i] − src1[len−1−i]·win[i]`,
+/// `dst[len+i] = src0[len−1−i]·win[len−1−i] + src1[i]·win[len+i]`.
+pub fn vector_fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
+    for i in 0..len {
+        let j = len - 1 - i;
         let s0 = src0[i];
         let s1 = src1[j];
         let wi = win[i];
-        let wj = win[j];
-        dst[i] = s0 * wi - s1 * wj;
-        dst[j] = s1 * wi + s0 * wj;
+        let wj = win[2 * len - 1 - i];
+        dst[i] = s0 * wj - s1 * wi;
+        dst[len + i] = src0[j] * win[j] + src1[i] * win[len + i];
     }
 }
 
@@ -152,8 +154,8 @@ mod tests {
         let input = [1.0f32, 0.0, 0.0, 0.0];
         let mut output = [0.0f32; 8];
         mdct.imdct(&input, &mut output);
-        // x(0) = (−1/4)·cos(π/8·(0 + 2 + 0.5)·1) = −0.25·cos(π·2.5/8)
-        let expect0 = (-0.25f64 * (std::f64::consts::PI / 8.0 * 2.5).cos()) as f32;
+        // x(0) = −1/(4·2^15)·cos(π/8·(0 + 2 + 0.5)·1) = −0.25/2^15·cos(π·2.5/8)
+        let expect0 = (-0.25f64 / 32768.0 * (std::f64::consts::PI / 8.0 * 2.5).cos()) as f32;
         assert!((output[0] - expect0).abs() < 1e-6);
     }
 
@@ -193,8 +195,9 @@ mod tests {
                             * (2.0 * k as f64 + 1.0);
                         acc += (block[n] * win[n]) as f64 * angle.cos();
                     }
-                    // ISO analysis carries a leading −2.
-                    coeffs[k] = (-2.0 * acc) as f32;
+                    // ISO analysis carries a leading −2 (·2^15 to cancel the
+                    // synthesis normalization's 1/2^15).
+                    coeffs[k] = (-2.0 * 32768.0 * acc) as f32;
                 }
                 let mut y = vec![0.0f32; 2 * m];
                 mdct.imdct(&coeffs, &mut y);

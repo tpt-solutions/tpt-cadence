@@ -7,3 +7,8 @@ Cargo.lock
 *.swp
 .DS_Store
 Thumbs.db
+
+# Debug scratch dumps
+*_post.bin
+tools/*.f32
+tools/rust_*.bin

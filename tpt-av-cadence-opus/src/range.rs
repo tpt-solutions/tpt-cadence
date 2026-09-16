@@ -121,39 +121,39 @@ impl<'a> RangeDecoder<'a> {
         Ok(is_one)
     }
 
-    /// `ec_dec_icdf` (§4.1.3.3): decodes a symbol from an inverse-CDF table
-    /// (entries are `(1 << ftb) - fh[k]`, terminated by a 0 entry).
+    /// `ec_dec_icdf` (§4.1.3.3): decodes a symbol from an inverse-CDF
+    /// table (entries are `(1 << ftb) - fh[k]`, terminated by a 0 entry
+    /// that is itself the last symbol's boundary).
+    ///
+    /// Implemented in libopus's algebraic form: with `r = rng >> ftb`,
+    /// symbol `k` satisfies `d >= r*icdf[k]` for the first `k`, giving
+    /// `val -= r*icdf[k]` and `rng = r*(icdf[k-1] - icdf[k])`.
     pub fn decode_icdf(&mut self, icdf: &[u8], ftb: u32) -> Result<u32> {
-        let ft = 1u32 << ftb;
-        let dm = self.rng / ft;
-        if dm == 0 {
+        let r = self.rng >> ftb;
+        if r == 0 {
             return Err(CadenceError::CorruptData(
                 "range decoder: rng < ft (corrupt frame)".to_string(),
             ));
         }
-        let fs = ft - (self.val / dm + 1).min(ft);
-        let mut k: usize = 0;
-        // The first entry where fs < (1 << ftb) - icdf[k]; since
-        // (1 << ftb) - icdf[k] == fh[k] is monotonically increasing, no
-        // subtraction is needed — just walk k.
+        let d = self.val;
+        let mut t;
+        let mut s = self.rng;
+        let mut ret = 0usize;
         loop {
-            let entry = *icdf.get(k).ok_or_else(|| {
+            t = s;
+            let entry = *icdf.get(ret).ok_or_else(|| {
                 CadenceError::CorruptData("icdf table missing its 0 terminator".to_string())
             })? as u32;
-            if entry == 0 {
-                return Err(CadenceError::CorruptData(
-                    "icdf table exhausted without a match".to_string(),
-                ));
-            }
-            if fs < ft - entry {
+            s = r * entry;
+            ret += 1;
+            if d >= s {
                 break;
             }
-            k += 1;
         }
-        let fh = ft - icdf[k] as u32;
-        let fl = if k == 0 { 0 } else { ft - icdf[k - 1] as u32 };
-        self.update(fl, fh, ft);
-        Ok(k as u32)
+        self.val = d - s;
+        self.rng = t - s;
+        self.normalize();
+        Ok((ret - 1) as u32)
     }
 
     /// `ec_dec_bits` (§4.1.4): reads `count` raw bits packed LSB-first from
@@ -173,25 +173,27 @@ impl<'a> RangeDecoder<'a> {
     }
 
     /// `ec_dec_uint` (§4.1.5): decodes one of `ft` equiprobable values.
+    ///
+    /// Out-of-range values on corrupt frames clamp to `ft - 1` and keep
+    /// decoding (matching libopus, which sets its error flag).
     pub fn decode_uint(&mut self, ft: u32) -> Result<u32> {
         if ft < 2 {
             return Ok(0);
         }
-        let ftb = ilog(ft - 1);
+        let ft_dec = ft - 1;
+        let ftb = ilog(ft_dec);
         if ftb <= 8 {
             let t = self.decode(ft)?;
             self.update(t, t + 1, ft);
             Ok(t)
         } else {
             let shift = ftb - 8;
-            let top_ft = ((ft - 1) >> shift) + 1;
+            let top_ft = (ft_dec >> shift) + 1;
             let mut t = self.decode(top_ft)?;
             self.update(t, t + 1, top_ft);
             t = (t << shift) | self.read_raw_bits(shift);
-            if t >= ft {
-                return Err(CadenceError::CorruptData(
-                    "ec_dec_uint decoded a value out of range (corrupt frame)".to_string(),
-                ));
+            if t > ft_dec {
+                return Ok(ft_dec);
             }
             Ok(t)
         }
@@ -200,6 +202,30 @@ impl<'a> RangeDecoder<'a> {
     /// Whole-bit usage (§4.1.6): a conservative count of consumed bits.
     pub fn tell(&self) -> u32 {
         self.nbits_total - ilog(self.rng)
+    }
+
+    /// `ec_tell_frac`: bit usage in 1/8-bit units, using the same linear
+    /// +correction-table shortcut as libopus (`entcode.c`).
+    pub fn tell_frac(&self) -> u32 {
+        static CORRECTION: [u32; 8] = [35733, 38967, 42495, 46340, 50535, 55109, 60097, 65535];
+        let nbits = self.nbits_total << 3;
+        let l = ilog(self.rng);
+        let r = self.rng >> (l - 16);
+        let mut b = (r >> 12) - 8;
+        b += u32::from(r > CORRECTION[b as usize]);
+        nbits - ((l << 3) + b)
+    }
+
+    /// Adjusts `nbits_total` so that [`tell`][Self::tell] reports `target`
+    /// (used by the CELT silence flag to pretend all bits were read).
+    pub fn force_tell(&mut self, target: i32) {
+        let delta = target - self.tell() as i32;
+        self.nbits_total = (self.nbits_total as i32 + delta) as u32;
+    }
+
+    /// The current range (seed for the CELT spectral LCG).
+    pub fn rng(&self) -> u32 {
+        self.rng
     }
 }
 
