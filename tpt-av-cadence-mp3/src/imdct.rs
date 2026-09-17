@@ -17,7 +17,7 @@ fn dct3_9(y: &mut [f32; 9]) {
 
     let mut t0 = s0 + s6 * 0.5;
     let mut sa = s0 - s6;
-    let t4 = (s4 + s2) * 0.93969262;
+    let t4 = (s4 + s2) * 0.939_692_6;
     let t2 = (s8 + s2) * 0.76604444;
     let sb = (s4 - s8) * 0.17364818;
     let mut s4 = s4 + s8 - s2;
@@ -33,11 +33,11 @@ fn dct3_9(y: &mut [f32; 9]) {
     let s5 = y[5];
     let s7 = y[7];
 
-    s3 *= 0.86602540;
-    t0 = (s5 + s1) * 0.98480775;
+    s3 *= 0.866_025_4;
+    t0 = (s5 + s1) * 0.984_807_7;
     let t4 = (s5 - s7) * 0.34202014;
     let t2 = (s1 + s7) * 0.64278761;
-    let s1 = (s1 - s5 - s7) * 0.86602540;
+    let s1 = (s1 - s5 - s7) * 0.866_025_4;
 
     let s5 = t0 - s3 - t2;
     let s7 = t4 - s3 - t0;
@@ -89,7 +89,7 @@ fn imdct36(grbuf: &mut [f32], overlap: &mut [f32], window: &[f32], nbands: usize
 
 /// 3-point IDCT helper.
 fn idct3(x0: f32, x1: f32, x2: f32, dst: &mut [f32; 3]) {
-    let m1 = x1 * 0.86602540;
+    let m1 = x1 * 0.866_025_4;
     let a1 = x0 - x2 * 0.5;
     dst[1] = x0 + x2;
     dst[0] = a1 + m1;
@@ -220,8 +220,8 @@ mod tests {
             let mut gb = [0.0f32; 18];
             imdct36_slice(&mut gb, &mut overlap, &x);
             print!("k={k} fast:");
-            for i in 0..6 {
-                print!(" {:.4}", gb[i]);
+            for sample in &gb[..6] {
+                print!(" {sample:.4}");
             }
             let n0: Vec<f64> = (0..6)
                 .map(|i| {

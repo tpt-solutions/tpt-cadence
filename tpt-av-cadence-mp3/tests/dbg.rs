@@ -21,7 +21,7 @@ fn dbg_find() {
     let mut d = Vec::new();
     f.read_to_end(&mut d).unwrap();
     let d = &d[44..];
-    println!("valid at 0: {}", valid(&d[..]));
+    println!("valid at 0: {}", valid(d));
     for i in 0..900 {
         if d[i] == 0xFF && valid(&d[i..]) {
             println!("sync at {i}: {:02x?}", &d[i..i + 4]);

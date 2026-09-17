@@ -89,9 +89,8 @@ pub fn parse_header(h: &[u8]) -> Result<FrameHeader> {
     }
     let mpeg1 = mpeg1_flag(h);
     let bitrate_kbps = 2 * HALF_RATE[half_rate_index(h)] as u32;
-    let sample_rate_hz = BASE_HZ[sample_rate_index(h) as usize] as u32
-        >> (!mpeg1 as u32)
-        >> (!not_mpeg25_flag(h) as u32);
+    let sample_rate_hz =
+        BASE_HZ[sample_rate_index(h) as usize] >> (!mpeg1 as u32) >> (!not_mpeg25_flag(h) as u32);
     let frame_bytes = (if mpeg1 { 1152 } else { 576 }) * bitrate_kbps * 125 / sample_rate_hz;
     let md = mode(h);
     let joint = md == 1;

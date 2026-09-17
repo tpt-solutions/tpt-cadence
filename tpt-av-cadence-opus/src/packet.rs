@@ -238,10 +238,14 @@ pub fn parse_packet(payload: &[u8]) -> Result<Packet> {
                     "code 3 packet must have at least 2 bytes".to_string(),
                 ));
             }
+            // Bit 0 (MSB) = VBR flag, bit 1 = padding flag, bits 2-7 (the
+            // low 6 bits) = frame count M — RFC 6716 §3.2.5 Figure 5 uses
+            // the same MSB-first bit numbering as the TOC byte itself
+            // (config in the top 5 bits, code in the bottom 2).
             let count_byte = payload[1];
-            let vbr = count_byte & 0x01 != 0;
-            let has_padding = count_byte & 0x02 != 0;
-            let frame_count = (count_byte >> 2) as usize;
+            let vbr = count_byte & 0x80 != 0;
+            let has_padding = count_byte & 0x40 != 0;
+            let frame_count = (count_byte & 0x3F) as usize;
             pos = 2;
             if frame_count == 0 {
                 return Err(CadenceError::CorruptData(
@@ -413,7 +417,7 @@ mod tests {
     fn code3_cbr_with_padding() {
         // Code 3, CBR (v=0), padding (p=1), M=3; padding length 5;
         // 3 frames of 4 bytes + 5 padding.
-        let mut payload = vec![0x03, 0x02 | 0x04 | (3 << 2), 5];
+        let mut payload = vec![0x03, 0x40 | 3, 5];
         payload.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         payload.extend_from_slice(&[0u8; 5]);
         let packet = parse_packet(&payload).unwrap();
@@ -428,7 +432,7 @@ mod tests {
     fn code3_vbr_with_dtx() {
         // Code 3, VBR (v=1), no padding, M=3; lengths 4, 0 (DTX) up front,
         // then frames back-to-back: 4 bytes, 0 bytes, remainder 2.
-        let payload = [0x03, 0x01 | (3 << 2), 4, 0, 5, 6, 7, 8, 9, 10];
+        let payload = [0x03, 0x80 | 3, 4, 0, 5, 6, 7, 8, 9, 10];
         let packet = parse_packet(&payload).unwrap();
         assert_eq!(packet.frame_count(), 3);
         assert_eq!(packet.frame_range(0), Some((4, 8)));
@@ -439,7 +443,7 @@ mod tests {
     #[test]
     fn code3_extended_padding_length() {
         // Padding length 255 -> 254 + next value (1) = 255 bytes.
-        let mut payload = vec![0x03, 0x02 | 0x04 | (1 << 2), 255, 1];
+        let mut payload = vec![0x03, 0x40 | 1, 255, 1];
         payload.push(0xAA); // one frame byte
         payload.extend(std::iter::repeat_n(0u8, 255));
         let packet = parse_packet(&payload).unwrap();

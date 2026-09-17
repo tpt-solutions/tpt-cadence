@@ -85,11 +85,15 @@ pub(crate) fn decode_scalefactors(
     scf: &mut [f32; 40],
     ch: usize,
 ) {
-    let mut partition_idx = (gr.n_short_sfb != 0) as usize + (gr.n_long_sfb == 0) as usize;
+    // Scalefactor count partition: one of three rows by block type, then the
+    // LSF byte offset (C reference treats the table as a flat array).
+    let partition_idx = (gr.n_short_sfb != 0) as usize + (gr.n_long_sfb == 0) as usize;
     let mut scf_size = [0u8; 4];
     let mut iscf = [0u8; 40];
     let scf_shift = gr.scalefac_scale + 1;
     let mut scfsi = gr.scfsi as i32;
+    // Byte offset into the flat partition array (nonzero only for LSF).
+    let mut k = 0usize;
 
     if hdr.mpeg1 {
         let part = SCFC_DECODE[gr.scalefac_compress as usize] as usize;
@@ -101,7 +105,7 @@ pub(crate) fn decode_scalefactors(
         // LSF: split scalefac_compress over the mixed-radix `SCF_MOD` groups.
         let ist = (hdr.i_stereo && ch == 1) as usize;
         let mut sfc = (gr.scalefac_compress >> ist) as i32;
-        let mut k = ist * 12;
+        k = ist * 12;
         while sfc >= 0 {
             let mut modprod = 1u32;
             for i in (0..4).rev() {
@@ -112,18 +116,20 @@ pub(crate) fn decode_scalefactors(
             sfc -= modprod as i32;
             k += 4;
         }
-        partition_idx += k;
         scfsi = -16;
     }
 
-    read_scalefactors(
-        &mut iscf,
-        ist_pos,
-        &scf_size,
-        &SCF_PARTITIONS[partition_idx],
-        bs,
-        scfsi,
-    );
+    // Flat-array semantics (C reference): the selected row plus the LSF byte
+    // offset; the count reader stops at the first zero (terminator). Clamp
+    // the offset and zero-fill short tails so corrupt `scalefac_compress`
+    // values cannot index past the table (the C reference reads out of
+    // bounds here; we substitute zeros instead).
+    let part_off = (partition_idx * 28 + k).min(SCF_PARTITIONS.len());
+    let mut counts = [0u8; 4];
+    for (dst, src) in counts.iter_mut().zip(SCF_PARTITIONS[part_off..].iter()) {
+        *dst = *src;
+    }
+    read_scalefactors(&mut iscf, ist_pos, &scf_size, &counts, bs, scfsi);
 
     if gr.n_short_sfb != 0 {
         let sh = 3 - scf_shift;

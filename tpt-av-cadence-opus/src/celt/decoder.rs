@@ -74,6 +74,7 @@ pub struct CeltDecoder {
     disable_inv: bool,
 
     rng: u32,
+    last_coded_bands: usize,
     error: bool,
     last_pitch_index: i32,
     loss_duration: i32,
@@ -161,6 +162,7 @@ impl CeltDecoder {
             end: NB_EBANDS,
             disable_inv: channels == 1,
             rng: 1_000_000, // reset state; libopus clears to 0
+            last_coded_bands: 0,
             error: false,
             last_pitch_index: 0,
             loss_duration: 0,
@@ -220,6 +222,24 @@ impl CeltDecoder {
     /// `CELT_SET_START_BAND`.
     pub fn set_start_band(&mut self, start: usize) {
         self.start = start;
+    }
+
+    /// The range coder's final state after the last successfully decoded
+    /// frame (`CELT_GET_FINAL_RANGE`). Lets a caller cross-check against an
+    /// encoder's own reported final range (e.g. the official Opus test
+    /// vectors' `.bit` files) to detect decoder desync independent of a
+    /// PCM comparison.
+    pub fn final_range(&self) -> u32 {
+        self.rng
+    }
+
+    /// The `coded_bands` value (number of PVQ-coded bands, per
+    /// `clt_compute_allocation`'s bisection) from the last successfully
+    /// decoded frame. Read-only debug accessor, analogous to
+    /// [`final_range`][Self::final_range], used to correlate decode
+    /// correctness with band count when investigating desync bugs.
+    pub fn last_coded_bands(&self) -> usize {
+        self.last_coded_bands
     }
 
     /// `OPUS_RESET_STATE`: clears the dynamic decoder state.
@@ -529,6 +549,17 @@ impl CeltDecoder {
         };
         bits -= anti_collapse_rsv;
 
+        if std::env::var_os("CELT_BAND_TRACE").is_some() {
+            eprintln!(
+                "HEADER silence={silence} is_transient={is_transient} intra_ener={intra_ener} \
+                 spread={spread_decision} alloc_trim={alloc_trim} anti_collapse_rsv={anti_collapse_rsv} \
+                 bits={bits} tell_frac_before_alloc={} tf_res={:?} offsets={:?} start={start} end={end} lm={lm} c={c}",
+                dec.tell_frac(),
+                &self.tf_res[start..end],
+                &self.offsets[start..end],
+            );
+        }
+
         let result = compute_allocation(
             start,
             end,
@@ -547,6 +578,19 @@ impl CeltDecoder {
         let dual_stereo = result.alloc.dual_stereo;
         let coded_bands = result.alloc.coded_bands;
         let balance = result.alloc.balance;
+
+        if std::env::var_os("CELT_BAND_TRACE").is_some() {
+            eprintln!(
+                "ALLOC coded_bands={coded_bands} balance={balance} intensity={intensity} \
+                 dual_stereo={dual_stereo} pulses={:?} ebits={:?} fine_priority={:?} \
+                 tell_frac_after_alloc={}",
+                &self.pulses[start..end],
+                &self.fine_quant[start..end],
+                &self.fine_priority[start..end],
+                dec.tell_frac(),
+            );
+        }
+        self.last_coded_bands = coded_bands;
 
         unquant_fine_energy(start, end, &mut self.old_band_e, &self.fine_quant, dec, c)?;
 

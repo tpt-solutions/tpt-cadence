@@ -650,18 +650,22 @@ fn quant_partition(
             ctx.remaining_bits -= curr_bits;
         }
 
+        if std::env::var_os("CELT_BAND_TRACE").is_some() {
+            eprintln!(
+                "  LEAF i={i} n={n} b={b} q={q} curr_bits={curr_bits} b_blocks={b_blocks} \
+                 tell_frac_before={}",
+                dec.tell_frac()
+            );
+        }
+
         if q != 0 {
             let k = get_pulses(q);
             // Finally do the actual quantization.
-            Ok(alg_unquant(
-                &mut x[..n],
-                &mut iy[..n],
-                k,
-                spread,
-                b_blocks,
-                dec,
-                gain,
-            )?)
+            let r = alg_unquant(&mut x[..n], &mut iy[..n], k, spread, b_blocks, dec, gain)?;
+            if std::env::var_os("CELT_BAND_TRACE").is_some() {
+                eprintln!("  LEAF i={i} k={k} tell_frac_after={}", dec.tell_frac());
+            }
+            Ok(r)
         } else {
             // If there's no pulse, fill the band anyway (decoder always
             // resynthesizes).
@@ -913,6 +917,11 @@ fn quant_band_stereo(
         let tmp = x[1];
         x[1] = tmp - y[1];
         y[1] += tmp;
+        if inv {
+            for v in y.iter_mut() {
+                *v = -*v;
+            }
+        }
     } else {
         // "Normal" split code.
         let mut mbits = 0.max(b.min((b - delta) / 2));
@@ -1110,6 +1119,14 @@ pub(crate) fn quant_all_bands(
         } else {
             0
         };
+
+        if std::env::var_os("CELT_BAND_TRACE").is_some() {
+            eprintln!(
+                "BAND i={i} n={n} b_blocks0={b_blocks0} tell={tell} balance_in={balance} b={b} \
+                 pulses_i={} remaining_bits={remaining_bits}",
+                pulses[i]
+            );
+        }
 
         if (m * EBAND5MS[i] as usize >= n + m * EBAND5MS[start] as usize || i == start + 1)
             && (update_lowband || lowband_offset == 0)

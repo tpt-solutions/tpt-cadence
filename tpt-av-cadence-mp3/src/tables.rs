@@ -232,17 +232,15 @@ pub(super) static SCF_MIXED: [[u8; 40]; 8] = [
 ];
 // dims [[8][40]], 320 entries
 
-pub(super) static SCF_PARTITIONS: [[u8; 28]; 3] = [
-    [
-        6, 5, 5, 5, 6, 5, 5, 5, 6, 5, 7, 3, 11, 10, 0, 0, 7, 7, 7, 0, 6, 6, 6, 3, 8, 8, 5, 0,
-    ],
-    [
-        8, 9, 6, 12, 6, 9, 9, 9, 6, 9, 12, 6, 15, 18, 0, 0, 6, 15, 12, 0, 6, 12, 9, 6, 6, 18, 9, 0,
-    ],
-    [
-        9, 9, 6, 12, 9, 9, 9, 9, 9, 9, 12, 6, 18, 18, 0, 0, 12, 12, 12, 0, 12, 9, 9, 6, 15, 12, 9,
-        0,
-    ],
+/// Scalefactor count partitions, flat exactly as the C reference lays them
+/// out: three 28-byte rows selected by block type, advanced by the LSF byte
+/// offset after the mixed-radix walk (`scf_partition += k`). Only the first
+/// four counts of the selected slice are ever read.
+pub(super) static SCF_PARTITIONS: [u8; 84] = [
+    6, 5, 5, 5, 6, 5, 5, 5, 6, 5, 7, 3, 11, 10, 0, 0, 7, 7, 7, 0, 6, 6, 6, 3, 8, 8, 5, 0, //
+    8, 9, 6, 12, 6, 9, 9, 9, 6, 9, 12, 6, 15, 18, 0, 0, 6, 15, 12, 0, 6, 12, 9, 6, 6, 18, 9,
+    0, //
+    9, 9, 6, 12, 9, 9, 9, 9, 9, 9, 12, 6, 18, 18, 0, 0, 12, 12, 12, 0, 12, 9, 9, 6, 15, 12, 9, 0,
 ];
 // dims [[3][28]], 84 entries
 

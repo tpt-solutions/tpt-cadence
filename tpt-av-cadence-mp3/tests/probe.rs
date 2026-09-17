@@ -23,6 +23,25 @@ fn decode_file(path: &Path) -> (usize, u32, usize, Vec<f32>) {
 }
 
 #[test]
+fn first_granule_matches_bundled_reference() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let mut decoder = Mp3Decoder::open(Box::new(
+        File::open(base.join("mpeg1_44100_stereo_128k.mp3")).unwrap(),
+    ))
+    .unwrap();
+    let mut pcm = [0.0; 576 * 2];
+    assert_eq!(decoder.decode(&mut pcm).unwrap(), 576);
+    let reference = std::fs::read(base.join("ref_128k.f32")).unwrap();
+    for (i, (&actual, bytes)) in pcm.iter().zip(reference.chunks_exact(4)).enumerate() {
+        let expected = f32::from_le_bytes(bytes.try_into().unwrap());
+        assert!(
+            (actual - expected).abs() <= 1e-5,
+            "sample {i}: actual={actual:e}, expected={expected:e}"
+        );
+    }
+}
+
+#[test]
 fn probe_128k() {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     let (frames, sr, ch, pcm) = decode_file(&base.join("mpeg1_44100_stereo_128k.mp3"));
@@ -31,6 +50,15 @@ fn probe_128k() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
+    assert_eq!(sr, 44100);
+    assert_eq!(ch, 2);
+    assert_eq!(frames, 133632);
+    assert_eq!(
+        pcm.len(),
+        ref_pcm.len(),
+        "decoded sample count differs from reference"
+    );
+    assert!(pcm.iter().all(|sample| sample.is_finite()));
     println!(
         "decoded frames={frames} sr={sr} ch={ch} ref_samples={}",
         ref_pcm.len() / 2
@@ -41,11 +69,15 @@ fn probe_128k() {
         for gr in 0..2 {
             let lo = (fr * 2 + gr) * 576 * 2;
             let hi = lo + 576 * 2;
-            if hi > n { break; }
-            let mut ssq = 0.0f64; let mut rsq = 0.0f64;
+            if hi > n {
+                break;
+            }
+            let mut ssq = 0.0f64;
+            let mut rsq = 0.0f64;
             for i in lo..hi {
                 let d = (pcm[i] - ref_pcm[i]) as f64;
-                ssq += d * d; rsq += ref_pcm[i] as f64 * ref_pcm[i] as f64;
+                ssq += d * d;
+                rsq += ref_pcm[i] as f64 * ref_pcm[i] as f64;
             }
             print!("f{fr}g{gr}:{:.1} ", 10.0 * (rsq / ssq.max(1e-20)).log10());
         }
@@ -66,12 +98,13 @@ fn probe_128k() {
         (ref_sq / n as f64).sqrt(),
         10.0 * (ref_sq / sum_sq).log10()
     );
+    assert!(
+        10.0 * (ref_sq / sum_sq).log10() > 100.0,
+        "whole-file SNR collapsed: expected > 100 dB vs the bundled reference"
+    );
     // First values for eyeballing.
     for i in 0..12 {
         print!("({:.4},{:.4}) ", pcm[i], ref_pcm[i]);
     }
     println!();
-    std::fs::write("../tools/rust_full.f32", unsafe {
-        std::slice::from_raw_parts(pcm.as_ptr() as *const u8, pcm.len() * 4)
-    }).unwrap();
 }

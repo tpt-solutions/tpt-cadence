@@ -12,9 +12,10 @@
 //! bit-reservoir (`main_data_begin`) and CRC-16 protection; a leading ID3v2
 //! tag is skipped.
 //!
-//! Conformance is validated against the bundled mpg123-derived streams
-//! (`tests/data/`) by comparing decoded PCM against reference float output
-//! and the original source WAVs.
+//! Ten bundled fixtures cover stream geometry, deterministic seek replay,
+//! and independent FFmpeg float PCM (>100 dB SNR, <=1e-5 peak error) when
+//! FFmpeg is available. These tolerance-based checks are not bit-exact
+//! conformance or exhaustive coverage of Layer III features.
 //!
 //! # Example
 //!

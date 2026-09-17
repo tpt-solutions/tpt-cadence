@@ -27,8 +27,7 @@ pub fn dct_ii(grbuf: &mut [f32], n: usize) {
             t[2][i] = u3 + u2;
             t[3][i] = (u3 - u2) * SEC[3 * i + 2];
         }
-        for g in 0..4 {
-            let x = &mut t[g];
+        for x in &mut t {
             let (mut x0, mut x1, mut x2, mut x3) = (x[0], x[1], x[2], x[3]);
             let (mut x4, mut x5, mut x6, mut x7) = (x[4], x[5], x[6], x[7]);
             let mut xt;
@@ -50,17 +49,17 @@ pub fn dct_ii(grbuf: &mut [f32], n: usize) {
             x6 = (x6 + x7) * 0.70710677;
             x7 += xt;
             x3 = (x3 + x4) * 0.70710677;
-            x5 -= x7 * 0.198912367; // rotate by PI/8
-            x7 += x5 * 0.382683432;
-            x5 -= x7 * 0.198912367;
+            x5 -= x7 * 0.198_912_37; // rotate by PI/8
+            x7 += x5 * 0.382_683_43;
+            x5 -= x7 * 0.198_912_37;
             x0 = xt - x6;
             xt += x6;
-            x[1] = (xt + x7) * 0.50979561;
-            x[2] = (x4 + x3) * 0.54119611;
-            x[3] = (x0 - x5) * 0.60134488;
-            x[5] = (x0 + x5) * 0.89997619;
-            x[6] = (x4 - x3) * 1.30656302;
-            x[7] = (xt - x7) * 2.56291556;
+            x[1] = (xt + x7) * 0.509_795_6;
+            x[2] = (x4 + x3) * 0.541_196_1;
+            x[3] = (x0 - x5) * 0.601_344_9;
+            x[5] = (x0 + x5) * 0.899_976_2;
+            x[6] = (x4 - x3) * 1.306_563;
+            x[7] = (xt - x7) * 2.562_915_6;
         }
         let mut base = k;
         for i in 0..7usize {
@@ -109,8 +108,7 @@ fn synth_pair(pcm: &mut [f32], pcm_off: usize, nch: usize, lins: &[f32], z: usiz
 /// whole QMF work area, exactly as the reference passes `lins + i*64`.
 fn synth(
     grbuf: &[f32],
-    xl: usize,
-    xr: usize,
+    (xl, xr): (usize, usize),
     pcm: &mut [f32],
     pcm_off: usize,
     nch: usize,
@@ -150,8 +148,10 @@ fn synth(
         lins[zlin + 4 * i + 3] = grbuf[xr + 1 + 18 * (31 - i)];
         lins[zlin + 4 * (i + 16)] = grbuf[xl + 1 + 18 * (1 + i)];
         lins[zlin + 4 * (i + 16) + 1] = grbuf[xr + 1 + 18 * (1 + i)];
-        lins[zlin + 4 * (i - 16) + 2] = grbuf[xl + 18 * (1 + i)];
-        lins[zlin + 4 * (i - 16) + 3] = grbuf[xr + 18 * (1 + i)];
+        // The tap is one 64-float block before zlin. Subtract from the
+        // absolute offset, not from i (which is always less than 16).
+        lins[zlin - 64 + 4 * i + 2] = grbuf[xl + 18 * (1 + i)];
+        lins[zlin - 64 + 4 * i + 3] = grbuf[xr + 18 * (1 + i)];
 
         for step in 0..8usize {
             let w0 = SYN_WIN[wi];
@@ -212,7 +212,7 @@ pub fn synth_granule(
     let xr_off = 576 * (nch - 1);
     let mut i = 0;
     while i < NBANDS {
-        synth(grbuf, i, i + xr_off, pcm, 32 * nch * i, nch, lins, i * 64);
+        synth(grbuf, (i, i + xr_off), pcm, 32 * nch * i, nch, lins, i * 64);
         i += 2;
     }
 

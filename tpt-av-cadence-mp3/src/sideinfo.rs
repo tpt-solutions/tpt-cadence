@@ -39,7 +39,10 @@ pub(crate) struct GranuleInfo {
 /// `SCF_LONG`/`SCF_SHORT`/`SCF_MIXED`.
 pub(crate) fn sr_table_idx(hdr: &FrameHeader) -> usize {
     let raw = crate::header::sample_rate_index(&hdr.bytes);
-    let my = raw + ((hdr.mpeg1 as u32) + (!hdr.lsf as u32)) * 3;
+    // The second version bit distinguishes MPEG-2 from MPEG-2.5;
+    // `!lsf` would duplicate `mpeg1` and select the wrong MPEG-2 rows.
+    let not_mpeg25 = hdr.bytes[1] & 0x10 != 0;
+    let my = raw + ((hdr.mpeg1 as u32) + (not_mpeg25 as u32)) * 3;
     (if my != 0 { my - 1 } else { 0 }) as usize
 }
 
@@ -80,7 +83,7 @@ pub(crate) fn read_side_info(
         }
         mdb
     } else {
-        let priv_bits = if hdr.mono { 5 } else { 3 };
+        let priv_bits = if hdr.mono { 1 } else { 2 };
         (bs.get_bits(8 + priv_bits) >> priv_bits) as u16
     };
 
@@ -111,6 +114,7 @@ pub(crate) fn read_side_info(
             gr.region_count = [7, 255, 255];
             if gr.block_type == SHORT_BLOCK {
                 if !gr.mixed_block_flag {
+                    gr.region_count[0] = 8;
                     gr.sfbtab = &SCF_SHORT[sr_idx];
                     gr.n_long_sfb = 0;
                     gr.n_short_sfb = 39;
@@ -141,13 +145,6 @@ pub(crate) fn read_side_info(
                 ((tables >> 5) & 31) as u8,
                 (tables & 31) as u8,
             ];
-            // Scalefactor sharing only applies between two long-block
-            // granules; granule 1 carries the per-channel flags.
-            gr.scfsi = if hdr.mpeg1 && g >= nch {
-                scfsi_stream[g % nch]
-            } else {
-                0
-            };
         }
         gr.preflag = if hdr.mpeg1 {
             bs.get_bit() != 0
@@ -156,6 +153,16 @@ pub(crate) fn read_side_info(
         };
         gr.scalefac_scale = bs.get_bits(1) as u8;
         gr.count1_table = bs.get_bits(1) as u8;
+        // MPEG-1 granule 1 carries the per-channel scfsi flags. Each
+        // granule-channel's own block type gates its own flags: a short
+        // block (pure or mixed) cannot share, long/start/stop can.
+        if hdr.mpeg1 && g >= nch {
+            gr.scfsi = if gr.block_type == SHORT_BLOCK {
+                0
+            } else {
+                scfsi_stream[g % nch]
+            };
+        }
     }
 
     // part2_3 lengths may not draw on more bit reservoir than exists.
@@ -167,4 +174,73 @@ pub(crate) fn read_side_info(
         ));
     }
     Ok(main_data_begin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_rate_band_tables_cover_all_version_families() {
+        for (version, expected) in [(0xe3, [0, 0, 1]), (0xf3, [2, 3, 4]), (0xfb, [5, 6, 7])] {
+            for (rate, index) in expected.into_iter().enumerate() {
+                let hdr =
+                    crate::header::parse_header(&[0xff, version, 0x30 | (rate as u8) << 2, 0xc0])
+                        .unwrap();
+                assert_eq!(sr_table_idx(&hdr), index, "{} Hz", hdr.sample_rate_hz);
+            }
+        }
+    }
+
+    #[test]
+    fn lsf_side_info_consumes_exact_wire_size() {
+        for (mode, bytes) in [(0xc0, 9), (0x00, 17)] {
+            let hdr = crate::header::parse_header(&[0xff, 0xf3, 0x38, mode]).unwrap();
+            let data = [0u8; 64];
+            let mut bs = BitReader::new(&data);
+            let mut granules = std::array::from_fn::<_, 4, _>(|_| GranuleInfo::default());
+            assert_eq!(read_side_info(&mut bs, &hdr, &mut granules).unwrap(), 0);
+            assert_eq!(bs.bit_pos(), bytes * 8, "mode={mode:#x}");
+        }
+    }
+
+    #[test]
+    fn pure_short_block_region_zero_has_nine_scalefactor_bands() {
+        // First frame: start windows in granule 0, pure short windows in
+        // granule 1. Its ID3v2 tag occupies the first 44 bytes.
+        let stream = include_bytes!("../tests/data/mpeg1_44100_stereo_128k.mp3");
+        let hdr = crate::header::parse_header(&stream[44..48]).unwrap();
+        let mut bs = BitReader::new(&stream[48..44 + hdr.total_bytes()]);
+        let mut granules = std::array::from_fn::<_, 4, _>(|_| GranuleInfo::default());
+        read_side_info(&mut bs, &hdr, &mut granules).unwrap();
+        for gr in &granules[2..] {
+            assert_eq!(gr.block_type, SHORT_BLOCK);
+            assert!(!gr.mixed_block_flag);
+            assert_eq!(gr.region_count[0], 8); // stored as band count minus one
+            let bands = gr.region_count[0] as usize + 1;
+            assert_eq!(
+                gr.sfbtab[..bands]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .sum::<usize>(),
+                36
+            );
+        }
+    }
+
+    #[test]
+    fn start_block_granule_keeps_scfsi_flags() {
+        // Frame 114 (offset 47691): granule 0 is a long block, granule 1 a
+        // start block (type 1). The stream's scfsi nibbles are (3, 15) and
+        // the reference decoder still applies them (the short-block mask
+        // only fires for type 2, i.e. when granule 0 itself is short).
+        let stream = include_bytes!("../tests/data/mpeg1_44100_stereo_128k.mp3");
+        let hdr = crate::header::parse_header(&stream[47691..47695]).unwrap();
+        let mut bs = BitReader::new(&stream[47695..47691 + hdr.total_bytes()]);
+        let mut granules = std::array::from_fn::<_, 4, _>(|_| GranuleInfo::default());
+        read_side_info(&mut bs, &hdr, &mut granules).unwrap();
+        assert_eq!(granules[2].block_type, 1);
+        assert_eq!(granules[2].scfsi, 3);
+        assert_eq!(granules[3].scfsi, 15);
+    }
 }

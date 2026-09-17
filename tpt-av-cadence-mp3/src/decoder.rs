@@ -28,9 +28,10 @@ const SIDE_INFO: [[usize; 2]; 2] = [[9, 17], [17, 32]];
 /// Decoder for raw MPEG-1/2/2.5 Layer III streams (a leading ID3v2 tag is
 /// skipped automatically).
 ///
-/// All allocation happens in [`Mp3Decoder::from_source`]/[`Mp3Decoder::open`];
-/// [`Decoder::decode`] is allocation-free, lock-free, and panic-free. Output
-/// is interleaved f32 in [-1, 1).
+/// Codec working buffers are allocated by [`Mp3Decoder::from_source`]/
+/// [`Mp3Decoder::open`]. Error construction can allocate, and source reads
+/// may block; a complete real-time safety audit remains pending. Output is
+/// interleaved f32 and is not clipped.
 pub struct Mp3Decoder {
     source: BufferedSource,
     info: StreamInfo,
@@ -73,7 +74,7 @@ impl Mp3Decoder {
     /// (`Read + Seek + Send`) get working `seek()`.
     pub fn from_source(source: Box<dyn ByteSource>) -> Result<Self, CadenceError> {
         let mut source = BufferedSource::new(source, 16 * 1024);
-        let (audio_start, mut probe, mut valid) = skip_id3v2(&mut source)?;
+        let (mut audio_start, mut probe, mut valid) = skip_id3v2(&mut source)?;
 
         // Probe for the first frame to learn the stream parameters. Bytes
         // pulled during the probe are carried over into the decoder window
@@ -81,8 +82,8 @@ impl Mp3Decoder {
         probe.resize(8 * 1024, 0);
         let mut probe_eof = false;
         let mut found: Option<(usize, FrameHeader)> = None;
-        while !probe_eof {
-            if valid < probe.len() {
+        loop {
+            if !probe_eof && valid < probe.len() {
                 match source.read(&mut probe[valid..]) {
                     Ok(0) => probe_eof = true,
                     Ok(n) => valid += n,
@@ -90,20 +91,32 @@ impl Mp3Decoder {
                 }
                 continue;
             }
+            // At EOF (`allow_tail`) the buffer may hold only a few frames;
+            // still scan it, accepting a tail candidate without a successor.
             match find_first_frame(&probe[..valid], probe_eof) {
-                Some(hit) => found = Some(hit),
-                None => {
-                    probe.copy_within(valid - 3.., 0);
-                    valid = 3;
+                Some(hit) => {
+                    found = Some(hit);
+                    break;
                 }
-            }
-            if found.is_some() {
-                break;
+                None if probe_eof => break,
+                None => {
+                    // Keep a complete candidate frame plus its successor's
+                    // header: retaining only three bytes loses frames whose
+                    // successor falls beyond the current probe window.
+                    let keep = MAX_L3_FRAME_PAYLOAD_BYTES + 4;
+                    let discarded = valid - keep;
+                    probe.copy_within(discarded..valid, 0);
+                    audio_start += discarded as u64;
+                    valid = keep;
+                }
             }
         }
         let (off, hdr) = found.ok_or_else(|| {
             CadenceError::InvalidFormat("no MPEG Layer III frame found in stream".into())
         })?;
+        // Account for bytes before the first frame within this probe window
+        // so seek() resets to the real first frame.
+        audio_start += off as u64;
 
         let channels: usize = if hdr.mono { 1 } else { 2 };
         let info = StreamInfo::new(Format::Mp3, hdr.sample_rate_hz, channels as u16, 16);
@@ -180,12 +193,13 @@ impl Mp3Decoder {
         Ok(())
     }
 
-    /// Refills once; returns false when no further progress is possible.
+    /// Refills once; returns true only when more buffered bytes are available.
+    /// EOF without progress yields false instead of looping on a partial frame.
     fn progress_or_eof(&mut self) -> Result<bool, CadenceError> {
         let before = self.window_valid - self.window_pos;
         self.fill_window()?;
         let after = self.window_valid - self.window_pos;
-        Ok(self.source_eof || after > before)
+        Ok(after > before)
     }
 
     /// Decodes the next frame into `pcm_staged`. Returns Ok(false) at end of
@@ -268,13 +282,23 @@ impl Mp3Decoder {
     /// e.g. missing bit reservoir).
     fn decode_frame(&mut self, hdr: &FrameHeader, sync: usize) -> Result<usize, CadenceError> {
         let nch: usize = if hdr.mono { 1 } else { 2 };
-        let si_len = SIDE_INFO[(!hdr.mpeg1) as usize][nch - 1];
+        let si_len = SIDE_INFO[hdr.mpeg1 as usize][nch - 1];
         let hdr_len = 4 + (hdr.crc as usize) * 2;
+        if hdr.total_bytes() < hdr_len + si_len {
+            return Err(CadenceError::CorruptData(
+                "truncated side information".into(),
+            ));
+        }
 
         if hdr.crc {
             let stored = u16::from_be_bytes([self.window[sync + 4], self.window[sync + 5]]);
-            let covered = &self.window[sync + 2..sync + hdr_len + si_len];
-            if crc16(covered) != stored {
+            // Only the final two header bytes and side information are
+            // protected, not the intervening stored CRC or main data.
+            let mut covered = [0u8; 2 + 32];
+            covered[..2].copy_from_slice(&self.window[sync + 2..sync + 4]);
+            covered[2..2 + si_len]
+                .copy_from_slice(&self.window[sync + hdr_len..sync + hdr_len + si_len]);
+            if crc16(&covered[..2 + si_len]) != stored {
                 return Err(CadenceError::CorruptData("header CRC-16 mismatch".into()));
             }
         }
@@ -305,7 +329,6 @@ impl Mp3Decoder {
         let n_granules = if hdr.mpeg1 { 2 } else { 1 };
         let mut frames = 0usize;
         let md_end_bits;
-        let dbg = std::env::var("MP3_DEBUG").is_ok();
         {
             let granules: &[GranuleInfo] = &self.granules;
             let mut md_bits = BitReader::new(&self.maindata[..md_len]);
@@ -313,7 +336,6 @@ impl Mp3Decoder {
             for igr in 0..n_granules {
                 if success {
                     self.grbuf.fill(0.0);
-                    *self.ist_pos = [[0; 39]; 2];
                     decode_granule(
                         hdr,
                         &granules[igr * nch..igr * nch + nch],
@@ -326,10 +348,6 @@ impl Mp3Decoder {
                         &mut self.reorder_scratch[..],
                         &mut self.mdct_overlap,
                     );
-                    if dbg {
-                        eprintln!("[dump] scf={:?}", &self.scf[..granules[igr * nch].n_long_sfb as usize + granules[igr * nch].n_short_sfb as usize]);
-                        eprintln!("[dump] grbuf_after_gr={:.6?}", &self.grbuf[..24]);
-                    }
                     synth::synth_granule(
                         &mut self.qmf_state,
                         &mut self.grbuf[..],
@@ -337,21 +355,6 @@ impl Mp3Decoder {
                         &mut self.pcm_staged[pcm_off..pcm_off + 576 * nch],
                         &mut self.lins[..],
                     );
-                    if dbg {
-                        eprintln!("[dump] pcm_gr={:.6?}", &self.pcm_staged[pcm_off..pcm_off + 24]);
-                    }
-                    if dbg && igr == 0 {
-                        use std::io::Write;
-                        let mut f = std::fs::File::create("grbuf_post.bin").unwrap();
-                        for v in self.grbuf.iter() {
-                            f.write_all(&v.to_le_bytes()).unwrap();
-                        }
-                        let mut f = std::fs::File::create("pcm_post.bin").unwrap();
-                        for v in &self.pcm_staged[pcm_off..pcm_off + 576 * nch] {
-                            f.write_all(&v.to_le_bytes()).unwrap();
-                        }
-                        eprintln!("[dump] wrote grbuf_post.bin nch={} i={} ms={}", nch, hdr.i_stereo, hdr.ms_stereo);
-                    }
                     pcm_off += 576 * nch;
                     frames += 576;
                 }
@@ -360,7 +363,7 @@ impl Mp3Decoder {
         }
 
         // Save the unconsumed main data for the next frame's reservoir.
-        let mut pos_byte = if success { (md_end_bits + 7) / 8 } else { 0 };
+        let mut pos_byte = if success { md_end_bits.div_ceil(8) } else { 0 };
         let mut remains = md_len.saturating_sub(pos_byte);
         if remains > MAX_BITRESERVOIR_BYTES {
             pos_byte += remains - MAX_BITRESERVOIR_BYTES;
@@ -391,9 +394,7 @@ fn decode_granule(
 ) {
     for ch in 0..nch {
         let granule_limit = bs.bit_pos() as i64 + gr_info[ch].part_23_length as i64;
-        let scf_start = bs.bit_pos();
         scalefac::decode_scalefactors(hdr, &mut ist_pos[ch], bs, &gr_info[ch], scf, ch);
-        let scf_bits = bs.bit_pos() - scf_start;
         let pos = bs.bit_pos();
         let end = huffman::huffman(
             &mut grbuf[ch * 576..ch * 576 + 576],
@@ -404,29 +405,6 @@ fn decode_granule(
             granule_limit,
         );
         bs.set_bit_pos(end);
-        if std::env::var("MP3_DEBUG").is_ok() {
-            eprintln!(
-                "[dbg] ch={} part23={} scf_bits={} huff_bits={} huff_end={} limit={} nonzero={} gg={} bv={} bt={} mixed={} sbg={:?} preflag={} sfs={} scfsi={} regions={:?} tsel={:?} c1={}",
-                ch,
-                gr_info[ch].part_23_length,
-                scf_bits,
-                end - pos,
-                end,
-                granule_limit,
-                grbuf[ch * 576..ch * 576 + 576].iter().filter(|v| **v != 0.0).count(),
-                gr_info[ch].global_gain,
-                gr_info[ch].big_values,
-                gr_info[ch].block_type,
-                gr_info[ch].mixed_block_flag,
-                gr_info[ch].subblock_gain,
-                gr_info[ch].preflag,
-                gr_info[ch].scalefac_scale,
-                gr_info[ch].scfsi,
-                gr_info[ch].region_count,
-                gr_info[ch].table_select,
-                gr_info[ch].count1_table,
-            );
-        }
     }
 
     if hdr.i_stereo {
@@ -573,10 +551,8 @@ impl Decoder for Mp3Decoder {
         let want = buffer.len() / channels;
         let mut written = 0;
         while written < want {
-            if self.staged_pos >= self.staged_frames {
-                if !self.decode_next_frame()? {
-                    break;
-                }
+            if self.staged_pos >= self.staged_frames && !self.decode_next_frame()? {
+                break;
             }
             let available = self.staged_frames - self.staged_pos;
             let n = (want - written).min(available);

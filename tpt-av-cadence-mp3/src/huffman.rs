@@ -21,7 +21,7 @@ fn pow_43(x: i32) -> f32 {
         mult = 16.0;
         x <<= 3;
     }
-    let sign = 2 * x & 64;
+    let sign = (2 * x) & 64;
     let frac = ((x & 63) - sign) as f32 / ((x & !63) + sign) as f32;
     POW43[(16 + ((x + sign) >> 6)) as usize]
         * (1.0 + frac * (4.0 / 3.0 + frac * (2.0 / 9.0)))
@@ -98,12 +98,13 @@ pub(crate) fn huffman(
     granule_limit: i64,
 ) -> usize {
     let mut bs = HuffBits::new(buf, start_pos);
-    let mut escapes = 0u32;
     let mut d = 0usize;
     let mut scf_idx = 0usize;
     let mut sfb_idx = 0usize;
     let mut big_val_cnt = gr.big_values as i32;
     let mut ireg = 0usize;
+    // A band may contain both big_values pairs and count1 quadruples.
+    let mut one = 0.0f32;
 
     'regions: while big_val_cnt > 0 {
         if ireg >= 3 {
@@ -122,7 +123,7 @@ pub(crate) fn huffman(
             let np = (gr.sfbtab[sfb_idx] / 2) as i32;
             sfb_idx += 1;
             let pairs = big_val_cnt.min(np);
-            let one = scf[scf_idx];
+            one = scf[scf_idx];
             scf_idx += 1;
             for _ in 0..pairs {
                 let mut w: u32 = 5;
@@ -138,7 +139,6 @@ pub(crate) fn huffman(
                 for _ in 0..2 {
                     let lsb = (leaf & 0x0F) as u32;
                     if lsb == 15 && linbits != 0 {
-                        escapes += 1;
                         let mag = lsb + bs.peek(linbits);
                         bs.flush(linbits);
                         bs.check();
@@ -184,7 +184,6 @@ pub(crate) fn huffman(
     // values are count1-coded and keep its scalefactor (np counts down the
     // overshoot before the next reload pulls the following band's factor).
     let mut np = 1 - big_val_cnt;
-    let mut one = 0.0f32;
     'count1: loop {
         if d + 4 > dst.len() {
             break;
@@ -226,15 +225,32 @@ pub(crate) fn huffman(
     }
 
     let limit = granule_limit.max(0) as usize;
-    if std::env::var("MP3_DEBUG").is_ok() && escapes > 0 {
-        eprintln!("[esc] escapes={}", escapes);
-    }
     limit.min(buf.len() * 8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count1_keeps_scale_when_big_values_end_inside_band() {
+        // Table 0 emits one zero pair without consuming bits. Table B's
+        // 0000 code followed by 0101 signs emits (+1,-1,+1,-1).
+        // The first count1 pair is still in band 0; the second is in band 1.
+        let gr = GranuleInfo {
+            big_values: 1,
+            count1_table: 1,
+            sfbtab: &[4, 4, 0],
+            ..Default::default()
+        };
+        let mut scf = [0.0; 40];
+        scf[0] = 2.0;
+        scf[1] = 3.0;
+        let mut dst = [0.0; 576];
+        assert_eq!(huffman(&mut dst, &[0x05], 0, &gr, &scf, 8), 8);
+        assert_eq!(&dst[..6], &[0.0, 0.0, 2.0, -2.0, 3.0, -3.0]);
+        assert!(dst[6..].iter().all(|&v| v == 0.0));
+    }
 
     #[test]
     fn pow43_matches_direct_computation() {

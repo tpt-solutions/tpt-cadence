@@ -10,3 +10,7 @@ rust-version.workspace = true
 [dependencies]
 tpt-av-cadence-core = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tpt-av-cadence-test-utils = { workspace = true }

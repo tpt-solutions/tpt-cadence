@@ -64,7 +64,11 @@ fn stereo_process(
         let ipos = ist_pos[i] as u32;
         if i as i32 > max_band[i % 3] && ipos < max_pos {
             // Intensity band; mid/side gain (√2) folds in when both are on.
-            let s = if hdr.ms_stereo { 1.41421356f32 } else { 1.0 };
+            let s = if hdr.ms_stereo {
+                std::f32::consts::SQRT_2
+            } else {
+                1.0
+            };
             let (kl, kr) = if hdr.mpeg1 {
                 (PAN[2 * ipos as usize], PAN[2 * ipos as usize + 1])
             } else {
@@ -103,10 +107,10 @@ pub(crate) fn intensity_stereo(
     }
     let default_pos = if hdr.mpeg1 { 3 } else { 0 };
     let mut pos = *ist_pos;
-    for i in 0..max_blocks {
+    for (i, &band) in max_band.iter().enumerate().take(max_blocks) {
         let itop = n_sfb - max_blocks + i;
         let prev = itop - max_blocks;
-        pos[itop] = if max_band[i] >= prev as i32 {
+        pos[itop] = if band >= prev as i32 {
             default_pos
         } else {
             ist_pos[prev]
