@@ -263,6 +263,12 @@ impl ChannelState {
 
         if self.fs_khz != fs_khz || frame_length != self.frame_length {
             if self.fs_khz != fs_khz {
+                if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+                    eprintln!(
+                        "FSCHANGE old_fs={} new_fs={} nb_subfr={}",
+                        self.fs_khz, fs_khz, self.nb_subfr
+                    );
+                }
                 self.ltp_mem_length = 20 * fs_khz as usize;
                 if fs_khz == 8 || fs_khz == 12 {
                     self.lpc_order = 10;
@@ -935,10 +941,22 @@ impl SilkDecoder {
         let n_mix = ctrl.n_channels_api.min(ctrl.n_channels_internal);
         for n in 0..n_mix {
             if ctrl.n_channels_api == 2 {
+                if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+                    eprintln!(
+                        "PRERESAMP ch={n} nSamplesOutDec={n_samples_out_dec} in={:?}",
+                        &self.tmp[n][1..1 + n_samples_out_dec.min(20)]
+                    );
+                }
                 self.channel[n].resampler.resample(
                     &mut self.resample_out[..n_samples_out],
                     &self.tmp[n][1..1 + n_samples_out_dec],
                 )?;
+                if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+                    eprintln!(
+                        "POSTRESAMP ch={n} nSamplesOut={n_samples_out} out={:?}",
+                        &self.resample_out[..n_samples_out]
+                    );
+                }
                 for i in 0..n_samples_out {
                     samples_out[n + 2 * i] = self.resample_out[i];
                 }

@@ -289,6 +289,17 @@ fn run_vector(dir: &Path, name: &str) -> VectorResult {
                                     "  {name} SILK pkt@offset={sample_offset}: max_diff={pkt_max_diff} toc.config={} stereo={} code={} frame_count={} frame_size={}",
                                     packet.toc.config, packet.toc.stereo, packet.toc.code, frame_count, frame_size
                                 );
+                                eprintln!("    decoded[0..20]={:?}", &pcm[..20.min(pcm.len())]);
+                                eprintln!(
+                                    "    reference[0..20]={:?}",
+                                    &reference[ref_start..ref_start + 20.min(pcm.len())]
+                                );
+                                eprintln!(
+                                    "    payload.len()={} frame_range(0)={:?} zero_count={}",
+                                    payload.len(),
+                                    packet.frame_range(0),
+                                    pcm.iter().filter(|&&x| x == 0).count()
+                                );
                             }
                         }
                         for (i, &d) in pcm.iter().enumerate() {

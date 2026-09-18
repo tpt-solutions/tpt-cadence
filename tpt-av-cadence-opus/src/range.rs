@@ -169,6 +169,10 @@ impl<'a> RangeDecoder<'a> {
             };
             value |= (bit as u32) << i;
         }
+        // `ec_dec_bits` (entdec.c) counts raw bits towards `nbits_total`
+        // too, since `ec_tell`/`ec_tell_frac` must reflect the whole
+        // frame's bit budget, not just the range-coded portion.
+        self.nbits_total += count;
         value
     }
 
@@ -358,6 +362,9 @@ impl RangeEncoder {
             self.end_window >>= 8;
             self.nend_bits -= 8;
         }
+        // `ec_enc_bits` (entenc.c) counts raw bits towards `nbits_total`
+        // too, mirroring `RangeDecoder::read_raw_bits`.
+        self.nbits_total += bits;
     }
 
     /// §5.1.4: encode one of `ft` equiprobable values.

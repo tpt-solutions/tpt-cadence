@@ -209,6 +209,32 @@ pub(crate) fn decode_core(
     lag_prev: i32,
 ) {
     debug_assert!(state.prev_gain_q16 != 0);
+    if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+        eprintln!(
+            "CORE fs={} nb_subfr={} sigType={} NLSFInterp={} lagPrev={} prevGain={}",
+            frame.subfr_length / 5,
+            frame.nb_subfr,
+            indices.signal_type,
+            indices.nlsf_interp_coef_q2,
+            lag_prev,
+            state.prev_gain_q16
+        );
+        eprintln!(
+            "CORE gains_Q16={},{},{},{}",
+            ctrl.gains_q16[0], ctrl.gains_q16[1], ctrl.gains_q16[2], ctrl.gains_q16[3]
+        );
+        eprintln!(
+            "CORE pitchL={},{},{},{} predcoef1[0..4]={},{},{},{}",
+            ctrl.pitch_l[0],
+            ctrl.pitch_l[1],
+            ctrl.pitch_l[2],
+            ctrl.pitch_l[3],
+            ctrl.pred_coef_q12[1][0],
+            ctrl.pred_coef_q12[1][1],
+            ctrl.pred_coef_q12[1][2],
+            ctrl.pred_coef_q12[1][3]
+        );
+    }
     let frame_length = frame.frame_length();
     debug_assert!(xq.len() >= frame_length && pulses.len() >= frame_length);
     debug_assert!(exc_q14.len() >= frame_length);
