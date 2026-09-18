@@ -55,15 +55,19 @@ pub(crate) const MAX_FRAMES_PER_PACKET: usize = 3;
 
 /// The type of conditional coding in effect for a frame — mirrors
 /// `CODE_INDEPENDENTLY`, `CODE_INDEPENDENTLY_NO_LTP_SCALING`, and
-/// `CODE_CONDITIONALLY` (`silk/define.h`). Only the
-/// [`CondCoding::Independently`] vs [`CondCoding::Conditionally`]
-/// distinction matters to the decoder.
+/// `CODE_CONDITIONALLY` (`silk/define.h`). The distinction matters for
+/// voiced frames: only [`CondCoding::Independently`] codes the
+/// LTP-scale symbol (`silk/decode_indices.c`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CondCoding {
-    /// `CODE_INDEPENDENTLY` (and `CODE_INDEPENDENTLY_NO_LTP_SCALING`:
-    /// both skip LTP-scale coding).
+    /// `CODE_INDEPENDENTLY`: full side info; the LTP-scale symbol is
+    /// coded for voiced frames.
     Independently,
-    /// `CODE_CONDITIONALLY`.
+    /// `CODE_INDEPENDENTLY_NO_LTP_SCALING`: like `Independently` except
+    /// the LTP-scale symbol is not coded (the side channel after a
+    /// skipped side frame needs no LTP scaling).
+    IndependentlyNoLtpScaling,
+    /// `CODE_CONDITIONALLY`: delta-coded side info.
     Conditionally,
 }
 

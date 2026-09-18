@@ -2,7 +2,7 @@
 
 Tracks all tasks for the whole project, organized by phase. See `DESIGN.md` for full design rationale.
 
-Status snapshot (workspace totals are historical; MP3 revalidated separately): `cargo deny` currently fails against deny.toml's deprecated keys with the newest cargo-deny — config migration pending, and MP3 now passes 36 tests including the doc test and required FFmpeg 7.1 comparisons of all ten bundled streams (>100 dB SNR, <=1e-5 peak error); MP3 strict Clippy is clean; broader feature/bit-exact conformance and the full safety audit remain unresolved. Historically, ~182 tests passed, including bit-exact conformance suites for WAV, AIFF, and FLAC (the FLAC suite MD5-verifies against the official IETF decoder testbench vectors, CC0, bundled under `tpt-av-cadence-flac/tests/data/`). The Opus crate now has 139 unit tests (packet/range coder + the full CELT decoder + the new packet-to-CELT wiring + the SILK modules so far: tables, side-info indices, stereo mid/side prediction, gains dequant, NLSF decode/NLSF2A, pitch lag + LTP codebook lookup, and excitation decode with the seed-dithered reconstruction) plus an `#[ignore]`d conformance test against the official RFC 6716 test vectors, which found a real bug in the packet parser (fixed) and a residual, not-yet-root-caused bug in the CELT decoder itself (see the CELT status section below) — that decoder bug is the reason Opus isn't yet counted toward bit-exact conformance the way WAV/AIFF/FLAC are.
+Status snapshot (workspace totals are historical; MP3 revalidated separately): `cargo deny check licenses` now passes clean — `deny.toml` migrated off the removed `deny` key (an allow-list is sufficient for the newest cargo-deny; everything not on `allow` is denied by default). MP3 passes 36 tests including the doc test and required FFmpeg 7.1 comparisons of all ten bundled streams (>100 dB SNR, <=1e-5 peak error); MP3 strict Clippy is clean; broader feature/bit-exact conformance and the full safety audit remain unresolved. Historically, ~182 tests passed, including bit-exact conformance suites for WAV, AIFF, and FLAC (the FLAC suite MD5-verifies against the official IETF decoder testbench vectors, CC0, bundled under `tpt-av-cadence-flac/tests/data/`). The Opus crate now has 172 unit tests (packet/range coder + the full CELT decoder + the packet-to-CELT wiring + the full SILK decoder: tables, side-info indices, stereo mid/side prediction, gains dequant, NLSF decode/NLSF2A, pitch lag + LTP codebook lookup, excitation decode with the seed-dithered reconstruction, the inverse-NSQ/LTP/LPC synthesis core (`silk/decode_core.c`), PLC + CNG (`silk/PLC.c`/`silk/CNG.c`, bit-exact against an independent Python oracle transcription), and the Tier 4 `SilkDecoder` top-level assembly (`silk/dec_API.c`/`decode_frame.c`/`decode_parameters.c`/`decoder_set_fs.c`) wiring all of the above into a per-payload decode loop with LBRR, mono/stereo, and resampling) plus an `#[ignore]`d conformance test against the official RFC 6716 test vectors, which found a real bug in the packet parser (fixed) and a residual, not-yet-root-caused bug in the CELT decoder itself (see the CELT status section below) — that decoder bug is the reason Opus isn't yet counted toward bit-exact conformance the way WAV/AIFF/FLAC are. A new `decode_silk_only_packet` top-level entry point (mirroring `decode_celt_only_packet`) and a SILK arm in `tests/conformance.rs` were run against the official RFC 6716 test vectors this session for the first time: found and fixed a real bug (only the first 20ms internal subframe of any 40/60ms SILK payload was being decoded, the rest left as silence), after which 3 of 12 vectors (pure SILK-only content) decode bit-exact (`final_range` matches 100% of packets, infinite PCM SNR); a smaller, still-unresolved transition glitch remains at internal-bandwidth (fs_kHz) switches — see the "SILK conformance — session update" section under Phase 3. Hybrid packets (SILK+CELT) are still rejected.
 
 ## Phase 0 — Project Setup & Governance
 
@@ -146,8 +146,8 @@ coefficients; compare vs FFmpeg decode of tests/data/test.aac
 - [x] Implement CELT decoder (MDCT-based, music-optimized)
 - [x] Wire CELT-only packets into a top-level packet decode path (`src/decoder.rs`, `decode_celt_only_packet`) — TOC → (start/end band, stream channels, frame size) mapping, multi-frame packets, DTX/PLC; not the full `Decoder` trait (still needs SILK/hybrid)
 - [ ] Root-cause the CELT `final_range` desync bug — see task breakdown below
-- [ ] Implement SILK decoder (speech-optimized, LP-based) — see task breakdown below
-- [ ] Integrate hybrid SILK+CELT mode (blocked on SILK decoder above)
+- [x] Implement SILK decoder (speech-optimized, LP-based) — see task breakdown below; wired into `decode_silk_only_packet`. This session ran it against the official RFC 6716 test vectors for the first time, found and fixed a real multi-subframe (40/60 ms payload) decode bug, and got 3 of 12 vectors to bit-exact `final_range` match — see the "SILK conformance — session update" subsection under Phase 3 below
+- [ ] Integrate hybrid SILK+CELT mode (SILK decoder is done; still needs the low-band CELT merge for hybrid packets)
 - [x] Conformance test harness against the official Opus test vectors (`tests/conformance.rs`, `#[ignore]`d — see below); found and fixed a real packet-parser bug, and found (but has not yet root-caused) a residual CELT decoder bug
 
 ### CELT decoder — status (packet mapping verified correct; decoder itself has a residual, unresolved desync bug)
@@ -557,16 +557,93 @@ bitstream correctness), so can start in parallel once that struct exists:**
 **Tier 3 — depends on Tier 2 outputs (LPC coefficients, gains, LTP
 coefficients, excitation signal):**
 
-- [ ] `silk/synthesis.rs` — short-term (LPC) synthesis filter +
+- [x] `silk/synthesis.rs` — short-term (LPC) synthesis filter +
   long-term (LTP) prediction for voiced subframes, noise-shaping
-  quantization inverse.
-- [ ] `silk/plc.rs` — SILK-side packet loss concealment.
+  quantization inverse. Done: `decode_core` (port of
+  `silk/decode_core.c`: the seed-dithered excitation reconstruction
+  delegated to `excitation::reconstruct_excitation`; per-subframe
+  `inv_gain_Q31` via `silk_INVERSE32_varQ(·, 47)` and the
+  `silk_DIV32_varQ` gain-change factor that rescales the sLPC_Q14
+  (and, on non-rewhitened voiced subframes, the sLTP_Q15) states;
+  voiced-branch re-whitening at subframe 0 and — when NLSF
+  interpolation is active — again at subframe 2 (which first copies
+  xq[0..2·subfr] into outBuf), with the k=0 `LTP_scale_Q14`
+  downscale; the 5-tap LTP prediction over sLTP_Q15 with the +2 bias
+  and the residual feedback into the state; the 10th/16th-order LPC
+  synthesis with `ADD_SAT32`/`LSHIFT_SAT32` and the Q0 output
+  quantization), plus the "voiced PLC → unvoiced" transition fix-up
+  (center-tap-only LTP filter + `pitchL[k] = lagPrev` for k < 2 —
+  mutating `pitchL` is observable because `silk_decode_frame` feeds
+  `pitchL[nb_subfr-1]` back into `lagPrev`), the
+  `silk_decoder_state` subset as `SynthesisState` (sLPC_Q14_buf /
+  outBuf incl. the end-of-frame slide-and-append from
+  `silk_decode_frame` / prev_gain_Q16, reset to 65536 per
+  `silk_reset_decoder`), frame geometry per `silk_decoder_set_fs`
+  (`FrameInfo`), and new shared helpers `silk_DIV32_varQ` and
+  `silk_LPC_analysis_filter` (generic non-`USE_CELT_FIR` form) in
+  `sigproc.rs`. Verification: 48-case bit-exact FNV-1a hash suite
+  over whole 3-frame decode runs (xq + post-frame pitchL + final
+  sLPC/outBuf/prevGain) against an independent Python transcription
+  of decode_core.c (covering all 6 fs×nb_subfr geometries, NLSF
+  interpolation on/off, gain changes incl. the state-rescale path,
+  all signal types, loss sequences with the transition fix-up, and
+  both realistic ±8k and full-range i16 coefficient distributions);
+  structural tests (unvoiced zero-LPC closed form, voiced
+  center-tap LTP hand trace incl. the k=0 scale participation,
+  pitchL-override truth table, outBuf slide, reset-state values,
+  geometry table); `div32_varq` endpoint literals checked against
+  the same transcription; no-panic fuzz over full-range garbage in
+  every geometry. Also fixed four never-compiled expectations in
+  `sigproc.rs`'s prior-session test block (`rand` LCG literal type,
+  `0x8765_4321` literal overflow, `smultt`/`sub_lshift32`/
+  `lshift_sat32` semantics — the LIMIT-then-shift macro tops out at
+  `32767 << 16`, not `i32::MAX`), and pinned `sum_sqr_shift`'s
+  reference fixed-point bias for saturated inputs `(306764653, 3)`
+  from a C transcription (the port is bit-exact; the old exact-sum
+  expectation was wrong even for libopus), plus the AR(1) analysis
+  test's coefficient (0.5 in Q12 is 2048, not 8192) and the
+  d==len all-zero case. Opus lib tests now 154/154.
+- [x] `silk/plc.rs` — SILK-side packet loss concealment. Done: full port
+  of `silk/PLC.c` (`plc`/`plc_conceal`/`plc_update`/`plc_glue_frames`,
+  the voiced pitch-based and unvoiced LPC-noise concealment paths, the
+  cross-fade glue after a loss run) and `silk/CNG.c` (`cng`: NLSF
+  smoothing, per-subframe gain tracking, LPC-shaped comfort noise added
+  into the output during silence/loss). Verification: a 32-case
+  bit-exact FNV-1a hash suite over multi-frame (loss/normal-mixed) runs
+  of `plc`+`cng`+`plc_glue_frames` in `silk_decode_frame`'s exact call
+  order, against an independent Python transcription of `PLC.c`/`CNG.c`;
+  plus `plc_reset`/`cng_reset` literal checks, an fs-change reset-path
+  test, and a never-panic sweep over hostile state/coefficient
+  combinations.
+- [x] `silk/decoder.rs` — `SilkDecoder` top-level. Done: full port of
+  `silk/dec_API.c`'s `silk_Decode` (first-frame-of-payload bookkeeping,
+  VAD/LBRR flag decode, the LBRR skip/decode pass, mid/side predictor
+  decode and side-channel skip logic, per-frame `LostFlag` dispatch,
+  mid/side → left/right conversion, internal→API resampling, mono→stereo
+  duplication, `prevPitchLag`/`LastGainIndex` cross-packet updates),
+  `silk_decode_frame` (`ChannelState::decode_frame`: side-info +
+  excitation + parameter + core decode, outBuf slide, PLC update/
+  concealment, CNG, frame gluing), `silk_decode_parameters` (gain
+  dequant, NLSF decode + NLSF2A + interframe interpolation, post-loss
+  BWE, voiced pitch/LTP lookups), and `silk_decoder_set_fs` (geometry,
+  NLSF codebook selection, resampler reinit, reset-on-rate-change
+  semantics). All scratch lives in the state structs (alloc-free
+  `decode`). Wired into a new top-level `decode_silk_only_packet`
+  (`src/decoder.rs`, mirroring `decode_celt_only_packet`): TOC config →
+  internal rate/payload duration, per-frame range decoder, DTX frames as
+  concealment. Tests: `set_fs` geometry table for all 6 (fs, nb_subfr)
+  pairs, resampler reinit on rate changes, invalid-rate rejection,
+  packet-loss plumbing (geometry/output-length math/loss counting/gain-
+  clamp removal), loss-run determinism + pitch-lag drift bounds, mono→
+  stereo duplication, two-channel internal loss bookkeeping, and
+  `decode_parameters`' unvoiced-zeroing/interpolation-gate/post-loss-BWE
+  branches. Not yet validated against the official RFC 6716 test vectors
+  or FFmpeg (see the Opus conformance section below) — the SILK
+  bitstream-to-PCM path is untested against real encoded streams this
+  session, only against independent-oracle unit tests of each stage.
 
-**Tier 4 — final assembly, depends on everything above:**
-
-- [ ] `silk/decoder.rs` — `SilkDecoder` top-level: per-20ms-frame decode
-  loop over 5ms subframes, LBRR (low-bitrate redundancy) handling,
-  multi-frame packet support, wiring Tiers 1-3 together.
+**Tier 4 — final assembly, depends on everything above:** done (see
+`silk/decoder.rs` above).
 
 Testing note: each Tier 1/2 module should get its own round-trip/table
 spot-check unit tests (mirroring how `celt/laplace.rs`, `celt/cwrs.rs`,
@@ -582,8 +659,15 @@ packet in a `.bit` file, decodes contiguous runs of CELT-only packets
 through `decode_celt_only_packet` with one persistent `CeltDecoder`,
 and compares against the reference `.dec` PCM plus (independently and
 more precisely) the encoder's recorded final range-coder state per
-packet. SILK/Hybrid packets are skipped (this crate can't decode them
-yet) while still advancing the expected sample offset.
+packet. As of this session, SILK-only packets are decoded too, through
+the new `decode_silk_only_packet` with one persistent `SilkDecoder`
+(reset whenever the previous packet was CELT-only, matching libopus);
+Hybrid packets are still skipped (this crate can't decode them yet)
+while still advancing the expected sample offset. This session did not
+have the official test vectors available locally to actually run the
+suite, so the SILK path's real-world pass rate against RFC 6716 vectors
+is not yet known — only its independent-oracle unit tests (see the
+task breakdown above) have been verified.
 
 How to run it: download `opus_testvectors.tar.gz` from
 <https://opus-codec.org/static/testvectors/opus_testvectors.tar.gz>
@@ -646,16 +730,111 @@ Running it against all 12 official vectors:
   alternative decoder) recommended above remains the highest-leverage next
   step.
 
+### SILK conformance — session update: multi-subframe bug found and fixed; three vectors now bit-exact
+
+This session downloaded `opus_testvectors.tar.gz` and ran `tests/conformance.rs`
+against all 12 official vectors for the first time. Also added SILK
+SNR/range-match reporting to the test's output (previously computed but never
+printed — see `run_vector`'s `silk_stats`/`silk_packet_count` fields).
+
+**Found and fixed a real bug**: `decode_silk_only_packet` (`src/decoder.rs`)
+called `SilkDecoder::decode` exactly once per *Opus* frame, but
+`SilkDecoder::decode` only ever produces one *internal* SILK subframe (always
+20 ms, or 10 ms in the rare case) per call — a 40/60 ms Opus/SILK frame needs
+2 or 3 internal frames, decoded from the same range decoder in a loop with
+`new_packet_flag` true only on the first (mirroring libopus's
+`while (nSamplesOut < FrameSize)` loop in `opus_decoder.c`). The old code
+wrote a single 20 ms internal frame's output into a buffer sized for the
+whole 40/60 ms Opus frame, leaving the remainder at its zero-initialized
+value. This was invisible to every existing unit/oracle test (all synthetic,
+none exercised a real multi-subframe payload end-to-end) and only surfaced
+against real bitstreams, where roughly 30% of decoded SILK-only audio was
+exact silence in vectors using >20 ms payloads. Fixed by looping
+`SilkDecoder::frames_per_packet(payload_size_ms)`'s frame count per Opus
+frame, sub-slicing the output buffer per internal frame
+(`sub_frame_size = frame_size / n_frames_per_payload`), and sharing one
+`RangeDecoder` across the internal frames of one Opus/SILK frame — exposed
+`SilkDecoder::frames_per_packet` as `pub(crate)` for this. Also deleted a
+dead, never-used `payload_size_ms` computation left over from an earlier
+refactor (`decoder.rs`, shadowed by the one now derived from `frame_size`).
+
+**Result**: testvector02/03/04 (pure SILK-only, no CELT/hybrid content) now
+decode **bit-exact** — `max |diff| = 0`, `SNR = ∞ dB`, and every packet's
+`final_range` matches the encoder's recorded value (1185/1185, 998/998,
+1265/1265). This is the first bit-exact conformance result for Opus at all
+(CELT's `final_range` bug, below, still blocks CELT-only content).
+
+Full per-vector numbers after the fix (`OPUS_TESTVECTORS_DIR=<path> cargo
+test -p tpt-av-cadence-opus --release -- --ignored --nocapture`):
+
+| vector | CELT SNR (dB) | CELT range match | SILK SNR (dB) | SILK packets |
+|---|---|---|---|---|
+| 01 | -2.3 | 0/2147 | (no SILK) | — |
+| 02 | (no CELT) | — | **inf** | 1185 |
+| 03 | (no CELT) | — | **inf** | 998 |
+| 04 | (no CELT) | — | **inf** | 1265 |
+| 05, 06 | (no CELT) | — | (no SILK) | — |
+| 07 | -1.5 | 286/4186 | (no SILK) | — |
+| 08 | -1.7 | 91/1242 | 0.1 | 5 |
+| 09 | 0.2 | 405/1332 | 3.0 | 5 |
+| 10 | 0.8 | 174/1598 | (no SILK) | — |
+| 11 | -2.4 | 0/553 | (no SILK) | — |
+| 12 | (no CELT) | — | 23.6 | 1068 |
+
+**Remaining SILK issue found this session (not yet root-caused): a
+transition glitch at internal-bandwidth (fs_kHz) switches.** testvector12 is
+pure SILK-only (mono) but mixes NB/MB/WB content (TOC config 1/5/9), and
+every mismatch in it clusters exactly at a config change, with the error
+decaying over the following ~5-10 packets (max diff ~1000-3000, decaying to
+~100-200 within 100ms) rather than a sustained desync — e.g. offsets 131520
+(config 1→5), 205440 (5→9), 584640-590400 (9, decaying after a prior
+transition), 1073280 (5→9, at EOF so no time to decay). This decay pattern
+(not a flat high error, and not correlated with a codeword desync, which
+would produce sustained garbage) points at a filter/state-scaling issue
+around `silk_decoder_set_fs`, not an entropy-decode bug. Ruled out this
+session (fetched the real `silk/decoder_set_fs.c` from
+`github.com/xiph/opus` tag `v1.5.2` and diffed by hand against
+`ChannelState::set_fs` in `src/silk/decoder.rs`): the reset scope (outBuf,
+sLPC_Q14_buf, lag_prev=100, last_gain_index=10, prev_signal_type,
+first_frame_after_reset=true, resampler reinit) matches the reference
+exactly, including which fields are *not* reset (e.g. `prev_gain_q16` is
+correctly left alone — the reference doesn't touch it either); the
+NLSF-interpolation disable on `first_frame_after_reset`
+(`decode_parameters`, `src/silk/decoder.rs` ~line 327) also matches. Not yet
+checked this session: `pitch_contour_iCDF`/`pitch_lag_low_bits_iCDF`
+selection (the reference caches these in decoder state gated on the same
+`fs_kHz`/`frame_length` condition as the LPC-order/NLSF-codebook switch,
+whereas this port appears to recompute them live from `fs_khz` — should be
+equivalent but not yet proven), the CNG smoothed-NLSF state's handling of an
+order change across the switch, and the resampler delay/history at the
+exact sample where its internal rate changes. Next step: an
+`SILK_DBG=1`-gated per-field dump (fs_khz, nb_subfr, lpc_order, gains,
+prev_gain_q16, lag_prev) for the packets immediately around one of the
+logged transition offsets above (e.g. testvector12 @ 205440), diffed against
+a Python transcription of `decode_core.c` fed the same real bits — the same
+oracle-trace approach already recommended for the CELT bug below, just
+against a much smaller, already-localized packet range.
+
 Deferred / next:
-- Root-cause the `final_range` desync — see the "CELT `final_range` desync
-  bug — session update" subsection above (under the CELT decoder status
-  section) for the current, up-to-date state: still unresolved after two
-  sessions of line-by-line/table-diff auditing; next step is a byte-exact
-  oracle trace (real libopus build, or an alternative decoder
+- Root-cause the CELT `final_range` desync — see the "CELT `final_range`
+  desync bug — session update" subsection above (under the CELT decoder
+  status section) for the current, up-to-date state: still unresolved after
+  two sessions of line-by-line/table-diff auditing; next step is a
+  byte-exact oracle trace (real libopus build, or an alternative decoder
   implementation), not more manual reading.
+- Root-cause the SILK bandwidth-switch transition glitch described just
+  above — localized to a handful of packets per vector, oracle-trace
+  approach recommended.
 - Bit-exact conformance vs libopus binaries (rather than just the
   recorded final range in the test vectors) still blocked on a
   gcc/ffmpeg toolchain (none on this machine).
+- Implement the hybrid SILK+CELT merge (low-band SILK + high-band CELT)
+  now that both sub-decoders exist independently — note testvector08/09's
+  tiny SILK-only segments (5 packets each, poor SNR) are likely SILK-only
+  runs sandwiched between hybrid packets this crate still skips, so their
+  state may be legitimately discontinuous until hybrid is wired up; revisit
+  their numbers once hybrid decoding exists rather than treating them as a
+  separate bug.
 
 ## Phase 4 — Legacy & Open Source
 

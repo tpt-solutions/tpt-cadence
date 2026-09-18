@@ -42,7 +42,7 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable |
 | [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable |
 | [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable |
-| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) | 🚧 In progress — packet parser + range coder done; CELT/SILK next |
+| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) | 🚧 In progress — packet parser, range coder, CELT, and SILK decoders done; hybrid mode and full conformance still open |
 | [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | 🚧 In progress |
 | [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | 🚧 Scaffolded |
 | [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis | 🚧 Scaffolded |
@@ -103,9 +103,8 @@ Conformance testing is anchored by [`tpt-av-cadence-test-utils`](tpt-av-cadence-
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: contributions are dual-licensed
-MIT OR Apache-2.0, no copyleft dependencies, and every new decoder must ship
-bit-exact conformance tests against a reference implementation.
+This project does not accept pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+how to report bugs or request features via GitHub issues.
 
 ## License
 

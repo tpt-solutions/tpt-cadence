@@ -51,7 +51,6 @@ fn main() {
     let records = read_bit_file(Path::new(&path));
 
     let mut celt = CeltDecoder::new(2, 48_000).unwrap();
-    let mut prev_was_celt = false;
     let mut buckets: BTreeMap<usize, Bucket> = BTreeMap::new();
 
     // Track, per coded_bands bucket, the packet index of the last PASS and
@@ -72,7 +71,6 @@ fn main() {
         let frame_count = packet.frame_count();
 
         if packet.toc.mode() == Mode::Celt {
-            prev_was_celt = true;
             let mut pcm = vec![0f32; frame_count * frame_size * 2];
             match decode_celt_only_packet(&mut celt, &packet, payload, &mut pcm) {
                 Ok(_) => {
@@ -101,10 +99,7 @@ fn main() {
                 Err(e) => panic!("decode_celt_only_packet failed at record {record_idx}: {e}"),
             }
             celt_pkt_index += 1;
-        } else {
-            prev_was_celt = false;
         }
-        let _ = prev_was_celt;
     }
 
     println!("\ncoded_bands  pass  fail  fail%");

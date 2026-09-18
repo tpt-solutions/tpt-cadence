@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-aiff"
 description = "AIFF/AIFC (big-endian IFF) parser and decoder for the tpt-cadence audio codec suite."
+readme = "README.md"
+keywords = ["audio", "aiff", "pcm", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

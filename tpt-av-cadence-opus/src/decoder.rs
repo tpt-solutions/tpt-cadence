@@ -14,6 +14,8 @@
 
 use crate::celt::CeltDecoder;
 use crate::packet::{Bandwidth, Mode, Packet};
+use crate::range::RangeDecoder;
+use crate::silk::decoder::{DecControl, LostFlag, SilkDecoder};
 use crate::{CadenceError, Result};
 
 /// Number of output channels this path always produces: the official test
@@ -122,6 +124,127 @@ pub fn decode_celt_only_packet(
     }
 
     Ok(frame_count * frame_size)
+}
+
+/// Decodes one already-demuxed, SILK-only Opus packet end-to-end,
+/// writing interleaved stereo 16-bit PCM at 48 kHz into `pcm`.
+///
+/// This mirrors [`decode_celt_only_packet`] for the SILK modes: the
+/// packet TOC's config selects the internal rate (configs 0–3 → 8 kHz,
+/// 4–7 → 12 kHz, 8–11 → 16 kHz) and payload duration (10/20/40/60 ms),
+/// the TOC's stereo flag the internal channel count. Every frame of the
+/// packet is decoded against its own byte range with its own range
+/// decoder and `new_packet_flag` set, exactly as libopus's
+/// `opus_decode_frame`/`opus_decode_native` pair does; a zero-length
+/// frame range (DTX) is decoded as packet-loss concealment, which for
+/// SILK means the comfort-noise path.
+///
+/// `silk` must persist across the stream's SILK packets; libopus resets
+/// it after CELT-only packets (`st->prev_mode == MODE_CELT_ONLY`), so
+/// callers should [`SilkDecoder::reset`] at every SILK run start.
+///
+/// Returns the total samples per channel written. Hybrid packets are
+/// still rejected: they additionally need the CELT low-band merge.
+pub fn decode_silk_only_packet(
+    silk: &mut SilkDecoder,
+    packet: &Packet,
+    payload: &[u8],
+    pcm: &mut [i16],
+) -> Result<usize> {
+    let toc = packet.toc;
+    match toc.mode() {
+        Mode::Silk => {}
+        Mode::Hybrid => {
+            return Err(CadenceError::UnsupportedFeature(
+                "hybrid packets need the SILK low band merged with CELT (not wired yet)"
+                    .to_string(),
+            ))
+        }
+        Mode::Celt => {
+            return Err(CadenceError::UnsupportedFeature(
+                "not a SILK-only packet; use decode_celt_only_packet".to_string(),
+            ))
+        }
+    }
+
+    let internal_sample_rate: i32 = match toc.config / 4 {
+        0 => 8000,
+        1 => 12000,
+        2 => 16000,
+        _ => {
+            return Err(CadenceError::CorruptData(format!(
+                "config {} is not a SILK-only configuration",
+                toc.config
+            )))
+        }
+    };
+    let n_channels_internal = if toc.stereo { 2 } else { 1 };
+
+    let frame_size = celt_frame_size(packet);
+    let frame_count = packet.frame_count();
+    let total = frame_count * frame_size;
+    let needed = total * OUTPUT_CHANNELS;
+    if pcm.len() < needed {
+        return Err(CadenceError::BufferTooSmall {
+            needed,
+            provided: pcm.len(),
+        });
+    }
+
+    // `payload_size_ms` mirrors libopus's IMAX(10, 1000 * audiosize / Fs):
+    // the duration of one Opus frame at the API rate. A single call to
+    // `SilkDecoder::decode` only ever produces one *internal* SILK frame
+    // (always 20 ms, except the rare 10 ms case), so a 40/60 ms Opus frame
+    // must drive multiple `decode` calls sharing the same range decoder —
+    // mirroring libopus's `while (nSamplesOut < FrameSize)` loop in
+    // `opus_decoder.c`'s SILK path.
+    let payload_size_ms: i32 = (frame_size as i32).max(10 * 48) / 48;
+    let (n_frames_per_payload, _) = SilkDecoder::frames_per_packet(payload_size_ms)?;
+    let sub_frame_size = frame_size / n_frames_per_payload;
+
+    for i in 0..frame_count {
+        let (start, end) = packet.frame_range(i).ok_or_else(|| {
+            CadenceError::CorruptData(format!(
+                "packet reports {frame_count} frames but frame {i} has no byte range"
+            ))
+        })?;
+        let frame_pcm =
+            &mut pcm[i * frame_size * OUTPUT_CHANNELS..(i + 1) * frame_size * OUTPUT_CHANNELS];
+        if start == end {
+            // DTX / empty frame: conceal (the reference routes zero-byte
+            // payloads through the PLC/CNG path with data == NULL).
+            for f in 0..n_frames_per_payload {
+                let mut ctrl = DecControl {
+                    n_channels_api: OUTPUT_CHANNELS,
+                    n_channels_internal,
+                    api_sample_rate: 48_000,
+                    internal_sample_rate,
+                    payload_size_ms,
+                    prev_pitch_lag: 0,
+                };
+                let chunk = &mut frame_pcm[f * sub_frame_size * OUTPUT_CHANNELS
+                    ..(f + 1) * sub_frame_size * OUTPUT_CHANNELS];
+                silk.decode(&mut ctrl, None, LostFlag::PacketLost, f == 0, chunk)?;
+            }
+        } else {
+            let mut dec = RangeDecoder::new(&payload[start..end]);
+            for f in 0..n_frames_per_payload {
+                let mut ctrl = DecControl {
+                    n_channels_api: OUTPUT_CHANNELS,
+                    n_channels_internal,
+                    api_sample_rate: 48_000,
+                    internal_sample_rate,
+                    payload_size_ms,
+                    prev_pitch_lag: 0,
+                };
+                let chunk = &mut frame_pcm[f * sub_frame_size * OUTPUT_CHANNELS
+                    ..(f + 1) * sub_frame_size * OUTPUT_CHANNELS];
+                silk.decode(&mut ctrl, Some(&mut dec), LostFlag::Normal, f == 0, chunk)?;
+            }
+        }
+    }
+
+    Ok(total)
 }
 
 #[cfg(test)]

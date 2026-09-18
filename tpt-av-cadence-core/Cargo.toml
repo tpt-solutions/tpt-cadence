@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-core"
 description = "Core traits and types for the tpt-cadence audio codec suite: the Decoder trait, StreamInfo, format enums, and error handling."
+readme = "README.md"
+keywords = ["audio", "codec", "decoder"]
+categories = ["multimedia::audio", "encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

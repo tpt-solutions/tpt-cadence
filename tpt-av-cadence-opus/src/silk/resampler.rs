@@ -206,6 +206,7 @@ enum ResamplerFn {
 /// SILK resampler state — mirrors `silk_resampler_state_struct`
 /// (`silk/resampler_structs.h`) plus the configuration
 /// `silk_resampler_init` computes.
+#[derive(Clone)]
 pub(crate) struct Resampler {
     /// `sIIR`: shared IIR/AR state. Used as the 6-element Q10 allpass
     /// state by [`up2_hq`] and as the 2-element AR2 state by [`ar2`].

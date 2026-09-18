@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-wav"
 description = "RIFF/WAVE parser and PCM/IEEE-float decoder for the tpt-cadence audio codec suite."
+readme = "README.md"
+keywords = ["audio", "wav", "pcm", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

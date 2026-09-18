@@ -42,7 +42,7 @@
 //! §4.2.9 ("Packet loss concealment").
 #![allow(dead_code)]
 
-use super::decode_indices::{TYPE_NO_VOICE_ACTIVITY, TYPE_VOICED, MAX_LPC_ORDER, MAX_NB_SUBFR};
+use super::decode_indices::{MAX_LPC_ORDER, MAX_NB_SUBFR, TYPE_NO_VOICE_ACTIVITY, TYPE_VOICED};
 use super::nlsf::{bwexpander, inverse32_varq, lpc_inverse_pred_gain, nlsf2a};
 use super::pitch::LTP_ORDER;
 use super::sigproc::{
@@ -257,7 +257,8 @@ fn plc_update(
                 break;
             }
             let mut temp_ltp_gain_q14: i32 = 0;
-            for coef in &ctrl.ltp_coef_q14[(nb_subfr - 1 - j) * LTP_ORDER..(nb_subfr - j) * LTP_ORDER]
+            for coef in
+                &ctrl.ltp_coef_q14[(nb_subfr - 1 - j) * LTP_ORDER..(nb_subfr - j) * LTP_ORDER]
             {
                 temp_ltp_gain_q14 += *coef as i32;
             }
@@ -267,7 +268,9 @@ fn plc_update(
                 // below immediately overwrites everything but the
                 // center tap.
                 let src = (nb_subfr - 1 - j) * LTP_ORDER;
-                ps_plc.ltp_coef_q14.copy_from_slice(&ctrl.ltp_coef_q14[src..src + LTP_ORDER]);
+                ps_plc
+                    .ltp_coef_q14
+                    .copy_from_slice(&ctrl.ltp_coef_q14[src..src + LTP_ORDER]);
 
                 ps_plc.pitch_l_q8 = ctrl.pitch_l[nb_subfr - 1 - j] << 8;
             }
@@ -301,7 +304,9 @@ fn plc_update(
     ps_plc.prev_ltp_scale_q14 = ctrl.ltp_scale_q14;
 
     // Save last two gains
-    ps_plc.prev_gain_q16.copy_from_slice(&ctrl.gains_q16[nb_subfr - 2..nb_subfr]);
+    ps_plc
+        .prev_gain_q16
+        .copy_from_slice(&ctrl.gains_q16[nb_subfr - 2..nb_subfr]);
 
     ps_plc.subfr_length = subfr_length;
     ps_plc.nb_subfr = nb_subfr;
@@ -413,8 +418,8 @@ fn plc_conceal(
                 rand_scale_q14 = rand_scale_q14.wrapping_sub(*coef);
             }
             rand_scale_q14 = rand_scale_q14.max(3277); /* 0.2 */
-            rand_scale_q14 = (smulbb(rand_scale_q14 as i32, ps_plc.prev_ltp_scale_q14 as i32) >> 14)
-                as i16;
+            rand_scale_q14 =
+                (smulbb(rand_scale_q14 as i32, ps_plc.prev_ltp_scale_q14 as i32) >> 14) as i16;
         } else {
             // Reduce random noise for unvoiced frames with high LPC gain
             let inv_gain_q30 = lpc_inverse_pred_gain(&ps_plc.prev_lpc_q12, lpc_order);
@@ -453,18 +458,17 @@ fn plc_conceal(
     /***************************/
     for _k in 0..frame_info.nb_subfr {
         // Set up pointer
-        let mut pred_lag = sltp_buf_idx - lag as usize + LTP_ORDER / 2;
-        for _ in 0..frame_info.subfr_length {
+        let pred_lag = sltp_buf_idx - lag as usize + LTP_ORDER / 2;
+        for p in 0..frame_info.subfr_length {
             // Unrolled loop
             // Avoids introducing a bias because silk_SMLAWB() always
             // rounds to -inf
             let mut ltp_pred_q12: i32 = 2;
-            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag], b_q14[0] as i32);
-            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag - 1], b_q14[1] as i32);
-            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag - 2], b_q14[2] as i32);
-            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag - 3], b_q14[3] as i32);
-            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag - 4], b_q14[4] as i32);
-            pred_lag += 1;
+            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag + p], b_q14[0] as i32);
+            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag + p - 1], b_q14[1] as i32);
+            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag + p - 2], b_q14[2] as i32);
+            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag + p - 3], b_q14[3] as i32);
+            ltp_pred_q12 = smlawb(ltp_pred_q12, sltp_q14[pred_lag + p - 4], b_q14[4] as i32);
 
             // Generate LPC excitation
             rand_seed = rand(rand_seed);
@@ -508,7 +512,11 @@ fn plc_conceal(
         // to -inf
         let mut lpc_pred_q10: i32 = (lpc_order >> 1) as i32;
         for (j, a) in a_q12[..lpc_order].iter().enumerate() {
-            lpc_pred_q10 = smlawb(lpc_pred_q10, sltp_q14[ltp_mem_length + i - j - 1], *a as i32);
+            lpc_pred_q10 = smlawb(
+                lpc_pred_q10,
+                sltp_q14[ltp_mem_length + i - j - 1],
+                *a as i32,
+            );
         }
 
         // Add prediction to LPC excitation
@@ -516,15 +524,16 @@ fn plc_conceal(
             add_sat32(sltp_q14[ltp_mem_length + i], lshift_sat32(lpc_pred_q10, 4));
 
         // Scale with Gain
-        frame[i] = sat16(
-            sat16(rshift_round(smulww(sltp_q14[ltp_mem_length + i], prev_gain_q10[1]), 8)) as i32,
-        );
+        frame[i] = sat16(sat16(rshift_round(
+            smulww(sltp_q14[ltp_mem_length + i], prev_gain_q10[1]),
+            8,
+        )) as i32);
     }
 
     // Save LPC state
-    state
-        .s_lpc_q14_buf
-        .copy_from_slice(&sltp_q14[slpc_base + frame_length..slpc_base + frame_length + MAX_LPC_ORDER]);
+    state.s_lpc_q14_buf.copy_from_slice(
+        &sltp_q14[slpc_base + frame_length..slpc_base + frame_length + MAX_LPC_ORDER],
+    );
 
     /**************************************/
     /* Update states                      */
@@ -576,8 +585,8 @@ pub(crate) fn plc_glue_frames(ps_plc: &mut PlcState, frame: &mut [i16], length: 
                 // Make slope 4x steeper to avoid missing onsets after DTX
                 slope_q16 <<= 2;
 
-                for i in 0..length {
-                    frame[i] = smulwb(gain_q16, frame[i] as i32) as i16;
+                for v in &mut frame[..length] {
+                    *v = smulwb(gain_q16, *v as i32) as i16;
                     gain_q16 = gain_q16.wrapping_add(slope_q16);
                     if gain_q16 > 1 << 16 {
                         break;
@@ -657,13 +666,11 @@ pub(crate) fn cng(
         // Update CNG parameters
 
         // Smoothing of LSF's
-        for i in 0..lpc_order {
-            let smoothed = ps_cng.cng_smth_nlsf_q15[i] as i32
-                + smulwb(
-                    prev_nlsf_q15[i] as i32 - ps_cng.cng_smth_nlsf_q15[i] as i32,
-                    CNG_NLSF_SMTH_Q16,
-                );
-            ps_cng.cng_smth_nlsf_q15[i] = smoothed as i16;
+        for (smth, &prev) in ps_cng.cng_smth_nlsf_q15[..lpc_order]
+            .iter_mut()
+            .zip(&prev_nlsf_q15[..lpc_order])
+        {
+            *smth = (*smth as i32 + smulwb(prev as i32 - *smth as i32, CNG_NLSF_SMTH_Q16)) as i16;
         }
         // Find the subframe with the highest gain
         let mut max_gain_q16: i32 = 0;
@@ -742,8 +749,11 @@ pub(crate) fn cng(
             // rounds to -inf
             let mut lpc_pred_q10: i32 = (lpc_order >> 1) as i32;
             for (j, a) in a_q12[..10].iter().enumerate() {
-                lpc_pred_q10 =
-                    smlawb(lpc_pred_q10, cng_sig_q14[MAX_LPC_ORDER + i - 1 - j], *a as i32);
+                lpc_pred_q10 = smlawb(
+                    lpc_pred_q10,
+                    cng_sig_q14[MAX_LPC_ORDER + i - 1 - j],
+                    *a as i32,
+                );
             }
             if lpc_order == 16 {
                 for (j, a) in a_q12[10..16].iter().enumerate() {
@@ -764,7 +774,10 @@ pub(crate) fn cng(
             // Scale with Gain and add to input signal
             frame[i] = add_sat16(
                 frame[i] as i32,
-                sat16(rshift_round(smulww(cng_sig_q14[MAX_LPC_ORDER + i], gain_q10), 8)) as i32,
+                sat16(rshift_round(
+                    smulww(cng_sig_q14[MAX_LPC_ORDER + i], gain_q10),
+                    8,
+                )) as i32,
             );
         }
         ps_cng
@@ -773,5 +786,592 @@ pub(crate) fn cng(
     } else {
         let lpc_order = frame_info.lpc_order;
         ps_cng.cng_synth_state[..lpc_order].fill(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::silk::synthesis::{DecoderControl as Ctrl, FrameInfo};
+
+    /// Small deterministic PRNG (xorshift32) so the tests need no
+    /// external crate (same generator as the other silk tests).
+    struct XorShift(u32);
+
+    impl XorShift {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+    }
+
+    const SEED_BASE: u32 = 0x5EED_FA11;
+    const N_CASES: usize = 32;
+    const FRAMES_PER_CASE: usize = 6;
+    const MAX_SUBFRS: usize = MAX_NB_SUBFR;
+
+    struct FrameCase {
+        lost: bool,
+        signal_type: i8,
+        ctrl: Ctrl,
+        xq: Vec<i16>,
+        exc: Vec<i32>,
+        prev_nlsf: Vec<i16>,
+    }
+
+    struct Case {
+        info: FrameInfo,
+        plc: PlcState,
+        cng: CngState,
+        state: SynthesisState,
+        prev_signal_type: i8,
+        first_frame_after_reset: bool,
+        frames: Vec<FrameCase>,
+    }
+
+    /// The Q14 excitation draw of the oracle: mostly realistic Q14
+    /// magnitudes (|x| < 2^24), every tenth sample full-range i32.
+    fn exc_draw(rng: &mut XorShift) -> i32 {
+        let r = rng.next_u32() % 10;
+        if r < 8 {
+            (rng.next_u32() % (1 << 25)) as i32 - (1 << 24)
+        } else {
+            rng.next_u32() as i32
+        }
+    }
+
+    /// Mirrors the oracle's `gen_case` exactly (same xorshift32 stream,
+    /// same draw order, same value ranges).
+    fn gen_case(rng: &mut XorShift, case_idx: usize) -> Case {
+        let fs = [8u32, 12, 16][(rng.next_u32() % 3) as usize];
+        let nb_subfr = 2 + 2 * (rng.next_u32() % 2) as usize;
+        let subfr_length = 5 * fs as usize;
+        let frame_length = nb_subfr * subfr_length;
+        let lpc_order = if fs == 16 { 16 } else { 10 };
+        let coef_max: u32 = if case_idx % 3 == 0 { 32768 } else { 8192 };
+
+        let i16_of = |u: u32| -> i16 { (u as u16) as i16 };
+
+        // --- PlcState
+        let plc_fs_khz = if case_idx % 2 == 0 { fs } else { 0 };
+        let pitch_l_q8 = ((2 * fs as i32) + (rng.next_u32() % (16 * fs + 1)) as i32) << 8;
+        let ltp_coef: Vec<i16> = (0..5).map(|_| i16_of(rng.next_u32() % 65536)).collect();
+        let prev_lpc: Vec<i16> = (0..16)
+            .map(|_| (rng.next_u32() % (2 * coef_max)) as i32 - coef_max as i32)
+            .map(|v| v as i16)
+            .collect();
+        let last_frame_lost = (rng.next_u32() % 2) == 1;
+        let rand_seed = rng.next_u32() as i32;
+        let rand_scale_q14 = i16_of(rng.next_u32() % 65536);
+        let conc_energy = rng.next_u32() as i32;
+        let conc_energy_shift = (rng.next_u32() % 8) as i32;
+        let prev_ltp_scale_q14 = [8192i16, 12288, 15565][(rng.next_u32() % 3) as usize];
+        let pg0 = 81920 + (rng.next_u32() % (1 << 26)) as i32;
+        let pg1 = 81920 + (rng.next_u32() % (1 << 26)) as i32;
+        let plc_subfr_length = [20usize, 40, 60, 80][(rng.next_u32() % 4) as usize];
+        let plc_nb_subfr = 2 + 2 * (rng.next_u32() % 2) as usize;
+
+        // --- CngState
+        let cng_fs_khz = if case_idx % 2 == 0 { fs } else { 0 };
+        let cng_exc_vec: Vec<i32> = (0..MAX_FRAME_LENGTH).map(|_| exc_draw(rng)).collect();
+        let mut cng_nlsf: Vec<i16> = (0..16).map(|_| (rng.next_u32() % 32768) as i16).collect();
+        cng_nlsf.sort_unstable();
+        let cng_synth: Vec<i32> = (0..16).map(|_| rng.next_u32() as i32).collect();
+        let cng_smth_gain = (rng.next_u32() % (1 << 26)) as i32;
+        let cng_rand_seed = rng.next_u32() as i32;
+
+        // --- synthesis state
+        let s_lpc: Vec<i32> = (0..16).map(|_| rng.next_u32() as i32).collect();
+        let out_buf: Vec<i16> = (0..MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH)
+            .map(|_| i16_of(rng.next_u32() % 65536))
+            .collect();
+
+        // --- scalars
+        let prev_signal_type = (rng.next_u32() % 3) as i8;
+        let _lag_prev = 2 * fs as i32 + (rng.next_u32() % (16 * fs + 1)) as i32;
+        let first_frame_after_reset = (rng.next_u32() % 2) == 0;
+
+        let mut frames = Vec::with_capacity(FRAMES_PER_CASE);
+        for f in 0..FRAMES_PER_CASE {
+            let mut lost = (rng.next_u32() % 5) < 2;
+            if f == 1 {
+                lost = true;
+            }
+            if f == 2 {
+                lost = false;
+            }
+            let signal_type = (rng.next_u32() % 3) as i8;
+            let _qot = rng.next_u32() % 2;
+
+            let mut pitch_l = [0i32; MAX_SUBFRS];
+            for p in pitch_l.iter_mut().take(nb_subfr) {
+                if signal_type == TYPE_VOICED {
+                    *p = 2 * fs as i32 + (rng.next_u32() % (16 * fs + 1)) as i32;
+                }
+            }
+            let mut gains_q16 = [0i32; MAX_SUBFRS];
+            for g in gains_q16.iter_mut().take(nb_subfr) {
+                *g = 81920 + (rng.next_u32() % (1 << 26)) as i32;
+            }
+            let draw_coef = |rng: &mut XorShift| -> [i16; MAX_LPC_ORDER] {
+                let mut a = [0i16; MAX_LPC_ORDER];
+                for v in a.iter_mut() {
+                    *v = ((rng.next_u32() % (2 * coef_max)) as i32 - coef_max as i32) as i16;
+                }
+                a
+            };
+            let pred0 = draw_coef(rng);
+            let pred1 = draw_coef(rng);
+            let mut ltp_coef_q14 = [0i16; LTP_ORDER * MAX_SUBFRS];
+            for v in ltp_coef_q14[..nb_subfr * LTP_ORDER].iter_mut() {
+                *v = i16_of(rng.next_u32() % 65536);
+            }
+            let ltp_scale_q14 = [8192i16, 12288, 15565][(rng.next_u32() % 3) as usize];
+            let xq: Vec<i16> = (0..frame_length)
+                .map(|_| i16_of(rng.next_u32() % 65536))
+                .collect();
+            let exc: Vec<i32> = (0..MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH)
+                .map(|_| exc_draw(rng))
+                .collect();
+            let mut prev_nlsf: Vec<i16> = (0..lpc_order)
+                .map(|_| (rng.next_u32() % 32768) as i16)
+                .collect();
+            prev_nlsf.sort_unstable();
+
+            frames.push(FrameCase {
+                lost,
+                signal_type,
+                ctrl: Ctrl {
+                    pitch_l,
+                    gains_q16,
+                    pred_coef_q12: [pred0, pred1],
+                    ltp_coef_q14,
+                    ltp_scale_q14,
+                },
+                xq,
+                exc,
+                prev_nlsf,
+            });
+        }
+
+        let to_arr16 = |v: &Vec<i16>| -> [i16; 16] {
+            let mut a = [0i16; 16];
+            a.copy_from_slice(v);
+            a
+        };
+        let to_arr16_i32 = |v: &Vec<i32>| -> [i32; 16] {
+            let mut a = [0i32; 16];
+            a.copy_from_slice(v);
+            a
+        };
+        let mut plc_arr = [0i16; LTP_ORDER];
+        plc_arr.copy_from_slice(&ltp_coef);
+        let mut out_buf_arr = [0i16; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH];
+        out_buf_arr.copy_from_slice(&out_buf);
+        let mut cng_exc_buf = [0i32; MAX_FRAME_LENGTH];
+        cng_exc_buf.copy_from_slice(&cng_exc_vec);
+
+        Case {
+            info: FrameInfo::new(fs, nb_subfr),
+            plc: PlcState {
+                pitch_l_q8,
+                ltp_coef_q14: plc_arr,
+                prev_lpc_q12: to_arr16(&prev_lpc),
+                last_frame_lost,
+                rand_seed,
+                rand_scale_q14,
+                conc_energy,
+                conc_energy_shift,
+                prev_ltp_scale_q14,
+                prev_gain_q16: [pg0, pg1],
+                fs_khz: plc_fs_khz,
+                nb_subfr: plc_nb_subfr,
+                subfr_length: plc_subfr_length,
+            },
+            cng: CngState {
+                cng_exc_buf_q14: cng_exc_buf,
+                cng_smth_nlsf_q15: to_arr16(&cng_nlsf),
+                cng_synth_state: to_arr16_i32(&cng_synth),
+                cng_smth_gain_q16: cng_smth_gain,
+                rand_seed: cng_rand_seed,
+                fs_khz: cng_fs_khz,
+            },
+            state: SynthesisState {
+                s_lpc_q14_buf: to_arr16_i32(&s_lpc),
+                out_buf: out_buf_arr,
+                prev_gain_q16: 65536,
+            },
+            prev_signal_type,
+            first_frame_after_reset,
+            frames,
+        }
+    }
+
+    fn fnv1a64(data: &[u8]) -> u64 {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h
+    }
+
+    fn run_case(case: &mut Case) -> Vec<u8> {
+        let fs = case.info.subfr_length / 5;
+        let ltp_mem_length = case.info.ltp_mem_length;
+        let frame_length = case.info.frame_length();
+        let nb_subfr = case.info.nb_subfr;
+
+        let mut loss_cnt: i32 = 0;
+        let mut prev_signal_type = case.prev_signal_type;
+        let mut first_frame_after_reset = case.first_frame_after_reset;
+        let mut lag_prev: i32 = 0;
+
+        let mut blob = Vec::new();
+        for fc in &mut case.frames {
+            let mut ctrl = fc.ctrl;
+            let mut frame = vec![0i16; frame_length];
+            if !fc.lost {
+                frame.copy_from_slice(&fc.xq);
+                case.state.update_out_buf(&frame, ltp_mem_length);
+                plc(
+                    &mut case.plc,
+                    &mut case.state,
+                    &mut ctrl,
+                    &fc.exc,
+                    &mut frame,
+                    &case.info,
+                    fs as u32,
+                    loss_cnt,
+                    prev_signal_type,
+                    first_frame_after_reset,
+                    false,
+                );
+                loss_cnt = 0;
+                prev_signal_type = fc.signal_type;
+                first_frame_after_reset = false;
+            } else {
+                plc(
+                    &mut case.plc,
+                    &mut case.state,
+                    &mut ctrl,
+                    &fc.exc,
+                    &mut frame,
+                    &case.info,
+                    fs as u32,
+                    loss_cnt,
+                    prev_signal_type,
+                    first_frame_after_reset,
+                    true,
+                );
+                loss_cnt += 1;
+                case.state.update_out_buf(&frame, ltp_mem_length);
+            }
+
+            cng(
+                &mut case.cng,
+                &case.plc,
+                &ctrl,
+                &fc.exc,
+                &mut frame,
+                frame_length,
+                &case.info,
+                fs as u32,
+                loss_cnt,
+                prev_signal_type,
+                &fc.prev_nlsf,
+            );
+            plc_glue_frames(&mut case.plc, &mut frame, frame_length, loss_cnt != 0);
+            lag_prev = ctrl.pitch_l[nb_subfr - 1];
+
+            for &v in &frame {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            for &v in &ctrl.pitch_l {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        // final state
+        blob.extend_from_slice(&loss_cnt.to_le_bytes());
+        blob.extend_from_slice(&(prev_signal_type as i32).to_le_bytes());
+        blob.extend_from_slice(&lag_prev.to_le_bytes());
+        let mut first = [0u8; 1];
+        first[0] = u8::from(first_frame_after_reset);
+        blob.extend_from_slice(&first);
+        let p = &case.plc;
+        blob.extend_from_slice(&p.pitch_l_q8.to_le_bytes());
+        for v in &p.ltp_coef_q14 {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &p.prev_lpc_q12 {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.push(u8::from(p.last_frame_lost));
+        blob.extend_from_slice(&p.rand_seed.to_le_bytes());
+        blob.extend_from_slice(&p.rand_scale_q14.to_le_bytes());
+        blob.extend_from_slice(&p.conc_energy.to_le_bytes());
+        blob.extend_from_slice(&p.conc_energy_shift.to_le_bytes());
+        blob.extend_from_slice(&p.prev_ltp_scale_q14.to_le_bytes());
+        for v in &p.prev_gain_q16 {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&(p.subfr_length as i32).to_le_bytes());
+        blob.extend_from_slice(&(p.nb_subfr as i32).to_le_bytes());
+        blob.extend_from_slice(&(p.fs_khz as i32).to_le_bytes());
+        let c = &case.cng;
+        for v in &c.cng_exc_buf_q14 {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &c.cng_smth_nlsf_q15 {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &c.cng_synth_state {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&c.cng_smth_gain_q16.to_le_bytes());
+        blob.extend_from_slice(&c.rand_seed.to_le_bytes());
+        blob.extend_from_slice(&(c.fs_khz as i32).to_le_bytes());
+        for v in &case.state.s_lpc_q14_buf {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &case.state.out_buf {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob
+    }
+
+    /// (case index, FNV-1a64 over the per-frame outputs (concealed /
+    /// decoded frames + pitch_l) and every PLC/CNG/synthesis state
+    /// field at the end) — values generated by an independent Python
+    /// transcription of PLC.c + CNG.c driven through silk_decode_frame's
+    /// exact call sequence. The generator above mirrors the oracle's
+    /// case generator sample-for-sample.
+    #[test]
+    fn plc_cng_match_libopus_oracle() {
+        const HASHES: [u64; N_CASES] = [
+            0xA4A754DAD33FA42C,
+            0xB02DC6B0D8AF1F9B,
+            0x7C00119F8B8789F7,
+            0x8A34D367D14D7B6A,
+            0x23552B86BBB3C521,
+            0xEF388B15BE042B80,
+            0xC8036C5333704236,
+            0x3A62AF57B3D300F7,
+            0xCABAC58F54E53FA8,
+            0xF4DAB467D03E8BB9,
+            0x8855255F64C7256C,
+            0x00956F217D641B65,
+            0x6D50D6535AD1FE07,
+            0xA78B12C78368B7E1,
+            0x8CC59258CD0A65D5,
+            0xCCAB2B09712A84DC,
+            0xA7A4580B753D3027,
+            0xC6D26E7A04DE01CE,
+            0x1549991FCD356ED6,
+            0x0BB7B05977CD86C2,
+            0x737651EC78CDC0FE,
+            0xB3754964B14E2963,
+            0xCF7702C31E08EDA5,
+            0xE17B8CBE6BCD587F,
+            0x9DA8C9604B36B401,
+            0x10D4D04590A7FBD2,
+            0x885F9EC5E8AF872A,
+            0xAF5A7030868256D8,
+            0x1D375E3B32286560,
+            0x694AF5A64FBB31B9,
+            0xA657D57998C361EB,
+            0xF2CBB56829667831,
+        ];
+        for (c, &want) in HASHES.iter().enumerate() {
+            let mut rng = XorShift(SEED_BASE + c as u32);
+            let mut case = gen_case(&mut rng, c);
+            let got = fnv1a64(&run_case(&mut case));
+            assert_eq!(got, want, "case {c}: PLC/CNG diverged from the oracle");
+        }
+    }
+
+    /// Reset-value contracts: `plc_reset` (unity gains, midpoint pitch,
+    /// 20 ms geometry) and `cng_reset` (flat NLSF ramp, zero gain, the
+    /// 3176576 seed).
+    #[test]
+    fn reset_values() {
+        let mut plc_s = PlcState::default();
+        plc_reset(&mut plc_s, 320);
+        assert_eq!(plc_s.pitch_l_q8, 320 << 7);
+        assert_eq!(plc_s.prev_gain_q16, [1 << 16, 1 << 16]);
+        assert_eq!(plc_s.subfr_length, 20);
+        assert_eq!(plc_s.nb_subfr, 2);
+
+        let mut cng_s = CngState::default();
+        cng_reset(&mut cng_s, 10);
+        // 32767 / 11, accumulated
+        let step = 32767 / 11;
+        let want: Vec<i16> = (1..=10).map(|i| (step * i) as i16).collect();
+        assert_eq!(&cng_s.cng_smth_nlsf_q15[..10], &want[..]);
+        assert_eq!(cng_s.cng_smth_nlsf_q15[10..16], [0; 6]);
+        assert_eq!(cng_s.cng_smth_gain_q16, 0);
+        assert_eq!(cng_s.rand_seed, 3176576);
+
+        let mut cng_s16 = CngState::default();
+        cng_reset(&mut cng_s16, 16);
+        let step16 = 32767 / 17;
+        let want16: Vec<i16> = (1..=16).map(|i| (step16 * i) as i16).collect();
+        assert_eq!(&cng_s16.cng_smth_nlsf_q15[..16], &want16[..]);
+    }
+
+    /// Rate changes reset both sub-states: feeding a different fs_kHz
+    /// reinitializes the PLC/CNG state on the next call.
+    #[test]
+    fn fs_change_resets() {
+        let mut plc_s = PlcState {
+            fs_khz: 8,
+            ..PlcState::default()
+        };
+        let mut state = SynthesisState::default();
+        let mut ctrl = Ctrl::default();
+        let mut rng = XorShift(42);
+        let mut exc = vec![0i32; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH];
+        for v in exc.iter_mut() {
+            *v = (rng.next_u32() % (1 << 25)) as i32 - (1 << 24);
+        }
+        let mut frame = vec![0i16; 320];
+        let info = FrameInfo::new(16, 4);
+        // The rate change runs the reset path (plc_conceal with loss_cnt
+        // == 0 and a first_frame_after_reset state): must not panic, and
+        // every subframe's pitch lag must be the (single) drifted lag.
+        plc(
+            &mut plc_s,
+            &mut state,
+            &mut ctrl,
+            &exc,
+            &mut frame,
+            &info,
+            16,
+            0,
+            TYPE_NO_VOICE_ACTIVITY,
+            true,
+            true,
+        );
+        assert_eq!(plc_s.prev_gain_q16, [1 << 16, 1 << 16]);
+        assert_eq!(plc_s.fs_khz, 16);
+        assert!(ctrl.pitch_l.windows(2).all(|w| w[0] == w[1]));
+        assert!(ctrl.pitch_l[0] >= 2 * 16 && ctrl.pitch_l[0] <= 18 * 16);
+    }
+
+    /// Never-panic sweep over hostile (but lag-legal) states: any i16
+    /// coefficients/gains/scales, any seeds/energies, both signal types,
+    /// 0..=3 prior losses, both geometries, DTX and loss call orders.
+    #[test]
+    fn conceal_cng_glue_never_panic() {
+        let mut rng = XorShift(0xA5F00D);
+        for case in 0..64 {
+            let fs = [8u32, 12, 16][case % 3];
+            let nb_subfr = 2 + 2 * ((case / 3) % 2);
+            let info = FrameInfo::new(fs, nb_subfr);
+            let u16v = |rng: &mut XorShift| -> i16 { (rng.next_u32() as u16) as i16 };
+            let mut plc_s = PlcState {
+                pitch_l_q8: ((2 * fs as i32) + (rng.next_u32() % (16 * fs + 1)) as i32) << 8,
+                ltp_coef_q14: [u16v(&mut rng); LTP_ORDER],
+                prev_lpc_q12: [u16v(&mut rng); MAX_LPC_ORDER],
+                last_frame_lost: rng.next_u32() % 2 == 1,
+                rand_seed: rng.next_u32() as i32,
+                rand_scale_q14: u16v(&mut rng),
+                conc_energy: rng.next_u32() as i32,
+                conc_energy_shift: (rng.next_u32() % 40) as i32,
+                prev_ltp_scale_q14: u16v(&mut rng),
+                // gains stay in the legal dequantized range (positive):
+                // negative gains would leave the reference's own domain
+                // (silk_INVERSE32_varQ's headroom math assumes b32 > 0).
+                prev_gain_q16: [
+                    81920 + (rng.next_u32() % (1 << 26)) as i32,
+                    81920 + (rng.next_u32() % (1 << 26)) as i32,
+                ],
+                fs_khz: 0,
+                nb_subfr,
+                subfr_length: info.subfr_length,
+            };
+            let mut cng_s = CngState {
+                cng_exc_buf_q14: [0; MAX_FRAME_LENGTH],
+                cng_smth_nlsf_q15: [(rng.next_u32() % 32768) as i16; MAX_LPC_ORDER],
+                cng_synth_state: [rng.next_u32() as i32; MAX_LPC_ORDER],
+                cng_smth_gain_q16: rng.next_u32() as i32,
+                rand_seed: rng.next_u32() as i32,
+                fs_khz: 0,
+            };
+            let mut state = SynthesisState::default();
+            for v in state.out_buf.iter_mut() {
+                *v = (rng.next_u32() as u16) as i16;
+            }
+            let mut ctrl = Ctrl {
+                pitch_l: [0; MAX_SUBFRS],
+                gains_q16: [rng.next_u32() as i32; MAX_SUBFRS],
+                pred_coef_q12: [[u16v(&mut rng); MAX_LPC_ORDER]; 2],
+                ltp_coef_q14: [u16v(&mut rng); LTP_ORDER * MAX_SUBFRS],
+                ltp_scale_q14: u16v(&mut rng),
+            };
+            let mut exc = vec![0i32; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH];
+            for v in exc.iter_mut() {
+                *v = rng.next_u32() as i32;
+            }
+            let mut prev_nlsf = vec![0i16; info.lpc_order];
+            for v in prev_nlsf.iter_mut() {
+                *v = (rng.next_u32() % 32768) as i16;
+            }
+            let loss_cnt = (case % 4) as i32;
+            let prev_st = (case % 3) as i8;
+
+            let mut frame = vec![0i16; info.frame_length()];
+            plc(
+                &mut plc_s,
+                &mut state,
+                &mut ctrl,
+                &exc,
+                &mut frame,
+                &info,
+                fs,
+                loss_cnt,
+                prev_st,
+                case % 2 == 0,
+                true,
+            );
+            cng(
+                &mut cng_s,
+                &plc_s,
+                &ctrl,
+                &exc,
+                &mut frame,
+                info.frame_length(),
+                &info,
+                fs,
+                loss_cnt + 1,
+                prev_st,
+                &prev_nlsf,
+            );
+            plc_glue_frames(&mut plc_s, &mut frame, info.frame_length(), true);
+            // And the good-frame update path with the hostile ctrl.
+            plc(
+                &mut plc_s, &mut state, &mut ctrl, &exc, &mut frame, &info, fs, 0, prev_st, false,
+                false,
+            );
+            cng(
+                &mut cng_s,
+                &plc_s,
+                &ctrl,
+                &exc,
+                &mut frame,
+                info.frame_length(),
+                &info,
+                fs,
+                0,
+                prev_st,
+                &prev_nlsf,
+            );
+            plc_glue_frames(&mut plc_s, &mut frame, info.frame_length(), false);
+        }
     }
 }

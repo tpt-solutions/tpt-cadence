@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-aac"
 description = "AAC-LC decoder (ISO/IEC 14496-3) for the tpt-cadence audio codec suite."
+readme = "README.md"
+keywords = ["audio", "aac", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

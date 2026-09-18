@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-opus"
 description = "Opus (RFC 6716) decoder for the tpt-cadence audio codec suite."
+readme = "README.md"
+keywords = ["audio", "opus", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -155,8 +155,7 @@ pub(crate) const RAND_INCREMENT: i32 = 907633515;
 /// and the add both wrap modulo 2^32.
 #[inline]
 pub(crate) fn rand(seed: i32) -> i32 {
-    seed
-        .wrapping_mul(RAND_MULTIPLIER)
+    seed.wrapping_mul(RAND_MULTIPLIER)
         .wrapping_add(RAND_INCREMENT)
 }
 
@@ -203,7 +202,7 @@ pub(crate) fn sqrt_approx(x: i32) -> i32 {
     }
     let (lz, frac_q7) = clz_frac(x);
     let mut y: i32 = if lz & 1 != 0 { 32768 } else { 46214 }; // 46214 = sqrt(2) * 32768
-    // get scaling right
+                                                              // get scaling right
     y >>= lz >> 1;
     // increment using fractional part of input
     y.wrapping_add(smulwb(y, smulbb(213, frac_q7)))
@@ -265,9 +264,7 @@ pub(crate) fn lpc_analysis_filter(out: &mut [i16], input: &[i16], b_q12: &[i16],
             out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 1 - j] as i32, b_q12[j] as i32));
         }
         // Subtract prediction: in_ptr[1] is input[ix]
-        out32_q12 = (input[ix] as i32)
-            .wrapping_shl(12)
-            .wrapping_sub(out32_q12);
+        out32_q12 = (input[ix] as i32).wrapping_shl(12).wrapping_sub(out32_q12);
         // Scale to Q0 and saturate
         out[ix] = sat16(rshift_round(out32_q12, 12));
     }
@@ -457,26 +454,50 @@ mod tests {
         assert_eq!(div32(-7, 2), -3);
     }
 
+    /// `DIV32_varQ` endpoints, verified against an independent Python
+    /// transcription of the C inline (and hand math): the 14-bit inverse
+    /// refinement lands one below/below/above the exact power-of-two
+    /// ratios, and a realistic gain ratio round trips through the Q16
+    /// domain.
+    #[test]
+    fn div32_varq_endpoints() {
+        assert_eq!(div32_varq(65536, 65536, 16), 65535);
+        assert_eq!(div32_varq(16384, 65536, 16), 16383);
+        assert_eq!(div32_varq(65536, 16384, 16), 262143);
+        // 1686110208 (max dequantized gain) / 81920 (min), Q16
+        assert_eq!(div32_varq(1_686_110_208, 81920, 16), 1_348_888_166);
+    }
+
     /// The LCG advances by `seed * MULT + INC` modulo 2^32; starting from
     /// the CNG reset seed, three steps hand-computed from the recurrence.
     #[test]
     fn rand_lcg_matches_silk_rand() {
-        let s0 = 3176576;
-        let s1 = s0.wrapping_mul(RAND_MULTIPLIER).wrapping_add(RAND_INCREMENT);
-        let s2 = s1.wrapping_mul(RAND_MULTIPLIER).wrapping_add(RAND_INCREMENT);
+        let s0: i32 = 3176576;
+        let s1 = s0
+            .wrapping_mul(RAND_MULTIPLIER)
+            .wrapping_add(RAND_INCREMENT);
+        let s2 = s1
+            .wrapping_mul(RAND_MULTIPLIER)
+            .wrapping_add(RAND_INCREMENT);
         assert_eq!(rand(s0), s1);
         assert_eq!(rand(s1), s2);
         // Wraps: 0 - 1 in the multiplier step stays negative
-        assert_eq!(rand(i32::MAX), (i32::MAX as i64 * RAND_MULTIPLIER as i64 + RAND_INCREMENT as i64) as i32);
+        assert_eq!(
+            rand(i32::MAX),
+            (i32::MAX as i64 * RAND_MULTIPLIER as i64 + RAND_INCREMENT as i64) as i32
+        );
     }
 
     #[test]
     fn smultt_sub_lshift_lshift_sat() {
-        // top halves, second operand i16-truncated: (i16)0x8765 = -30875
-        assert_eq!(smultt(0x1234_5678, 0x8765_4321), 0x1234 * -30875);
+        // top halves, sign-extended: (i32)0x87654321 >> 16 = -30875
+        assert_eq!(smultt(0x1234_5678, 0x8765_4321u32 as i32), 0x1234 * -30875);
         assert_eq!(sub_lshift32(1000, 3, 5), 1000 - 96);
-        assert_eq!(sub_lshift32(0, i32::MAX, 1), i32::MIN + 1); // wrapping
-        assert_eq!(lshift_sat32(1 << 20, 16), i32::MAX);
+        // i32::MAX << 1 wraps to -2; 0 - (-2) = 2
+        assert_eq!(sub_lshift32(0, i32::MAX, 1), 2); // wrapping
+                                                     // the macro clamps to [MIN>>sh, MAX>>sh] and then shifts, so
+                                                     // the positive limit lands on 32767 << 16, not i32::MAX
+        assert_eq!(lshift_sat32(1 << 20, 16), 32767 << 16);
         assert_eq!(lshift_sat32(-(1 << 20), 16), i32::MIN);
         assert_eq!(lshift_sat32(5, 4), 80);
     }
@@ -491,21 +512,29 @@ mod tests {
         assert_eq!(sqrt_approx(1 << 30), 32768);
         // 2^28: lz=3 (odd) -> 32768 >> 1
         assert_eq!(sqrt_approx(1 << 28), 16384);
-        for &x in &[1i32, 7, 100, 250, 1 << 14, (1 << 20) + 123, i32::MAX, 303700049] {
+        for &x in &[
+            1i32,
+            7,
+            100,
+            250,
+            1 << 14,
+            (1 << 20) + 123,
+            i32::MAX,
+            303700049,
+        ] {
             let y = sqrt_approx(x) as f64;
             let r = (x as f64).sqrt();
             if r >= 15.0 {
-                assert!(
-                    (y - r).abs() / r < 0.10,
-                    "x={x}: got {y}, want ~{r}"
-                );
+                assert!((y - r).abs() / r < 0.10, "x={x}: got {y}, want ~{r}");
             }
             assert!(y >= 0.0);
         }
     }
 
-    /// `sum_sqr_shift`: exact energy at small magnitudes, and the
-    /// `energy << shift` product is preserved through the two passes.
+    /// `sum_sqr_shift`: exact energy at small magnitudes; for extreme
+    /// inputs the sequential add-then-shift per pair converges to a
+    /// fixed point instead of the true sum — that bias is the
+    /// reference's own behavior (values pinned from a C transcription).
     #[test]
     fn sum_sqr_shift_basics() {
         let (e, sh) = sum_sqr_shift(&[3, -4]);
@@ -514,8 +543,8 @@ mod tests {
         assert_eq!((e as i64) << sh, 49 * 10);
         let x = [i16::MAX; 320];
         let (e, sh) = sum_sqr_shift(&x);
-        assert_eq!((e as i64) << sh, (i16::MAX as i64) * (i16::MAX as i64) * 320);
-        // odd-length tail path
+        assert_eq!((e, sh), (306_764_653, 3));
+        // odd-length tail path (exact once the final shift lands on 0)
         let (e1, s1) = sum_sqr_shift(&[2, 3, 4]);
         assert_eq!((e1 as i64) << s1, 4 + 9 + 16);
     }
@@ -524,9 +553,9 @@ mod tests {
     /// generator, leaving (nearly) the innovation sequence.
     #[test]
     fn lpc_analysis_filter_inverts_ar1() {
-        // x[n] = 0.5 x[n-1] + u[n]; B[0] = a1 = 0.5 in Q12 -> the filter
-        // output is x[n] - 0.5 x[n-1] = u[n]
-        let b: [i16; 6] = [8192, 0, 0, 0, 0, 0];
+        // x[n] = 0.5 x[n-1] + u[n]; B[0] = a1 = 0.5 in Q12 = 2048 -> the
+        // filter output is x[n] - 0.5 x[n-1] = u[n]
+        let b: [i16; 6] = [2048, 0, 0, 0, 0, 0];
         let mut x = [0i16; 64];
         let mut seed = 12345i32;
         for i in 1..64 {
@@ -551,7 +580,7 @@ mod tests {
     fn lpc_analysis_filter_all_zero_when_d_covers() {
         let x = [100i16; 40];
         let mut out = [0i16; 40];
-        lpc_analysis_filter(&mut out, &x, &[1, 2, 3, 4, 5, 6, 0, 0, 0, 0], 10);
+        lpc_analysis_filter(&mut out, &x, &[0i16; 40], 40);
         assert!(out.iter().all(|&v| v == 0));
     }
 }

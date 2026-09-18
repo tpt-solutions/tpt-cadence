@@ -57,6 +57,7 @@
 //! Future: `decoder` (Tier 4) — see todo.md.
 
 pub mod decode_indices;
+pub mod decoder;
 pub mod excitation;
 pub mod gains;
 pub mod nlsf;

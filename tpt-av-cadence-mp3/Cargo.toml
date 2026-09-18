@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-mp3"
 description = "mp3 decoder for the tpt-cadence audio codec suite (under construction)."
+readme = "README.md"
+keywords = ["audio", "mp3", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

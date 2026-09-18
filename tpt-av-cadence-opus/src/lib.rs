@@ -35,7 +35,10 @@ pub mod packet;
 pub mod range;
 pub mod silk;
 
-pub use decoder::{celt_end_band, celt_frame_size, decode_celt_only_packet, OUTPUT_CHANNELS};
+pub use decoder::{
+    celt_end_band, celt_frame_size, decode_celt_only_packet, decode_silk_only_packet,
+    OUTPUT_CHANNELS,
+};
 pub use packet::{Bandwidth, FrameDuration, Mode, Packet, Toc};
 pub use range::{RangeDecoder, RangeEncoder};
 

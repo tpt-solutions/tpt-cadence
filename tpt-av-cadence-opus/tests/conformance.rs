@@ -56,7 +56,8 @@ use std::path::{Path, PathBuf};
 
 use tpt_av_cadence_opus::celt::CeltDecoder;
 use tpt_av_cadence_opus::packet::{parse_packet, Mode};
-use tpt_av_cadence_opus::{celt_frame_size, decode_celt_only_packet};
+use tpt_av_cadence_opus::silk::decoder::SilkDecoder;
+use tpt_av_cadence_opus::{celt_frame_size, decode_celt_only_packet, decode_silk_only_packet};
 
 /// Max acceptable per-sample error, in 16-bit PCM units, for a CELT-only
 /// run to be considered passing. The RFC's own quality guidance targets
@@ -146,6 +147,8 @@ struct VectorResult {
     stats: RunStats,
     celt_packet_count: u64,
     range_match_count: u64,
+    silk_packet_count: u64,
+    silk_stats: RunStats,
 }
 
 fn run_vector(dir: &Path, name: &str) -> VectorResult {
@@ -155,8 +158,11 @@ fn run_vector(dir: &Path, name: &str) -> VectorResult {
     let reference = read_dec_file(&dec_path);
 
     let mut celt = CeltDecoder::new(2, 48_000).unwrap();
+    let mut silk = SilkDecoder::new(2).unwrap();
+    let mut prev_mode_was_celt = false;
     let mut sample_offset: u64 = 0; // samples-per-channel already advanced
     let mut stats = RunStats::default();
+    let mut silk_stats = RunStats::default();
     // Tracked for debug output only (to print at the start of a contiguous
     // CELT-only run) — the decoder itself is never reset mid-file. Real
     // libopus does not invoke celt_decode_with_ec at all for SILK-only
@@ -173,6 +179,7 @@ fn run_vector(dir: &Path, name: &str) -> VectorResult {
     let mut prev_was_celt = false;
     let mut celt_packet_count = 0u64;
     let mut range_match_count = 0u64;
+    let mut silk_packet_count = 0u64;
 
     for record in &records {
         let payload = &record.packet;
@@ -257,9 +264,54 @@ fn run_vector(dir: &Path, name: &str) -> VectorResult {
                     panic!("{name}: decode_celt_only_packet failed at sample offset {sample_offset}: {e}");
                 }
             }
+        } else if packet.toc.mode() == Mode::Silk {
+            prev_was_celt = false;
+            // libopus resets the SILK decoder after CELT-only packets.
+            if prev_mode_was_celt {
+                silk.reset();
+            }
+            let mut pcm = vec![0i16; packet_samples as usize * 2];
+            match decode_silk_only_packet(&mut silk, &packet, payload, &mut pcm) {
+                Ok(produced) => {
+                    debug_assert_eq!(produced as u64, packet_samples);
+                    silk_packet_count += 1;
+                    let ref_start = (sample_offset as usize) * 2;
+                    let ref_end = ref_start + pcm.len();
+                    if ref_end <= reference.len() {
+                        if std::env::var_os("OPUS_TV_DEBUG").is_some() {
+                            let mut pkt_max_diff = 0i32;
+                            for (i, &d) in pcm.iter().enumerate() {
+                                pkt_max_diff = pkt_max_diff
+                                    .max((d as i32 - reference[ref_start + i] as i32).abs());
+                            }
+                            if pkt_max_diff > 50 {
+                                eprintln!(
+                                    "  {name} SILK pkt@offset={sample_offset}: max_diff={pkt_max_diff} toc.config={} stereo={} code={} frame_count={} frame_size={}",
+                                    packet.toc.config, packet.toc.stereo, packet.toc.code, frame_count, frame_size
+                                );
+                            }
+                        }
+                        for (i, &d) in pcm.iter().enumerate() {
+                            silk_stats.record(d, reference[ref_start + i]);
+                        }
+                    } else if std::env::var_os("OPUS_TV_DEBUG").is_some() {
+                        eprintln!(
+                            "  {name} SILK pkt@offset={sample_offset}: reference too short for {} samples",
+                            pcm.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    panic!(
+                        "{name}: decode_silk_only_packet failed at sample offset {sample_offset}: {e}"
+                    );
+                }
+            }
         } else {
+            // Hybrid: not decodable yet; state bookkeeping only.
             prev_was_celt = false;
         }
+        prev_mode_was_celt = packet.toc.mode() == Mode::Celt;
 
         sample_offset += packet_samples;
     }
@@ -269,6 +321,8 @@ fn run_vector(dir: &Path, name: &str) -> VectorResult {
         stats,
         celt_packet_count,
         range_match_count,
+        silk_packet_count,
+        silk_stats,
     }
 }
 
@@ -303,23 +357,41 @@ fn opus_conformance_test_vectors() {
         let s = &result.stats;
         if s.samples_compared == 0 {
             println!("{:<14} {:>18}", result.name, "no CELT-only segments found");
-            continue;
+        } else {
+            let snr = s.snr_db();
+            println!(
+                "{:<14} {:>18} {:>14} {:>10.1} {:>8}/{:<8}",
+                result.name,
+                s.samples_compared / 2, // per-channel
+                s.max_abs_diff,
+                snr,
+                result.range_match_count,
+                result.celt_packet_count,
+            );
+            if s.max_abs_diff > MAX_ABS_DIFF_I16 || snr < MIN_SNR_DB {
+                failures.push(format!(
+                    "{}: max_abs_diff={} (limit {}), snr={:.1}dB (limit {}dB)",
+                    result.name, s.max_abs_diff, MAX_ABS_DIFF_I16, snr, MIN_SNR_DB
+                ));
+            }
         }
-        let snr = s.snr_db();
-        println!(
-            "{:<14} {:>18} {:>14} {:>10.1} {:>8}/{:<8}",
-            result.name,
-            s.samples_compared / 2, // per-channel
-            s.max_abs_diff,
-            snr,
-            result.range_match_count,
-            result.celt_packet_count,
-        );
-        if s.max_abs_diff > MAX_ABS_DIFF_I16 || snr < MIN_SNR_DB {
-            failures.push(format!(
-                "{}: max_abs_diff={} (limit {}), snr={:.1}dB (limit {}dB)",
-                result.name, s.max_abs_diff, MAX_ABS_DIFF_I16, snr, MIN_SNR_DB
-            ));
+
+        let ss = &result.silk_stats;
+        if ss.samples_compared == 0 {
+            println!(
+                "{:<14} {:>18}",
+                format!("{}(SILK)", result.name),
+                "no SILK-only segments found"
+            );
+        } else {
+            println!(
+                "{:<14} {:>18} {:>14} {:>10.1} {:>16}",
+                format!("{}(SILK)", result.name),
+                ss.samples_compared / 2, // per-channel
+                ss.max_abs_diff,
+                ss.snr_db(),
+                result.silk_packet_count,
+            );
         }
     }
 

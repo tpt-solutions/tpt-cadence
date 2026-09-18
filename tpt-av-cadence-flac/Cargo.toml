@@ -1,6 +1,9 @@
 [package]
 name = "tpt-av-cadence-flac"
 description = "FLAC (Free Lossless Audio Codec) parser and decoder for the tpt-cadence audio codec suite."
+readme = "README.md"
+keywords = ["audio", "flac", "lossless", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
