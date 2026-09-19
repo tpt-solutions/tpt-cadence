@@ -72,39 +72,42 @@ pub struct Residue {
 impl Residue {
     /// Decodes `ch` residue vectors of length `n` into `vectors`, honoring
     /// `do_not_decode`. Every vector must hold `n` samples (already zeroed
-    /// by the caller).
+    /// by the caller). `vectors` holds the submap bundle's channel buffers
+    /// in bundle order.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode(
         &self,
         books: &[Codebook],
         br: &mut BitReader,
-        vectors: &mut [&mut [f32]],
+        vectors: &mut [Box<[f32]>],
+        members: &[usize],
         do_not_decode: &[bool],
         ws: &mut ResidueWorkspace,
+        n: usize,
     ) -> Result<(), CadenceError> {
-        let ch = vectors.len();
+        // The bundle size is the member count, not `vectors.len()` (which
+        // holds every channel of the stream): multi-submap mappings route
+        // a subset of channels per submap, e.g. a 5.1 stream's LFE alone.
+        let ch = members.len();
         if ch == 0 {
             return Ok(());
         }
-        let n = vectors[0].len();
-        for v in vectors.iter().skip(1) {
-            if v.len() != n {
-                return Err(corrupt("ragged vector bundle"));
-            }
-        }
         if self.residue_type == 2 {
-            self.decode_type2(books, br, vectors, do_not_decode, ws, n)
+            self.decode_type2(books, br, vectors, members, do_not_decode, ws, n)
         } else {
-            self.decode_type01(books, br, vectors, do_not_decode, ws, n)
+            self.decode_type01(books, br, vectors, members, do_not_decode, ws, n)
         }
     }
 
     /// Types 0 and 1: per-channel vectors, differing only in intra-partition
     /// interleave (spec 8.6.2 with 8.6.3/8.6.4).
+    #[allow(clippy::too_many_arguments)]
     fn decode_type01(
         &self,
         books: &[Codebook],
         br: &mut BitReader,
-        vectors: &mut [&mut [f32]],
+        vectors: &mut [Box<[f32]>],
+        members: &[usize],
         do_not_decode: &[bool],
         ws: &mut ResidueWorkspace,
         n: usize,
@@ -130,13 +133,12 @@ impl Residue {
         }
         let psize = self.partition_size as usize;
 
-        let mut partition_count = 0usize;
         for pass in 0..8u32 {
-            partition_count = 0;
+            let mut partition_count = 0usize;
             while partition_count < partitions_to_read {
                 if pass == 0 {
-                    for j in 0..ch {
-                        if do_not_decode[j] {
+                    for (j, skip) in do_not_decode.iter().enumerate().take(ch) {
+                        if *skip {
                             continue;
                         }
                         read_classifications(
@@ -156,15 +158,16 @@ impl Residue {
                 }
                 let mut i = 0usize;
                 while i < classwords_per_codeword && partition_count < partitions_to_read {
-                    for j in 0..ch {
-                        if do_not_decode[j] {
+                    for (j, skip) in do_not_decode.iter().enumerate().take(ch) {
+                        if *skip {
                             continue;
                         }
                         let vqclass = ws.all_classes[j * partitions_to_read + partition_count];
                         let vqbook = self.books[vqclass as usize * 8 + pass as usize];
                         if vqbook >= 0 {
                             let book = &books[vqbook as usize];
-                            let mut vec = &mut vectors[j][..n];
+                            let member = members[j];
+                            let mut vec = &mut *vectors[member];
                             decode_partition(
                                 self.residue_type,
                                 book,
@@ -188,11 +191,13 @@ impl Residue {
     /// Type 2: one interleaved vector of `ch * n` samples decoded as type 1,
     /// then deinterleaved (spec 8.6.5). When every channel is marked
     /// do-not-decode nothing is read and the (zeroed) vectors stand.
+    #[allow(clippy::too_many_arguments)]
     fn decode_type2(
         &self,
         books: &[Codebook],
         br: &mut BitReader,
-        vectors: &mut [&mut [f32]],
+        vectors: &mut [Box<[f32]>],
+        members: &[usize],
         do_not_decode: &[bool],
         ws: &mut ResidueWorkspace,
         n: usize,
@@ -223,25 +228,25 @@ impl Residue {
         let psize = self.partition_size as usize;
         ws.scratch[..total].fill(0.0);
 
-        let mut partition_count = 0usize;
         for pass in 0..8u32 {
-            partition_count = 0;
+            let mut partition_count = 0usize;
             while partition_count < partitions_to_read {
+                // One classword per outer iteration (classifications for
+                // the next `classwords_per_codeword` partitions), read in
+                // pass 0 only — mirroring `decode_type01` and the spec's
+                // per-chunk interleaving of classifications and VQ reads.
                 if pass == 0 {
-                    let mut pos = partition_count;
-                    while pos < partitions_to_read {
-                        read_classifications(
-                            classbook,
-                            self.classifications,
-                            classwords_per_codeword,
-                            br,
-                            &mut ws.classes,
-                        )?;
-                        for c in ws.classes.iter() {
-                            if pos < partitions_to_read {
-                                ws.all_classes[pos] = *c;
-                                pos += 1;
-                            }
+                    read_classifications(
+                        classbook,
+                        self.classifications,
+                        classwords_per_codeword,
+                        br,
+                        &mut ws.classes,
+                    )?;
+                    for (k, c) in ws.classes.iter().enumerate() {
+                        let idx = partition_count + k;
+                        if idx < partitions_to_read {
+                            ws.all_classes[idx] = *c;
                         }
                     }
                 }
@@ -269,8 +274,8 @@ impl Residue {
             }
         }
         // Deinterleave into the channel vectors.
-        for (j, v) in vectors.iter_mut().enumerate() {
-            for (i, out) in v.iter_mut().enumerate() {
+        for (j, &member) in members.iter().enumerate() {
+            for (i, out) in vectors[member].iter_mut().enumerate().take(n) {
                 *out = ws.scratch[i * ch + j];
             }
         }
@@ -280,6 +285,7 @@ impl Residue {
 
 /// Decodes one partition of `psize` scalars starting at `offset` into
 /// `vector` (spec 8.6.3/8.6.4).
+#[allow(clippy::too_many_arguments)]
 fn decode_partition(
     residue_type: u8,
     book: &Codebook,
@@ -301,10 +307,10 @@ fn decode_partition(
         let step = psize / dims;
         for p in 0..step {
             book.read_vector(br, vec_buf)?;
-            for d in 0..dims {
+            for (d, &v) in vec_buf.iter().enumerate().take(dims) {
                 let idx = offset + p + d * step;
                 if idx < n {
-                    vector[idx] += vec_buf[d];
+                    vector[idx] += v;
                 }
             }
         }
@@ -312,10 +318,10 @@ fn decode_partition(
         let mut done = 0usize;
         while done < psize {
             book.read_vector(br, vec_buf)?;
-            for d in 0..dims {
+            for (d, &v) in vec_buf.iter().enumerate().take(dims) {
                 let idx = offset + done + d;
                 if idx < n {
-                    vector[idx] += vec_buf[d];
+                    vector[idx] += v;
                 }
             }
             done += dims;

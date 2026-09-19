@@ -9,7 +9,7 @@
 //! The window is the Vorbis window
 //! `w[n] = sin( (pi/2) * sin^2( pi (n + 1/2) / N ) )`.
 
-use crate::fft::{C, Fft};
+use crate::fft::{Fft, C};
 
 /// Per-block-size synthesis transform (allocation confined to [`Mdct::new`]).
 pub struct Mdct {
@@ -91,10 +91,15 @@ impl Mdct {
         }
         self.fft.run(&self.gbuf, &mut self.obuf);
         // out[m] = -Im{ e^{i phi_m} * G[m] }, phi_m = pi m / N
-        for m in 0..half {
-            let gr = self.obuf[m].re;
-            let gi = self.obuf[m].im;
-            spec_out[m] = -(gr * self.phase_sin[m] + gi * self.phase_cos[m]);
+        for (m, ((g, sin), cos)) in self
+            .obuf
+            .iter()
+            .zip(self.phase_sin.iter())
+            .zip(self.phase_cos.iter())
+            .enumerate()
+            .take(half)
+        {
+            spec_out[m] = -(g.re * sin + g.im * cos);
         }
     }
 }
@@ -110,7 +115,9 @@ impl Mdct {
 /// dst[2len-1-a] = src0[a] * win[a]        + src1[len-1-a] * win[2len-1-a]
 /// ```
 pub fn vector_fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
-    debug_assert!(dst.len() >= 2 * len && src0.len() >= len && src1.len() >= len && win.len() >= 2 * len);
+    debug_assert!(
+        dst.len() >= 2 * len && src0.len() >= len && src1.len() >= len && win.len() >= 2 * len
+    );
     for a in 0..len {
         let b = 2 * len - 1 - a;
         let s0 = src0[a];
@@ -143,7 +150,7 @@ mod tests {
                 sum_d += (a * i_d).cos() * x;
                 sum_u += (a * i_u).cos() * x;
             }
-            dst[i] = sum_d * -1.0;
+            dst[i] = -sum_d;
             dst[i + len] = -sum_u * -1.0;
         }
         dst
@@ -220,7 +227,7 @@ mod tests {
             .collect();
         let spectrum = |block: &[f32]| -> Vec<f32> {
             let mut spec = vec![0.0f32; half];
-            for k in 0..half {
+            for (k, s) in spec.iter_mut().enumerate() {
                 let mut acc = 0.0f64;
                 for (j, &x) in block.iter().enumerate() {
                     let ang = std::f64::consts::PI / n as f64
@@ -228,7 +235,7 @@ mod tests {
                         * (2 * k + 1) as f64;
                     acc += x as f64 * win_full[j] as f64 * ang.cos();
                 }
-                spec[k] = acc as f32;
+                *s = acc as f32;
             }
             spec
         };
@@ -267,10 +274,7 @@ mod tests {
             }
             assert!(rs.len() > 8, "not enough probe points");
             let mean = rs.iter().sum::<f64>() / rs.len() as f64;
-            let spread = rs
-                .iter()
-                .map(|&r| (r - mean).abs())
-                .fold(0.0f64, f64::max);
+            let spread = rs.iter().map(|&r| (r - mean).abs()).fold(0.0f64, f64::max);
             assert!(
                 mean.abs() > 1e-3 && spread / mean.abs() < 1e-3,
                 "non-constant ratio mean={mean} spread={spread}"

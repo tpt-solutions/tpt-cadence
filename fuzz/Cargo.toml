@@ -1,0 +1,86 @@
+[package]
+name = "tpt-cadence-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tpt-av-cadence-core = { path = "../tpt-av-cadence-core" }
+tpt-av-cadence-wav = { path = "../tpt-av-cadence-wav" }
+tpt-av-cadence-aiff = { path = "../tpt-av-cadence-aiff" }
+tpt-av-cadence-flac = { path = "../tpt-av-cadence-flac" }
+tpt-av-cadence-ogg = { path = "../tpt-av-cadence-ogg" }
+tpt-av-cadence-opus = { path = "../tpt-av-cadence-opus" }
+tpt-av-cadence-vorbis = { path = "../tpt-av-cadence-vorbis" }
+tpt-av-cadence-mp3 = { path = "../tpt-av-cadence-mp3" }
+tpt-av-cadence-aac = { path = "../tpt-av-cadence-aac" }
+
+
+# Fuzz targets (one bin per parser entry point).
+[[bin]]
+name = "aiff_decode"
+path = "fuzz_targets/aiff_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "flac_decode"
+path = "fuzz_targets/flac_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mp3_decode"
+path = "fuzz_targets/mp3_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wav_decode"
+path = "fuzz_targets/wav_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "opus_ogg_decode"
+path = "fuzz_targets/opus_ogg_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "opus_packet"
+path = "fuzz_targets/opus_packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "opus_decode"
+path = "fuzz_targets/opus_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vorbis_stream"
+path = "fuzz_targets/vorbis_stream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ogg_pages"
+path = "fuzz_targets/ogg_pages.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "aac_adts"
+path = "fuzz_targets/aac_adts.rs"
+test = false
+doc = false
+
+# Prevent this crate from being part of the parent workspace (it is built
+# by `cargo fuzz` with its own lockfile and nightly toolchain).
+[workspace]

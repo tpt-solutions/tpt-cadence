@@ -12,7 +12,6 @@ use tpt_av_cadence_core::CadenceError;
 pub struct IdHeader {
     pub channels: u16,
     pub sample_rate: u32,
-    pub bitrate_nominal: i32,
     /// Exponents: blocksize_0 = 1 << e0 <= blocksize_1 = 1 << e1.
     pub blocksize_0_exp: u32,
     pub blocksize_1_exp: u32,
@@ -24,13 +23,6 @@ pub struct Mode {
     /// `false` = short block, `true` = long block.
     pub blockflag: bool,
     pub mapping: usize,
-}
-
-/// Channel coupling step of a mapping.
-#[derive(Debug, Clone)]
-pub struct Coupling {
-    pub magnitude: usize,
-    pub angle: usize,
 }
 
 /// Mapping type 0 (the only Vorbis I mapping).
@@ -85,7 +77,7 @@ pub fn parse_id(packet: &[u8]) -> Result<IdHeader, CadenceError> {
     let channels = br.read_bits(8)? as u16;
     let sample_rate = br.read_bits(32)?;
     let _bitrate_max = br.read_bits(32)? as i32;
-    let bitrate_nominal = br.read_bits(32)? as i32;
+    let _bitrate_nominal = br.read_bits(32)? as i32;
     let _bitrate_min = br.read_bits(32)? as i32;
     let bs0 = br.read_bits(4)?;
     let bs1 = br.read_bits(4)?;
@@ -105,7 +97,6 @@ pub fn parse_id(packet: &[u8]) -> Result<IdHeader, CadenceError> {
     Ok(IdHeader {
         channels,
         sample_rate,
-        bitrate_nominal,
         blocksize_0_exp: bs0,
         blocksize_1_exp: bs1,
     })
@@ -120,7 +111,7 @@ pub fn skip_comment(packet: &[u8]) -> Result<(), CadenceError> {
     // Lengths are plain little-endian u32s; validate bounds instead of
     // trusting them.
     let mut off = 0usize;
-    let mut field = |off: &mut usize, payload: &[u8]| -> Result<u32, CadenceError> {
+    let field = |off: &mut usize, payload: &[u8]| -> Result<u32, CadenceError> {
         if *off + 4 > payload.len() {
             return Err(corrupt("comment header truncated"));
         }
@@ -162,19 +153,15 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
 
     // Codebooks.
     let codebook_count = br.read_bits(8)? as usize + 1;
-    if std::env::var("VORBIS_TRACE").is_ok() { eprintln!("setup: {} codebooks", codebook_count); }
     let mut codebooks = Vec::with_capacity(codebook_count);
-    for _ in 0..codebook_count {
+    for _i in 0..codebook_count {
         let sync = br.read_bits(24)?;
         if sync != 0x564342 {
             return Err(corrupt("codebook sync pattern mismatch"));
         }
-        let cb = Codebook::parse(&mut br);
-        if std::env::var("VORBIS_TRACE").is_ok() { eprintln!("  codebook {i} ok", i = codebooks.len()); }
-        codebooks.push(cb?);
+        codebooks.push(Codebook::parse(&mut br)?);
     }
 
-    if std::env::var("VORBIS_TRACE").is_ok() { eprintln!("setup: time"); }
     // Time-domain transforms (placeholders, must be zero).
     let time_count = br.read_bits(6)? as usize + 1;
     for _ in 0..time_count {
@@ -190,10 +177,10 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
         match br.read_bits(16)? {
             0 => {
                 let order = br.read_bits(8)? as usize;
-                let rate = br.read_bits(16)? as u32;
-                let bark_map_size = br.read_bits(16)? as u32;
-                let amplitude_bits = br.read_bits(6)? as u32;
-                let amplitude_offset = br.read_bits(8)? as u32;
+                let rate = br.read_bits(16)?;
+                let bark_map_size = br.read_bits(16)?;
+                let amplitude_bits = br.read_bits(6)?;
+                let amplitude_offset = br.read_bits(8)?;
                 let num_books = br.read_bits(4)? as usize + 1;
                 let mut books = Vec::with_capacity(num_books);
                 for _ in 0..num_books {
@@ -224,7 +211,15 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
                     *c = br.read_bits(4)? as u8;
                     maximum_class = maximum_class.max(*c as i32);
                 }
-                let classes = maximum_class.max(0) as usize + 1;
+                // With zero partitions there are zero classes (the spec's
+                // range `0..=maximum_class` is empty when maximum_class is
+                // still its initial -1); parsing a phantom class here
+                // desyncs the entire setup header.
+                let classes = if partitions == 0 {
+                    0
+                } else {
+                    maximum_class.max(0) as usize + 1
+                };
                 let mut class_dimensions = vec![0u8; classes];
                 let mut class_subclasses = vec![0u8; classes];
                 let mut class_masterbooks = vec![-1i16; classes];
@@ -248,7 +243,7 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
                     }
                 }
                 let multiplier = br.read_bits(2)? + 1;
-                let rangebits = br.read_bits(4)? as u32;
+                let rangebits = br.read_bits(4)?;
                 let blocksize_1 = 1usize << id.blocksize_1_exp;
                 if rangebits == 0 && partitions > 0 {
                     return Err(invalid("floor1 rangebits 0 with partitions"));
@@ -259,16 +254,17 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
                 }
                 let mut x = vec![0u32; 2];
                 x[1] = rangemax as u32;
-                for p in 0..partitions {
-                    let class = partition_class[p] as usize;
+                for &class_byte in partition_class.iter() {
+                    let class = class_byte as usize;
                     for _ in 0..class_dimensions[class] {
                         if x.len() >= 65 {
                             return Err(invalid("floor1 x_list exceeds 65 entries"));
                         }
-                        x.push(br.read_bits(rangebits)? as u32);
+                        x.push(br.read_bits(rangebits)?);
                     }
                 }
                 let values = x.len();
+                eprintln!("DBG floor1 values={values} at bit {}", br.bit_pos);
                 // Precompute neighbors and sort order (spec 7.2.2/FFmpeg
                 // ff_vorbis_ready_floor1_list).
                 let mut low = vec![0usize; values];
@@ -313,31 +309,38 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
         }
     }
 
-    if std::env::var("VORBIS_TRACE").is_ok() { eprintln!("setup: floors done"); }
     // Residues.
     let residue_count = br.read_bits(6)? as usize + 1;
+    eprintln!("DBG residues={residue_count} at bit {}", br.bit_pos);
     let mut residues = Vec::with_capacity(residue_count);
     for _ in 0..residue_count {
         let residue_type = br.read_bits(16)? as u8;
         if residue_type > 2 {
             return Err(invalid("unsupported residue type"));
         }
-        let begin = br.read_bits(24)? as u32;
-        let end = br.read_bits(24)? as u32;
-        let partition_size = br.read_bits(24)? as u32 + 1;
-        let classifications = br.read_bits(6)? as u32 + 1;
+        let begin = br.read_bits(24)?;
+        let end = br.read_bits(24)?;
+        let partition_size = br.read_bits(24)? + 1;
+        let classifications = br.read_bits(6)? + 1;
         let classbook = br.read_bits(8)? as u8;
         if classbook as usize >= codebooks.len() {
             return Err(corrupt("residue classbook out of range"));
         }
-        let mut books = vec![-1i16; classifications as usize * 8];
-        for i in 0..classifications as usize {
+        // The spec reads the cascade vectors of ALL classifications first,
+        // then a second pass supplies the value-book number for every set
+        // cascade bit (spec §8.2; FFmpeg's two-loop parse). Interleaving
+        // the two reads desyncs the bitstream after the first cascade.
+        let mut cascades = vec![0u8; classifications as usize];
+        for cascade in cascades.iter_mut() {
             let low_bits = br.read_bits(3)? as u8;
             let mut high_bits = 0u8;
             if br.read_bit()? {
                 high_bits = br.read_bits(5)? as u8;
             }
-            let cascade = high_bits.wrapping_mul(8).wrapping_add(low_bits);
+            *cascade = high_bits.wrapping_mul(8).wrapping_add(low_bits);
+        }
+        let mut books = vec![-1i16; classifications as usize * 8];
+        for (i, &cascade) in cascades.iter().enumerate() {
             for j in 0..8 {
                 if cascade & (1 << j) != 0 {
                     let b = br.read_bits(8)? as i16;
@@ -362,7 +365,6 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
         });
     }
 
-    if std::env::var("VORBIS_TRACE").is_ok() { eprintln!("setup: residues done"); }
     // Mappings.
     let mapping_count = br.read_bits(6)? as usize + 1;
     let channels = id.channels as usize;
@@ -372,7 +374,11 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
         if br.read_bits(16)? != 0 {
             return Err(invalid("unsupported mapping type"));
         }
-        let submaps = if br.read_bit()? { br.read_bits(4)? as usize + 1 } else { 1 };
+        let submaps = if br.read_bit()? {
+            br.read_bits(4)? as usize + 1
+        } else {
+            1
+        };
         let (coupling_steps, magnitude, angle) = if br.read_bit()? {
             if channels < 2 {
                 return Err(invalid("coupling with fewer than two channels"));
@@ -427,7 +433,22 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
         });
     }
 
-    if std::env::var("VORBIS_TRACE").is_ok() { eprintln!("setup: mappings done"); }
+    eprintln!(
+        "DBG mapping dump: {} mappings; {:?}",
+        mappings.len(),
+        mappings
+            .iter()
+            .map(|m| (
+                m.submaps,
+                m.coupling_steps,
+                m.magnitude.to_vec(),
+                m.angle.to_vec(),
+                m.mux.to_vec(),
+                m.submap_floor.to_vec(),
+                m.submap_residue.to_vec()
+            ))
+            .collect::<Vec<_>>()
+    );
     // Modes.
     let mode_count = br.read_bits(6)? as usize + 1;
     let mut modes = Vec::with_capacity(mode_count);

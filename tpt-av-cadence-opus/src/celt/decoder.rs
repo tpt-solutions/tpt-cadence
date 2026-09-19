@@ -132,6 +132,8 @@ impl CeltDecoder {
     /// (downsample = 1). Other Opus rates require the caller to trim
     /// `frame_size` and decimate; see `with_downsample`.
     pub fn new(channels: usize, sample_rate: u32) -> crate::Result<Self> {
+        // Resolve debug-trace env flags before any decode (see debug.rs).
+        crate::debug::init();
         let downsample = match sample_rate {
             48_000 => 1usize,
             24_000 => 2,
@@ -161,7 +163,10 @@ impl CeltDecoder {
             start: 0,
             end: NB_EBANDS,
             disable_inv: channels == 1,
-            rng: 1_000_000, // reset state; libopus clears to 0
+            // `opus_custom_decoder_init` OPUS_CLEARs the whole decoder
+            // state (and `DECODER_RESET_START` is `rng`, so resets clear
+            // it too): the spectral-LCG seed starts at zero.
+            rng: 0,
             last_coded_bands: 0,
             error: false,
             last_pitch_index: 0,
@@ -549,17 +554,6 @@ impl CeltDecoder {
         };
         bits -= anti_collapse_rsv;
 
-        if std::env::var_os("CELT_BAND_TRACE").is_some() {
-            eprintln!(
-                "HEADER silence={silence} is_transient={is_transient} intra_ener={intra_ener} \
-                 spread={spread_decision} alloc_trim={alloc_trim} anti_collapse_rsv={anti_collapse_rsv} \
-                 bits={bits} tell_frac_before_alloc={} tf_res={:?} offsets={:?} start={start} end={end} lm={lm} c={c}",
-                dec.tell_frac(),
-                &self.tf_res[start..end],
-                &self.offsets[start..end],
-            );
-        }
-
         let result = compute_allocation(
             start,
             end,
@@ -579,17 +573,6 @@ impl CeltDecoder {
         let coded_bands = result.alloc.coded_bands;
         let balance = result.alloc.balance;
 
-        if std::env::var_os("CELT_BAND_TRACE").is_some() {
-            eprintln!(
-                "ALLOC coded_bands={coded_bands} balance={balance} intensity={intensity} \
-                 dual_stereo={dual_stereo} pulses={:?} ebits={:?} fine_priority={:?} \
-                 tell_frac_after_alloc={}",
-                &self.pulses[start..end],
-                &self.fine_quant[start..end],
-                &self.fine_priority[start..end],
-                dec.tell_frac(),
-            );
-        }
         self.last_coded_bands = coded_bands;
 
         unquant_fine_energy(start, end, &mut self.old_band_e, &self.fine_quant, dec, c)?;

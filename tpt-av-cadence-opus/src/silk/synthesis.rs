@@ -209,7 +209,7 @@ pub(crate) fn decode_core(
     lag_prev: i32,
 ) {
     debug_assert!(state.prev_gain_q16 != 0);
-    if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+    if crate::debug::flags().silk_c_fs_debug {
         eprintln!(
             "CORE fs={} nb_subfr={} sigType={} NLSFInterp={} lagPrev={} prevGain={}",
             frame.subfr_length / 5,

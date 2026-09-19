@@ -154,10 +154,7 @@ mod tests {
                     .map(|c| (c.re.powi(2) + c.im.powi(2)).sqrt() as f64)
                     .fold(0.0f64, |m, v| m.max(v)))
                 .max(1e-9);
-                assert!(
-                    err / scale < 1e-4,
-                    "n={n} forward={forward} rel err {err}"
-                );
+                assert!(err / scale < 1e-4, "n={n} forward={forward} rel err {err}");
             }
         }
     }

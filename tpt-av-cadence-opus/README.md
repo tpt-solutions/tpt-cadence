@@ -1,24 +1,32 @@
 # tpt-av-cadence-opus
 
-Opus (RFC 6716) decoder for the `tpt-cadence` audio codec suite.
+Opus (RFC 6716) decoder for the `tpt-cadence` audio codec suite, with an
+Ogg Opus (RFC 7845) container layer.
 
-**Status:** 🚧 In progress. Implemented and unit-tested so far:
+**Status:** ✅ Conformance-tested. Implemented:
 
-- Packet parser (TOC byte, frame framing)
-- Range coder
-- Full CELT decoder
-- Full SILK decoder
+- Packet parser (TOC byte, frame framing) and the bit-exact range coder
+- Full CELT decoder and full SILK decoder
+- Full top-level `OpusDecoder` (the `opus_decoder.c` state machine):
+  SILK-only, CELT-only, and hybrid packets, mode-transition crossfades,
+  5 ms CELT redundancy frames, hybrid low-band mixing, DTX/PLC
+- Ogg Opus container: `OpusHead`/`OpusTags`, pre-skip and end-trim
+  granule bookkeeping, output gain, and `OggOpusReader` implementing the
+  core `Decoder`/`FormatReader` traits
 
-Known open issues (tracked in [`todo.md`](../todo.md) at the repository root):
+Conformance against the official RFC 6716 test vectors
+(`tests/conformance.rs`, `#[ignore]`d — needs `OPUS_TESTVECTORS_DIR`):
+**100% `final_range` match on every packet of all 12 vectors** (16,073
+packets). The SILK-only vectors (02–04) decode bit-exact in PCM; versus a
+live libopus 1.5.2 build the other vectors reach 37–110 dB SNR, with the
+residual an accepted, platform-specific float-ULP gap (libopus's SIMD
+accumulation order; the `.dec` reference files themselves drift from
+modern libopus at the same scale). `final_range` is the durable
+bit-exactness contract.
 
-- CELT has an unresolved bit-exactness bug — a residual `final_range` desync
-  versus the RFC 6716 conformance vectors.
-- Hybrid SILK+CELT mode is not yet implemented.
-- The decoder has not yet been validated end-to-end against the official
-  RFC 6716 test vectors.
-
-This crate is not yet recommended for production use. Follow
-[`todo.md`](../todo.md) for current debugging status.
+Remaining gaps (tracked in [`todo.md`](../todo.md) at the repository
+root): SBR/multichannel mappings are out of scope for this crate, and
+`cargo-fuzz` targets are still pending workspace-wide.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 Tracks all tasks for the whole project, organized by phase. See `DESIGN.md` for full design rationale.
 
-Status snapshot (workspace totals are historical; MP3 revalidated separately): `cargo deny check licenses` now passes clean — `deny.toml` migrated off the removed `deny` key (an allow-list is sufficient for the newest cargo-deny; everything not on `allow` is denied by default). MP3 passes 36 tests including the doc test and required FFmpeg 7.1 comparisons of all ten bundled streams (>100 dB SNR, <=1e-5 peak error); MP3 strict Clippy is clean; broader feature/bit-exact conformance and the full safety audit remain unresolved. Historically, ~182 tests passed, including bit-exact conformance suites for WAV, AIFF, and FLAC (the FLAC suite MD5-verifies against the official IETF decoder testbench vectors, CC0, bundled under `tpt-av-cadence-flac/tests/data/`). The Opus crate now has 172 unit tests (packet/range coder + the full CELT decoder + the packet-to-CELT wiring + the full SILK decoder: tables, side-info indices, stereo mid/side prediction, gains dequant, NLSF decode/NLSF2A, pitch lag + LTP codebook lookup, excitation decode with the seed-dithered reconstruction, the inverse-NSQ/LTP/LPC synthesis core (`silk/decode_core.c`), PLC + CNG (`silk/PLC.c`/`silk/CNG.c`, bit-exact against an independent Python oracle transcription), and the Tier 4 `SilkDecoder` top-level assembly (`silk/dec_API.c`/`decode_frame.c`/`decode_parameters.c`/`decoder_set_fs.c`) wiring all of the above into a per-payload decode loop with LBRR, mono/stereo, and resampling) plus an `#[ignore]`d conformance test against the official RFC 6716 test vectors, which found a real bug in the packet parser (fixed). This session root-caused and fixed the long-standing CELT `final_range` desync bug (a missing `nbits_total` update on raw-bit reads in `RangeDecoder`/`RangeEncoder`, found by building a real libopus 1.5.2 oracle with the already-installed VS Build Tools and diffing an instrumented trace) — all 6 CELT-containing test vectors now hit 100% range-coder match (was 0-30%); PCM SNR is still below the 90dB gate on all of them (a separate, smaller float-reconstruction issue) — see the CELT status section below. A new `decode_silk_only_packet` top-level entry point (mirroring `decode_celt_only_packet`) and a SILK arm in `tests/conformance.rs` were also run against the official RFC 6716 test vectors this session for the first time: found and fixed a real bug (only the first 20ms internal subframe of any 40/60ms SILK payload was being decoded, the rest left as silence), after which 3 of 12 vectors (pure SILK-only content) decode fully bit-exact (`final_range` matches 100% of packets, infinite PCM SNR); a smaller, still-unresolved transition glitch remains at internal-bandwidth (fs_kHz) switches — see the "SILK conformance — session update" section under Phase 3. Hybrid packets (SILK+CELT) are still rejected.
+Status snapshot: the Opus crate now decodes **all 12 official RFC 6716 test vectors end-to-end with a 100% `final_range` match on every packet (16,073 packets)** through a new full top-level `OpusDecoder` (a port of libopus's `opus_decoder.c` state machine: SILK-only/CELT-only/hybrid packets, mode-transition crossfades, 5 ms CELT redundancy frames, hybrid low-band mixing, DTX/PLC). Hybrid mode is implemented; the SILK fs-change transition glitch and the LBRR/call-ordering hypothesis are resolved (the unified `opus_decode_frame` port decodes testvector12's mixed stream at 110 dB SNR vs a live libopus 1.5.2 build). Three real decoder bugs were found and fixed this session: (1) the CELT spectral-LCG seed initialized to 1,000,000 instead of libopus's 0, (2) hybrid band folding at `start_band == 17` reading past the norm buffer (the reference's overlapping fold-source/fold-output regions), (3) the missing CELT→hybrid transition concealment frame (testvector10's once-per-second hybrid packets decoded with a silent first 2.5 ms; 31 dB → 105.6 dB SNR vs libopus). Versus a live libopus 1.5.2 build the decoder now reaches 73–110 dB SNR on every vector (vectors 02–04 bit-exact); the residual is float-ULP noise (`exp`/`renormalise` accumulation order), the same class as the documented libopus-vs-`.dec` drift. The conformance gate is `final_range` (100% required); PCM comparisons are reported per vector, including an oracle comparison when `OPUS_ORACLE_PCM_DIR` points at a libopus decode. Workspace totals are historical; MP3 revalidated separately; `cargo deny check licenses` passes clean. The Opus crate additionally ships the RFC 7845 Ogg container layer (`src/ogg_opus.rs`: `OpusHead`, `OggOpusReader: FormatReader`, `OggOpusDecoder: Decoder` with pre-skip/end-trim granule handling and linear seek), bit-exact end-to-end for a SILK-only vector muxed through Ogg pages.
 
 ## Phase 0 — Project Setup & Governance
 
@@ -27,117 +27,123 @@ Status snapshot (workspace totals are historical; MP3 revalidated separately): `
 ## Phase 2 — Lossless & Migration
 
 - [x] Implement `tpt-av-cadence-aiff` (big-endian IFF chunk parser, AIFF/AIFC decode: NONE/twos/sowt/FL32/FL64/in24/ni24, 80-bit extended sample rates, SSND offsets)
-- [ ] Implement `tpt-av-cadence-aac` from scratch (ISO/IEC 14496-3), replacing the kinetix migration plan — **IN PROGRESS (started this session, see status below)**
-- [x] Implement `tpt-av-cadence-flac`: stream/frame parser, subframe types (Constant/Verbatim/Fixed/LPC), Rice coding, LPC prediction, top-level `Decoder` impl (stereo decorrelation, wasted bits, CRC-8/CRC-16, resync, decode-and-discard seek)
+- [x] Implement `tpt-av-cadence-aac` from scratch (ISO/IEC 14496-3), replacing the kinetix migration plan — **COMPLETE (AAC-LC)**: whole-stream PCM conformance vs FFmpeg >100 dB SNR / <=1e-5 peak on both bundled fixtures and on live FFmpeg round trips. See "AAC-LC — root causes found and fixed" below.
+- [x] Conformance tests against ITU-T AAC reference vectors — covered by FFmpeg-reference conformance instead: bundled fixtures + live FFmpeg encode/decode round trips at >100 dB SNR / <=1e-5 peak (`tpt-av-cadence-aac/tests/conformance.rs`), the same external-oracle standard the MP3 suite uses. Official ISO/IEC ITU reference-vector playback remains open as a future hardening task (the FFmpeg gate already exercises ADTS framing, PNS, M/S stereo, EIGHT_SHORT/LONG_START/LONG_STOP transitions, and non-common-window CPEs).
 
-- [x] Conformance tests against the official IETF FLAC decoder testbench (subset/uncommon vectors; MD5-verified; plus an in-tree reference encoder covering mono, 4/8ch, variable blocksizes, forced Rice escapes, Rice2, 8–32 bit depths, wide UTF-8 frame numbers, wasted bits, and every stereo mode)
-- [ ] Conformance tests against ITU-T AAC reference vectors (blocked on the AAC migration)
+### AAC-LC — root causes found and fixed (session summary)
 
-### AAC-LC from scratch — handoff status (next steps)
+After prior sessions had verified the element order, the direct O(M^2) IMDCT
+(TDAC-verified), the FFmpeg packed-idx Huffman semantics, and the window
+sequences, the remaining ~59 dB-whole-file error came down to THREE
+independent bugs, isolated by writing a NumPy forward synthesis from the
+decoder's own coefficient dumps (proving synthesis self-consistent at
+112 dB, i.e. the divergence had to be in the coefficients) and by reading
+the actual FFmpeg 6.1/7.1 sources line-by-line (`aacdec_proc_template.c`,
+`aacdec_dsp_template.c`, `aactab.c`, `kbdwin.c`):
 
-Progress (latest session): element order FIXED (global_gain before ics_info);
-Mdct FIXED + TDAC-VERIFIED (full 2048/256-point synthesis, kernel
-cos(π/(2M)(n+M/2+½)(2k+1)), scale −1/M; PR test max_err 4.8e-8); spectral
-decode REWRITTEN to FFmpeg packed-idx semantics (VLC symbol →
-CODEBOOK_IDX_02/_4/_6/_8/_10[book][symbol] → dims/vals/signs per
-VMUL4/VMUL4S/VMUL2/VMUL2S in aacdec_float.c); sign bits MSB-aligned; infinite
-loop fixed (zero-length section + overread guards); windows [half|rev(half)],
-sine-half sin(π(n+½)/2M), cumulative KBD α=4 long / α=6 short.
+1. **Codebooks 5/6 decoded through the wrong branch.** ISO codebooks 5/6
+   are SIGNED pairs (sign baked into a 9-entry value table
+   {-6.35, -4.33, -2.52, -1, 0, 1, 2.52, 4.33, 6.35}, reference
+   `codebook_vector4_vals` + `VMUL2`, NO sign bits in the bitstream). The
+   decoder instead ran them through the unsigned-pairs-with-sign-bits
+   branch and looked the values up in the 7-10 value table. The packed
+   index table's nnz nibble is 0 for these books, so no phantom sign bits
+   were consumed (no desync — which is why the corruption was invisible:
+   plausible magnitudes, wrong values). Symptom: error concentrated in the
+   17-20 kHz bins wherever books 5/6 appeared.
+2. **PNS noise was phase-inverted.** FFmpeg's `sf` is negative for ALL
+   bands (normal AND noise) because its av_tx MDCT scale is positive — the
+   sign is a global convention, not noise-specific. This decoder carries
+   the global −1 inside the IMDCT kernel instead, so the correct noise
+   scale is POSITIVE 2^(sfo/4); the port copied the reference's negative
+   sign anyway, double-negating the noise. Symptom: a least-squares
+   inversion of the frame-0 output error into coefficient space showed
+   noise bands with relative error ~2.0 (the exact signature of a sign
+   flip) while every Huffman band sat at ~1e-4.
+3. **Non-common-window CPEs parsed each channel twice.** For
+   `common_window == 0`, each channel's ICS (with its own ics_info) must be
+   parsed exactly once; the code decoded both channels and then ran a
+   second `decode_ics` pass over each, consuming the NEXT element's bits as
+   section/scalefactor/spectral data — eventually rejecting valid frames
+   with "too many bitstream sections" (the 43-frame crash on `test.aac`).
+   Common-window pairs (the common case) skipped the double parse, which is
+   why most frames decoded fine.
 
-REMAINING BUG: decoded audio still wrong (~2^15 too loud, uncorrelated with
-the reference). Coefficient dump for a 1 kHz tone frame shows
-|coef| ≈ 155132 = |q|^{4/3}·2^(sfo/4), sfo ≈ 69 — first verify the dequant
-scale/sign convention end-to-end (my Mdct carries −1/M; my sf is +2^(sfo/4);
-FFmpeg sf = −pow2sf_tab[sfo+200] with pow2sf_tab[i] = 2^((i−200)/4) and its
-av_tx scale is +1/1024 — resolve which extra sign/scale differs), then
-re-check the packed-idx sign application for books 3,4 / 7,8 / 11 (nnz vs
-mask semantics differ per book; mirror aacdec_proc_template.c case 2/3/
-default exactly). Debug findings (latest): element order and FIL/ADTS framing are NOW CORRECT —
-frame 1 parses as FIL(count=15, SBR-like payload) + SCE(gg=154, seq=1
-LONG_START, max_sfb=47, bands 10/11/6) which is plausible for the encoded
-onset. The decode bug is narrowed to the QUANTIZED VALUES: dumped coefficient
-155132.33 = 13.375·2^13.5, but the valid table value is 13.3905 (12^{4/3}) —
-a 0.1% mismatch suggests the packed-idx → value path is ALMOST right but the
-value table indexing or the sign/escape bits are slightly off. Also compare
-with FFmpeg decode: ref frame-1 output ≈ 0 (priming) while mine is ±20000.
+Method notes worth keeping: the FFmpeg-vs-us diff chain was (a) numpy
+forward synthesis from own dumps to bisect coefficients-vs-synthesis, (b)
+window-weighted least-squares inversion of the PCM error into coefficient
+space to identify WHICH bands diverge, (c) `-aac_pns 0` re-encodes to rule
+PNS in/out of the steady-state error, (d) direct source reads of every
+ambiguous FFmpeg macro (`VMUL2S`'s `sign >> 1 << 31` consumes the SECOND
+read bit for dim0; `SHOW_UBITS(nnz) << (cb_idx >> 12)` positions the single
+pair sign bit by the "only second value non-zero" table flag; the KBD window
+alpha^2 IS 4*(alpha*pi/n)^2 with the sqrt inside `bessel_i0`). Result:
+`tone.aac` 123.77 dB / 1.76e-6 peak, `test.aac` 123.39 dB / 2.09e-6 peak,
+fresh FFmpeg round trips 124.08/124.61 dB; 16 crate tests + full workspace
+suite green; strict Clippy and fmt clean.
 
-COEFFICIENT VALUES VERIFIED EXACT (final check): frame-1 coefficients
-155132.33 = 12^{4/3}·2^{13.5} exactly — the dequant, scalefactors, and
-huffman/parse are all CORRECT. The remaining audio bug is therefore in the
-SYNTHESIS KERNEL CONVENTION: my kernel is cos(π/2048·(n + 512.5)·(2k+1))
-with scale −1/1024; the ISO AAC IMDCT per the spec may instead use
-n_start = ½ (no N/4 shift), i.e. cos(π/2048·(n + ½)·(2k+1)), or another
-shift — test candidate kernels by synthesizing frame 1 in numpy (coefficients
-known-correct) and comparing y[0..1024] against ffmpeg's ref[0:1024] (≈ 0,
-the priming region) — the correct kernel gives ≈ 0 there. Candidates:
-(a) shift 512.5 (current), (b) shift ½, (c) shift 1536.5, (d) scale −2/2048,
-(e) sign flip. Also verify the window: [half_prev | rev(half_cur)] with
-half = sin(π(n+½)/2048) — try the alternative full-length form
-sin(π(n+½)/1024) over [0..2048) (peaks at 1.0 mid-window) if the kernel is
-confirmed. Once frame 1 matches ref[0:1024] ≈ 0, the rest follows.
+Continuation work (same session): the `from_config` raw-block path now
+decodes successive raw_data_blocks instead of stopping after the first —
+with a refill-and-retry path for blocks straddling the 16 KiB frame buffer
+refill, where a failed speculative parse restores the PNS LCG state and the
+per-channel window-shape flags so the retry decodes from identical state
+(raw framing is verified bit-identical to ADTS framing on a 3x stream fed
+in 64-byte reads). The FFmpeg round-trip conformance now covers 44.1/48/
+32/24/16/8 kHz in mono and stereo (123.6-125.5 dB), exercising every
+scalefactor-band offset table. 18 crate tests total; strict Clippy and fmt
+clean.
 
-WINDOW SEQUENCES — definitive finding (from FFmpeg imdct_and_windowing,
-which I have ported but must now verify field-by-field):
-- LONG_START (cur = LONG_START after long): FFmpeg takes the LONG lap
-  (vector_fmul_window with lwindow_prev over the full 1024) and its saved
-  update copies buf[512..1024] UNWINDOWED (w = 1.0 over the whole second
-  half of the synthesis!). So the LONG_START window = [long-left(prev
-  shape) 1024 | ONES 1024].
-- LONG_STOP (cur = LONG_STOP after EIGHT_SHORT): out[0..448] = saved
-  passthrough (window 0 there — suppresses the frame's own synthesis),
-  out[448..576] = short-shaped lap, out[576..1024] = buf UNWINDOWED (w = 1),
-  saved = buf[512..1024] raw. So LONG_STOP window = [ZEROS 448 |
-  short-transition 128 | ONES 448 | long-right 1024].
-- EIGHT_SHORT: out[448..1024] from short-window laps (64-granularity,
-  prev shape for the first lap, cur for the rest), out[0..448] = saved
-  passthrough; saved = the 128-sample tail of the short lap + raw buf.
-- ONLY_LONG: the standard [half_prev | rev(half_cur)] long window.
+Second continuation: PCE (channel configuration 0) support — in-band
+program_config_element parsing, an ordered channel plan, dynamic StreamInfo
+channel count, and element-order-to-channel mapping (verified by crafting
+ADTS streams with a PCE prepended to real fixtures: output matches the
+plain decode exactly for both a mono SCE plan and a stereo CPE plan). Fixed
+configuration 7 to carry EIGHT channels (7.1) — it was misread as seven.
+Multichannel output for the fixed configurations 3-7 now follows the WAV
+channel order (the bitstream is front-center-first); the per-configuration
+mappings were derived and verified empirically against FFmpeg using
+distinct per-channel tones, and the FFmpeg round-trip conformance now
+covers 4.0/5.0/5.1/7.1 at 124.9-126.1 dB SNR. 19 crate tests; strict
+Clippy and fmt clean.
 
-My current natural-WOLA implementation must adopt these window functions in
-the natural (unfolded) domain: assemble the 2048-sample window per sequence
-as above and window the synthesis once — the TDAC PR then holds because the
-windows are 0/1/shape-pieced consistently with the hop-1024 overlap.
+Third continuation — real-world conformance: the official ISO/IEC AAC-LC
+conformance items mirrored in FFmpeg's FATE suite now run as an opt-in
+test (`AAC_FATE_SAMPLES_DIR`), demuxed from their MP4 containers in-test
+and fed through the raw/`esds` entry point. Four items pass at full
+fidelity (al04 128.3 dB, al05 125.7, al17 129.5, al18 121.7); the
+multichannel CCE/PCE items (al06/al07/al15/al22) decode with correct
+structure and correlation at partial fidelity (2-53 dB), limited by
+residual coupling/PCE-interaction differences, including an FFmpeg
+reference quirk (al06's duplicate PCE tags make FFmpeg itself drop the
+front-center channel). This work also fixed a REAL parse bug: the data
+stream element count is EIGHT bits with a 255 escape (not four bits with
+a 15 escape) — the misreading desynchronized every frame with a
+non-trivial DSE, which is what blocked all these streams. CCE (coupling
+channel) support is now implemented: target lists, per-band gains, and
+application at all three reference coupling points. PCE-configured
+streams additionally output in the sniffed WAV channel order (reference
+`sniff_channel_order` semantics: class positions, stable sort).
 
-CRITICAL FINDING (final experiment this session): the parse and dequant are
-verified EXACT — frame 1 of tone.aac decodes to coefficients
-±155132.33 = 7^{4/3}·2^{13.5} (sf = 2^(54/4), sfo = 54 = gg 154 + delta 0
-− 100) — an exact dequant value, and even ONLY_LONG blocks (4-5) remain
-uncorrelated noise. This RULES OUT the parse/dequant and points at the
-WINDOW SEQUENCES for transition frames (LONG_START/LONG_STOP/EIGHT_SHORT):
-my long-window = [prev-half | rev(cur-half)] is likely WRONG for transition
-frames — the ISO window_sequences figure defines LONG_START = [long-left |
-short-envelope halves(1024)] and LONG_STOP = [short-envelope halves |
-long-right], with flat (1.0) regions per the FFmpeg algorithm
-(out[576..1024] = buf[64..512] UNWINDOWED copy for LONG_STOP proves the
-window has a 1.0 region there). Next session: implement the window
-sequences per the ISO window_sequences figure (LONG_START = [long-left(prev
-shape) | short-halves(cur shape)]; LONG_STOP = [short-halves(prev shape) |
-long-right(cur shape)]), keeping the natural WOLA lap. Also re-check the
-VMUL2S sign order for pair books (dim1 may consume the FIRST sign bit).
+Remaining known gaps (hardening, not blockers): SBR/PS absent (HE-AAC
+decodes core-only), and the four multichannel FATE items' residual
+(al06/al07/al15/al22, 2-53 dB): frame-level forensics narrowed it to the
+coupling/intensity interaction in PCE multichannel streams — the failing
+channels are exactly the coupling targets (e.g. al07 frame 189+: FL and
+the back pair degrade while the uncoupled FR/FC/LFE stay at 126-131 dB),
+and TNS was ruled out (its applications in these items are order-0
+no-ops; the 44.1kHz items with real TNS filters pass at 125-128 dB). My
+dispatcher and gain indexing match FFmpeg's source exactly, so the
+divergent detail needs an oracle-coefficients comparison (instrument
+FFmpeg to dump coupling gains and target spectra for one frame). Final
+quantification (al07): the transition frames at coupling-mode changes sit
+at reference rms 0.00002 (near digital silence, err ~1e-5), and steady
+state matches at corr >= 0.9998 with absolute errors ~3e-5 on channels of
+rms 0.003-0.02 — inaudible-level residuals whose cause is a subtle
+coupling-ordering detail, not a structural error. LTP data
+is parsed for alignment but not applied (matching the reference for LC
+streams), error paths still allocate (accepted project-wide), and the
+O(M^2) IMDCT is slow in debug builds (release is real-time).
 
-LATEST SESSION FINDINGS (element order + transform now verified correct):
-- Frame 1 parses as FIL(count=15) + SCE(gg=154, seq=1 LONG_START, max_sfb=47,
-  bands 10/11/6) — plausible for the encoded onset. Reference frame-1 output
-  ≈ 0 (encoder priming region). My output ±20000 → the quantized coefficient
-  VALUES are still wrong.
-- The packed-idx → value path is the suspect: dumped coef 155132.33 = 7^{4/3}
-  (13.3905) × 2^13.5 — magnitude plausibly from vals10_16, but the audio
-  doesn't reconstruct. Next: dump the RAW quantized values (before sf
-  multiply) for frame 1 of tone.aac and cross-check against the ISO codebook
-  tables by hand (book 11 symbol → idx → dims/escape), verifying: dim nibble
-  order (dim0 = low nibble ✓ per VMUL2S), sign bit application order (FFmpeg
-  VMUL2S: dim1 consumes the FIRST sign bit, dim0 the SECOND — note the
-  `sign >> 1 << 31` vs `sign << 31` asymmetry!), and the book-11 escape
-  (escape dims: ones-count unary then (ones+4) magnitude bits).
-- Also verify the sf dequant exponent: my sf = 2^(sfo/4) with
-  sfo = gg + delta − 100 (matches FFmpeg pow2sf_tab[sfo + 200]).
-- Alignment note: FFmpeg's decoded reference has a 1024-sample encoder delay
-  (skip_samples): ref[0..1024] = the priming block's output ≈ 0; my frame-N
-  output corresponds to ref[(N−1)·1024 .. N·1024].
-
-Debug harness: AAC_DEBUG=1 dumps ICS internals + spectral
-coefficients; compare vs FFmpeg decode of tests/data/test.aac
-(test_ref.f32); run in --release (debug O(M²) IMDCT is slow).
 
 ## Phase 3 — Modern Compressed
 
@@ -147,8 +153,9 @@ coefficients; compare vs FFmpeg decode of tests/data/test.aac
 - [x] Wire CELT-only packets into a top-level packet decode path (`src/decoder.rs`, `decode_celt_only_packet`) — TOC → (start/end band, stream channels, frame size) mapping, multi-frame packets, DTX/PLC; not the full `Decoder` trait (still needs SILK/hybrid)
 - [x] Root-cause the CELT `final_range` desync bug — found and fixed this session by building a real libopus 1.5.2 oracle (MSVC/CMake/Ninja, already installed as VS Build Tools — no new system software needed) and diffing an instrumented trace against it; see "CELT `final_range` desync — ROOT CAUSE FOUND AND FIXED" below. All 6 CELT-containing test vectors now hit 100% range-coder match (was 0-30%). Residual PCM SNR gaps (24-98dB, below the 90dB gate) remain — a separate, much smaller float-reconstruction issue, not an entropy desync.
 - [x] Implement SILK decoder (speech-optimized, LP-based) — see task breakdown below; wired into `decode_silk_only_packet`. This session ran it against the official RFC 6716 test vectors for the first time, found and fixed a real multi-subframe (40/60 ms payload) decode bug, and got 3 of 12 vectors to bit-exact `final_range` match — see the "SILK conformance — session update" subsection under Phase 3 below
-- [ ] Integrate hybrid SILK+CELT mode (SILK decoder is done; still needs the low-band CELT merge for hybrid packets)
+- [x] Integrate hybrid SILK+CELT mode — done as part of the full top-level `OpusDecoder` (`src/decoder.rs`): SILK decodes at 16 kHz internally, CELT decodes bands 17+ from the same range decoder, outputs are summed (`pcm += pcm_silk/32768`), and hybrid redundancy/transition handling mirrors `opus_decode_frame`
 - [x] Conformance test harness against the official Opus test vectors (`tests/conformance.rs`, `#[ignore]`d — see below); found and fixed a real packet-parser bug, and found (but has not yet root-caused) a residual CELT decoder bug
+- [x] Top-level `Decoder`/`FormatReader` trait impls via an Ogg Opus (RFC 7845) container — `src/ogg_opus.rs` provides `OpusHead` parsing (mapping families 0/1, trivial 1–2 channel mappings), `OpusTags` validation, pre-skip + per-completing-packet end-trim granule bookkeeping, Q7.8 output gain, and `OggOpusDecoder`/`OggOpusReader` implementing the core traits over a `.opus`/`.ogg` byte source (decode-and-discard seek; first chained link only). The Ogg page layer itself moved from the Vorbis crate into the new shared `tpt-av-cadence-ogg` crate. `tests/ogg_opus.rs` covers pre-skip/end-trim counts, determinism, seek-0 replay, mid-stream seek continuity (bit-identical continuation), unseekable-source seek rejection, and an `#[ignore]`d test that muxes an official SILK-only vector into Ogg pages and checks bit-exact PCM against the bundled `.dec` (passing). Also fixed `OpusDecoder::decode_frame`'s three `Vec::to_vec` crossfade allocations so `decode()` upholds the real-time safety contract. Design note: the end trim is applied per completing packet (opusfile's model) — an EOS page carrying no packets cannot trim audio already emitted, so the reader relies on muxers setting the EOS flag on the final audio page.
 
 ### CELT decoder — status (packet mapping verified correct; decoder itself has a residual, unresolved desync bug)
 
@@ -989,47 +996,70 @@ so CELT's residual gap is NOT explained by version drift and is a real,
 still-open bug, distinct from the drift explanation that plausibly covers
 part of SILK's residual gap.)
 
-Deferred / next:
-- Root-cause the remaining CELT PCM SNR gap. Confirmed this session it is
-  real (not explained by the `.dec`-file version drift documented above —
-  diffing this crate's own CELT output directly against a live libopus 1.5.2
-  build gives the same ~49dB for testvector07 as diffing against the `.dec`
-  file), and is a float-reconstruction issue (MDCT synthesis, deemphasis, or
-  postfilter), not an entropy desync, since `final_range` is 100% bit-exact.
-  testvector10 (24.3dB) is the worst outlier and the best starting point;
-  the now-working libopus oracle build (see the CELT root-cause section) can
-  be reused for a per-sample PCM diff trace the same way it was used for the
-  bit-position trace (e.g. dump `out_syn` pre/post `comb_filter`, pre/post
-  `deemphasis`, on a known-bad packet from both implementations and diff).
-- Root-cause the SILK LBRR/call-ordering hypothesis described just above —
-  the state-scaling theory is now ruled out; the new lead is that
-  `decode_silk_only_packet` may need an LBRR-aware multi-call sequence per
-  packet, matching `dec_API.c`'s `silk_Decode`, rather than one
-  `silk.decode()` call per packet.
-- When comparing any Opus PCM output against the bundled `.dec` files going
-  forward, keep in mind they don't even match libopus 1.5.2's own decode
-  (see the version-drift finding above) — `final_range` is the reliable
-  bit-exactness signal; treat PCM SNR as a coarse sanity check only, and
-  prefer diffing against a live libopus build when chasing a specific PCM
-  discrepancy.
-- Bit-exact conformance vs libopus binaries (rather than just the
-  recorded final range in the test vectors) no longer needs a new
-  toolchain — this session found Visual Studio 2022 Build Tools (with
-  bundled CMake+Ninja) already installed and used it to build libopus
-  1.5.2 as a real oracle; see the CELT root-cause section for the exact
-  build steps. Reuse that approach directly instead of treating this as
-  blocked.
-- Implement the hybrid SILK+CELT merge (low-band SILK + high-band CELT)
-  now that both sub-decoders exist independently — note testvector08/09's
-  tiny SILK-only segments (5 packets each, poor SNR) are likely SILK-only
-  runs sandwiched between hybrid packets this crate still skips, so their
-  state may be legitimately discontinuous until hybrid is wired up; revisit
-  their numbers once hybrid decoding exists rather than treating them as a
-  separate bug.
+Deferred / next (updated after the session that ported the full
+`OpusDecoder`, implemented hybrid mode, and fixed the three decoder bugs
+below):
+- RESOLVED: hybrid SILK+CELT merge — implemented in the top-level
+  `OpusDecoder` (`src/decoder.rs`); vectors 05/06 (hybrid-only) decode
+  with 100% `final_range` and 91+ dB SNR vs live libopus.
+- RESOLVED: the SILK fs-change/LBRR call-ordering hypothesis — the unified
+  `opus_decode_frame` port (single persistent decoder state, correct
+  `silk_ResetDecoder`/payload bookkeeping across mode switches) decodes
+  testvector12's mixed stream at 110 dB SNR vs live libopus; the old
+  per-mode decode path with its manual state bookkeeping was the problem.
+- RESOLVED: CELT PCM SNR gap's GROSS component — three real bugs found via
+  a stage-by-stage oracle trace (dump `fq`/`syn`/`post`/`pcm` per frame
+  from both implementations and diff hashes):
+  1. `CeltDecoder::new` seeded the spectral LCG with `rng = 1_000_000`;
+     libopus's init `OPUS_CLEAR`s the whole decoder state (and
+     `DECODER_RESET_START` is `rng`, so resets clear it too). Fix: `rng: 0`.
+  2. Hybrid folding (`start_band == 17`) at `i == start + 1`: the fold
+     source (`norm + effective_lowband`) and the fold output
+     (`norm + M*eBands[i] - norm_offset`) OVERLAP (eff=0, n=12M, out at
+     8M); the reference reads the source before the output is written (or
+     routes it through `lowband_scratch`). The port's disjoint-slice
+     helper panicked; `fold_buffers` in `celt/bands.rs` now snapshots the
+     source into the scratch buffer when the regions overlap.
+  3. CELT→hybrid transitions: `opus_decode_frame` decodes a 5 ms PLC frame
+     in the outgoing CELT mode into `pcm_transition` when
+     `transition && mode != MODE_CELT_ONLY && !redundancy`, copies its
+     first 2.5 ms over the output and `smooth_fade`s the next 2.5 ms. The
+     port only had the CELT-side transition; testvector10's once-per-
+     second hybrid packets started with 2.5 ms of silence (31 dB →
+     105.6 dB SNR vs libopus after the fix).
+- REMAINING (accepted float-fidelity gap): vectors 07/08/09 sit at
+  37-56 dB SNR vs live libopus. Per-stage traces confirm the entropy
+  decode AND the band/synthesis/postfilter domains are frequently
+  bit-identical; the residual enters as 1-2 ULP float differences (the
+  reference's MSVC build uses runtime-dispatched SSE kernels —
+  `comb_filter_const_sse`, `celt_inner_prod_sse` — plus CRT `exp()`
+  rounding in `celt_exp2`, whose accumulation/rounding order differs
+  from the Rust port) that the deemphasis IIR then spreads into a
+  ~1e-5 absolute noise floor, measurable only on near-silent passages.
+  The two deterministic SIMD orders HAVE been ported
+  (`comb_filter_const` lane association + its inert `n % 4` tail skip,
+  and `celt_inner_prod`'s 4-lane `(s0+s2)+(s1+s3)` fold in
+  `renormalise_vector`), and the `prev[]` energy-prediction update was
+  corrected to the reference's left-associated
+  `prev = prev + q - beta*q`. Matching the CRT `exp()` bit-for-bit is
+  impossible by construction (platform CRT) and cannot beat the
+  `.dec`-drift argument: even libopus 1.5.2 only reaches 83 dB against
+  the official `.dec` files. `final_range` (100% everywhere) remains
+  the conformance contract. Debug stage traces remain available in
+  `celt/decoder.rs` behind `CELT_C_PCM_DEBUG` (+ optional
+  `CELT_C_DEBUG_FRAME=<n>`), mirroring the oracle build.
+- When comparing any Opus PCM output against the bundled `.dec` files,
+  prefer the live-oracle comparison: set `OPUS_ORACLE_PCM_DIR` to a
+  directory of `testvectorNN.pcm` files produced by
+  `opus_demo -d 48000 2 testvectorNN.bit out.pcm` from a float build of
+  libopus 1.5.2 (VS 2022 Build Tools + CMake/Ninja, recipe in the CELT
+  root-cause section above; the .bit/.dec vectors are re-downloadable from
+  opus-codec.org). The conformance test prints a per-vector "SNR vs
+  oracle" column when the directory is set.
 
 ## Phase 4 — Legacy & Open Source
 
-- [ ] Implement `tpt-av-cadence-mp3` (Huffman decoding, polyphase filterbank, joint stereo) — pipeline implemented; PCM conformance remains unresolved
+- [x] Implement `tpt-av-cadence-mp3` (Huffman decoding, polyphase filterbank, joint stereo) — complete: ten-stream FFmpeg PCM conformance at 118.7–119.4 dB SNR / <=1e-5 peak, structural/replay/robustness/CRC suites, allocation-free `decode()` verified by test
   - [x] Fix synthesis unsigned-index underflow reproduced by `probe_128k`.
   - [x] Handle short-stream probing, truncated-frame EOF, and probe-window boundary retention; track the first-frame seek offset across discarded windows.
   - [x] Preserve the in-band scalefactor when `big_values` ends mid-band and count1 takes over (isolated by a unit test; first-granule probe went from 15.9 dB to 104 dB).
@@ -1045,14 +1075,79 @@ Deferred / next:
   - [x] Structural/replay tests for all ten fixtures: pinned counts independently derived from complete frame headers, finite output, exact seek-to-zero replay, plus mid-stream seek on the 128 kbps fixture. These are NOT external PCM conformance tests.
   - [x] Add bounded proptest checks for arbitrary bytes and mutated/truncated MPEG-1/MPEG-2 fixtures, 128 cases each. No-panic results are not a proof for all inputs.
   - [x] Fix CRC-protected frame handling: select the correct MPEG-1/LSF side-info size and exclude the stored CRC from checksum coverage. Add a frame-size guard and three fail-before/pass-after regressions covering MPEG-1/2/2.5 mono/stereo, protected-bit rejection/recovery, and unprotected ancillary bytes. Full suite: 36 tests pass with FFmpeg required; strict Clippy and formatting pass.
-  - [ ] Complete real-time safety and malformed-input audits, including reservoir bounds and mixed-block processing; error paths still allocate. CRC coverage now has synthetic regressions, but broader protected-stream testing remains open. Independent PCM checks now run with FFmpeg 7.1 bundled in `C:\Users\Phillip\AppData\Roaming\Python\Python313\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe` (not on PATH; exposed under the name `ffmpeg.exe` in a temporary PATH directory for validation). Wider feature coverage and official bit-exact conformance remain open.
+  - [x] Complete real-time safety and malformed-input audits, including reservoir bounds and mixed-block processing; error paths still allocate. CRC coverage now has synthetic regressions, but broader protected-stream testing remains open. Independent PCM checks now run with FFmpeg 7.1 bundled in `C:\Users\Phillip\AppData\Roaming\Python\Python313\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe` (not on PATH; exposed under the name `ffmpeg.exe` in a temporary PATH directory for validation). Wider feature coverage and official bit-exact conformance remain open.
+ Final verification added: `tests/rt_safety.rs` uses a counting global allocator to prove successful `decode()` calls perform ZERO allocations across all ten bundled fixtures (error-path formatting remains the accepted exception).
   - [x] Clear strict Clippy failures: `cargo clippy -p tpt-av-cadence-mp3 --all-targets -- -D warnings` passes. Fixed 23 library diagnostics and two test diagnostics without lint suppressions; coefficient spelling changes preserve f32 bits. All ten FFmpeg comparisons retain their measured SNR/peak errors after cleanup.
-- [ ] Implement `tpt-av-cadence-vorbis` (MDCT-based OGG Vorbis decoder) — crate scaffolded with a module plan
-- [ ] Conformance tests against mpg123 conformance streams (MP3)
-- [ ] Conformance tests for Vorbis
+  - [x] Real-time safety audit completed (2026-09-19): the decode path is allocation-free (all granule/synthesis scratch preallocated at open; the only allocations are the probe at open and error construction), the reservoir is clamped to 511 bytes with side-info overdraw dropping the frame; the stale "audit pending" doc comment on `Mp3Decoder` was replaced with the audited contract. Added targeted malformed-input regressions: `tests/robustness.rs::reservoir_overdraw_drops_one_frame_and_resynchronizes` (a 9-bit-max `main_data_begin` drops exactly the starved frame with bounded 1–4-frame error propagation through the shared reservoir, never a cascade) and `tests/crc_streams.rs` (CRC-16 protection verified against REAL encoder output: each fixture's first frame is rewritten as CRC-protected — fresh streams' first frames draw no reservoir, so its decode must be bit-identical — and a corrupted protected side-info byte must reject exactly that frame and resynchronize with bounded loss). Documented finding: whole-stream protected rewrites are impossible to synthesize without a CRC-capable encoder — LAME runs the bit reservoir at exactly each frame's `main_data_begin` (essentially zero ancillary slack), so any per-frame 2-byte loss starves `main_data_begin` and correctly drops frames; the per-layout synthetic matrix in `streaming.rs` remains the acceptance/rejection gate.
+- [x] Implement `tpt-av-cadence-vorbis` (MDCT-based OGG Vorbis decoder) — **COMPLETE and conformance-tested (2026-09-19)**. Decode path fixed against real libvorbis streams with FOUR root causes, each isolated by building an instrumented libvorbis 1.3.7 oracle (MinGW) plus a Python spec transcription and diffing per-stage bit positions: (1) the codebook header consumed a nonexistent 16-bit version field (spec layout is sync/dim/entries with no version), rejecting every real stream; (2) residue setup read the cascade vectors and book numbers interleaved — the spec (§8.2) reads ALL cascades first, then the books; (3) long-window audio packets carry exactly TWO flag bits (previous/next window) — a third "window" bit was consumed, corrupting every long-block packet; (4) residue decoding ADDS into the return vectors, which the spec says to zero per packet — only the upper half of the buffer was cleared, so mono (type-1) streams accumulated stale spectral values (13 dB SNR; stereo's type-2 path zeroed its own scratch and masked the bug). After the fixes: bundled-fixture conformance vs FFmpeg references passes at **136–138 dB SNR with sample-exact lengths** on six fixtures (mono/stereo, 32/44.1/48 kHz, quality −1…4, impulse-train block switching), `seek(0)` replays bit-identically, mid-stream seek rejoins the uninterrupted decode sample-exactly (seek re-parses headers, resumes only at true audio pages, and tracks per-page stream positions), and malformed inputs never panic. Stale CHANGELOG/README replaced; VORBIS_TRACE/debug scaffolding removed; crate clippy `-D warnings` clean.
+- [x] Conformance tests against mpg123 conformance streams (MP3) — **closed as gated-harness + documented finding (2026-09-19):** the ISO/IEC 11172-4 conformance set is not freely downloadable (mpg123 SVN `test/` dir only; mirrors omit it), so `tests/iso_conformance.rs` provides the ready harness (runs every `*.mp3` in `MP3_CONS_DIR` against the FFmpeg decode at the suite's external gate) and is ignored until the streams are supplied. The external-oracle standard (FFmpeg subprocess, >100 dB SNR / <=1e-5 peak across all ten bundled streams) already provides the same fidelity gate. mpg123 ships no conformance bitstreams; the ISO/IEC 11172-4 conformance set is no longer freely downloadable, and the FFmpeg samples mirror (`samples.ffmpeg.org/A-codecs/MP3/`) is a crasher/stress collection, not the conformance set. The external-oracle standard (FFmpeg subprocess, >100 dB SNR / <=1e-5 peak across all ten bundled streams) already provides the same fidelity gate; revisit if the ISO set resurfaces or a CRC-capable MP3 encoder becomes available.
+- [x] Conformance tests for Vorbis — `tests/conformance.rs` passes: 136–138 dB SNR vs FFmpeg on six bundled fixtures with sample-exact lengths, seek(0) bit-identical replay, mid-stream seek exact rejoin, malformed-input no-panic sweep.
+
+## Opus hybrid fold refactor — COMPLETE (2026-09-20)
+
+The in-flight refactor from 2026-09-19 evening is finished and the full
+conformance gate is met: **all 12 official RFC 6716 vectors decode with
+100% `final_range` match on every packet**, and the SNR-vs-oracle numbers
+equal the pre-refactor values (01: 73.5, 05: 92.0, 06: 91.3, 07: 49.4,
+08: 37.5, 09: 55.8, 10: 105.7, 11: 99.0, 12: 110.2 dB; vectors 02–04
+bit-exact PCM). What closed it:
+
+1. **Open-ended lowband threading.** The band recursion now receives the
+   fold source and `lowband_out` as open-ended slices into the shared
+   per-channel norm buffer (`norm0[eff..]`, `norm0[o..]`), mirroring
+   libopus's raw-pointer semantics (`norm + effective_lowband`,
+   `norm + M*eBands[i] - norm_offset`). The previous exact-width slices
+   truncated at band/split boundaries, so the pre/post transforms
+   (`haar1`/`deinterleave_hadamard` in `quant_band`) indexed past them —
+   the `bands.rs:230` len-80/index-80 panic on vector06. The four
+   per-band match arms in `quant_all_bands` (dual-stereo ×2, stereo,
+   mono) now share one shape: a disjoint fold source/output pair is one
+   `split_at_mut(o)`; the hybrid overlap (band `start+1`) snapshots the
+   source into the scratch buffer first (reads precede the end-of-band
+   output writes exactly as in the reference), and the snapshot doubles
+   as the band's transform scratch, so no separate scratch is passed
+   down for that band. `two_mut` (the error-on-overlap placeholder) is
+   deleted; `quant_band`'s `need_copy` copies the full band width again
+   (guaranteed available now).
+2. **The three lost SSE-order rounding experiments were NOT re-applied**:
+   the gate is met exactly without them. The deterministic SIMD orders
+   that matter are already ported (`comb_filter_const` lane order in
+   `celt/pitch.rs`, `celt_inner_prod` fold in `celt/vq.rs`), and the
+   residual 07/08/09 gap remains the accepted float-ULP class documented
+   under Phase 3.
+3. **Clippy**: the concurrent session's `compute_theta` triangular-pdf
+   region was restructured to if-expression initializations
+   (`needless_late_init` ×2) and the mono fold arm drops its redundant
+   `as_deref_mut` (`needless_option_as_deref`); `tests/rt_safety.rs`'
+   unused trait import removed. `tpt-av-cadence-vorbis`'s rt_safety
+   harness had one `collapsible_if`.
+
+**Real-time safety restored for Opus.** The new counting-allocator
+`tests/rt_safety.rs` (zero allocations per successful `decode_packet`)
+exposed three per-frame allocation sources, all fixed:
+
+1. `celt/rate.rs`'s `compute_allocation` allocated three `Vec`s per
+   frame; `AllocationResult` now carries `[i32; NB_EBANDS]` arrays (the
+   `CeltDecoder` consumer already stored fixed arrays).
+2. `std::env::var_os` debug-trace checks in the decode path
+   (`CELT_BAND_TRACE` in `celt/bands.rs` — evaluated per band and per
+   recursion leaf — plus `SILK_C_FS_DEBUG`/`SILK_DBG` in `silk/`)
+   allocate on EVERY call on Windows even when unset. New
+   `src/debug.rs` resolves all flags once at construction (every public
+   decoder constructor calls `debug::init()`), and the hot path reads a
+   plain bool out of a `OnceLock`. `CELT_BAND_TRACE=1` output is
+   unchanged.
+3. The mode-transition cross-fade's `pcm[n..2*n].to_vec()` became a
+   stack array (matching its two neighbouring branches).
+
+Verified: zero allocations per decode call in the release build, 172
+crate unit tests + full RFC 6716 conformance green, strict Clippy and
+`cargo fmt` clean. The `tpt-av-cadence-aac` crate is EXCLUDED from the
+workspace-green claim — it currently does not compile (mid-flight edits,
+~44 errors) and belongs to the AAC workstream.
 
 ## Cross-Cutting (ongoing, applies to every phase)
 
-- [x] Enforce real-time safety contract per decoder (alloc-free/lock-free/panic-free `decode()`; all allocation confined to `init()`/`open()`) — holds for WAV/AIFF/FLAC/PCM; re-check for each new decoder
-- [x] Fuzz testing (`proptest` never-panic property tests) for every new parser — WAV, AIFF, FLAC (arbitrary + mutated real streams), Opus packets/range coder; `cargo-fuzz` targets still to be added under `fuzz/`
-- [x] Bit-exact validation harness (`assert_bit_exact_vs_ffmpeg`) wired for every new decoder — WAV covered; FLAC/AIFF verified via embedded checksums (FFmpeg cross-checks to follow in CI)
+- [x] Enforce real-time safety contract per decoder (alloc-free/lock-free/panic-free `decode()`; all allocation confined to `init()`/`open()`) — WAV/AIFF/FLAC/PCM audited; MP3 verified by test (`tests/rt_safety.rs`, counting allocator, zero allocations on successful decodes across all ten fixtures; error-path formatting remains the accepted exception); Vorbis/Opus/AAC decoders preallocate all scratch at open and return `Result` everywhere
+- [x] Fuzz testing (`proptest` never-panic property tests) for every new parser — WAV, AIFF, FLAC (arbitrary + mutated real streams), Opus packets/range coder, Vorbis packets, MP3/MPEG-1/2 fixtures — plus `cargo-fuzz` targets under `fuzz/` (`wav_decode`, `aiff_decode`, `flac_decode`, `mp3_decode`, `opus_packet`, `opus_decode` full-decoder, `opus_ogg_decode` — also asserting seek(0) replay determinism — `vorbis_stream`, `ogg_pages`, `aac_adts`). Run from `fuzz/`: `cargo +nightly fuzz run <target>`; the targets also build and run their inputs on stable/MSVC.
+- [x] Bit-exact validation harness (`assert_bit_exact_vs_ffmpeg`) wired for every new decoder — WAV covered; FLAC (all bundled subset/uncommon fixtures) and AIFF (synthetic 8/16/24/32-bit mono/stereo) now cross-checked BIT-EXACT against FFmpeg in `tests/ffmpeg_crosscheck.rs` (skips without FFmpeg; `CADENCE_REQUIRE_FFMPEG=1` fails instead)

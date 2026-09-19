@@ -146,11 +146,12 @@ pub(crate) fn alg_unquant(
 
 /// `renormalise_vector`: rescales `x` to norm `gain`.
 pub(crate) fn renormalise_vector(x: &mut [f32], gain: f32) {
-    let mut e = EPSILON;
-    for &v in x.iter() {
-        e += v * v;
-    }
-    let g = (1.0 / (e as f64).sqrt() as f32) * gain;
+    // The reference computes the energy with `celt_inner_prod`, whose
+    // runtime-dispatched SSE kernel accumulates in 4 strided lanes with a
+    // horizontal `(s0+s2)+(s1+s3)` fold — a different rounding order than
+    // a scalar loop.
+    let e = EPSILON + super::pitch::celt_inner_prod_sse_order(x, x);
+    let g = 1.0 / (e as f64).sqrt() as f32 * gain;
     for v in x.iter_mut() {
         *v *= g;
     }

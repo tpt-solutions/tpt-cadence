@@ -231,6 +231,17 @@ impl<'a> RangeDecoder<'a> {
     pub fn rng(&self) -> u32 {
         self.rng
     }
+
+    /// `dec.storage -= n` (`opus_decoder.c`): marks the last `n` bytes of
+    /// the frame as off-limits (they hold CELT redundancy coded with raw
+    /// bits at the frame's end, not entropy-coded data). Raw-bit reads are
+    /// positioned relative to the end of the storage, so truncating the
+    /// slice is exactly the reference's shrink; previously range-coded
+    /// state (`rng`/`val`/`nbits_total`) is untouched.
+    pub fn shrink_storage(&mut self, bytes_to_remove: usize) {
+        let keep = self.bytes.len().saturating_sub(bytes_to_remove);
+        self.bytes = &self.bytes[..keep];
+    }
 }
 
 // ---------------------------------------------------------------------------

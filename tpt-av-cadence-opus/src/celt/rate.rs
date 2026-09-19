@@ -122,9 +122,9 @@ pub(crate) struct Allocation {
 /// pulses (PVQ bits), fine-energy bits, and fine priorities.
 pub(crate) struct AllocationResult {
     pub alloc: Allocation,
-    pub pulses: Vec<i32>,
-    pub ebits: Vec<i32>,
-    pub fine_priority: Vec<i32>,
+    pub pulses: [i32; NB_EBANDS],
+    pub ebits: [i32; NB_EBANDS],
+    pub fine_priority: [i32; NB_EBANDS],
 }
 
 /// `interp_bits2pulses`: bit refinement between two allocation vectors,
@@ -493,9 +493,9 @@ pub(crate) fn compute_allocation(
         bits2[j] = bits2j;
     }
 
-    let mut pulses = vec![0i32; NB_EBANDS];
-    let mut ebits = vec![0i32; NB_EBANDS];
-    let mut fine_priority = vec![0i32; NB_EBANDS];
+    let mut pulses = [0i32; NB_EBANDS];
+    let mut ebits = [0i32; NB_EBANDS];
+    let mut fine_priority = [0i32; NB_EBANDS];
     let alloc = interp_bits2pulses(
         start,
         end,

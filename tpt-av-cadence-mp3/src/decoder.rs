@@ -29,9 +29,12 @@ const SIDE_INFO: [[usize; 2]; 2] = [[9, 17], [17, 32]];
 /// skipped automatically).
 ///
 /// Codec working buffers are allocated by [`Mp3Decoder::from_source`]/
-/// [`Mp3Decoder::open`]. Error construction can allocate, and source reads
-/// may block; a complete real-time safety audit remains pending. Output is
-/// interleaved f32 and is not clipped.
+/// [`Mp3Decoder::open`]. `decode()` itself is allocation-free and
+/// panic-free: every granule/synthesis scratch lives in the struct, the
+/// bit reservoir is clamped to [`MAX_BITRESERVOIR_BYTES`], and side info
+/// demanding more reservoir than exists drops the frame instead of
+/// overreading. Error construction can allocate, and source reads may
+/// block. Output is interleaved f32 and is not clipped.
 pub struct Mp3Decoder {
     source: BufferedSource,
     info: StreamInfo,

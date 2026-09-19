@@ -54,7 +54,11 @@ impl Tree {
                     for branch in (0..2).rev() {
                         let bit = branch != 0;
                         let child_code = (code << 1) | branch as u32;
-                        let child = if bit { self.right[node] } else { self.left[node] };
+                        let child = if bit {
+                            self.right[node]
+                        } else {
+                            self.left[node]
+                        };
                         if child == -1 {
                             stack.push(Frame::Empty(node, bit, child_code, depth + 1));
                         } else if (child & LEAF_MASK) == 0 && depth + 1 < len {
@@ -113,8 +117,6 @@ impl Tree {
 pub struct Codebook {
     pub dimensions: usize,
     pub entries: usize,
-    /// Per-entry codeword lengths (0 = unused/sparse entry).
-    lengths: Box<[u8]>,
     lookup_type: u8,
     /// Flattened VQ value vectors, `entry * dimensions` scalars, for lookup
     /// types 1 and 2.
@@ -131,9 +133,10 @@ const MAX_VALUES: usize = 32 << 20;
 
 impl Codebook {
     /// Parses one codebook from the setup header, starting after the sync
-    /// pattern has been verified by the caller.
+    /// pattern has been verified by the caller. Layout (spec §3.2.1): the
+    /// 16-bit dimension count, the 24-bit entry count, then the codeword
+    /// lengths — there is no version field.
     pub fn parse(br: &mut BitReader) -> Result<Codebook, CadenceError> {
-        let _version = br.read_bits(16)?;
         let dimensions = br.read_bits(16)? as usize;
         let entries = br.read_bits(24)? as usize;
         if entries == 0 || entries > (1 << 24) {
@@ -146,9 +149,8 @@ impl Codebook {
             let mut current_entry = 0usize;
             let mut current_length = br.read_bits(5)? as usize + 1;
             while current_entry < entries {
-                let number = br
-                    .read_bits(BitReader::ilog((entries - current_entry) as i64))?
-                    as usize;
+                let number =
+                    br.read_bits(BitReader::ilog((entries - current_entry) as i64))? as usize;
                 if current_entry + number > entries {
                     return Err(corrupt("ordered length overruns entries"));
                 }
@@ -188,7 +190,11 @@ impl Codebook {
                 } else {
                     entries * dimensions
                 };
-                if lookup_values.checked_mul(value_bits).unwrap_or(u32::MAX as usize) > (1 << 31) {
+                if lookup_values
+                    .checked_mul(value_bits)
+                    .unwrap_or(u32::MAX as usize)
+                    > (1 << 31)
+                {
                     return Err(corrupt("lookup size overflows the packet"));
                 }
                 if lookup_values * dimensions > MAX_VALUES {
@@ -271,7 +277,6 @@ impl Codebook {
         Ok(Codebook {
             dimensions,
             entries,
-            lengths,
             lookup_type,
             values,
             tree,
@@ -286,11 +291,18 @@ impl Codebook {
             let _ = br.read_bit()?; // sink one bit; value tolerated as 0 or 1
             return Ok(entry);
         }
-        let tree = self.tree.as_ref().ok_or_else(|| corrupt("empty codebook read"))?;
+        let tree = self
+            .tree
+            .as_ref()
+            .ok_or_else(|| corrupt("empty codebook read"))?;
         let mut node = 0usize;
         for _ in 0..=self.max_depth {
             let bit = br.read_bit()?;
-            let next = if bit { tree.right[node] } else { tree.left[node] };
+            let next = if bit {
+                tree.right[node]
+            } else {
+                tree.left[node]
+            };
             if next < 0 {
                 return Err(corrupt("invalid codeword"));
             }
@@ -303,7 +315,7 @@ impl Codebook {
     }
 
     /// Reads one codeword and returns its VQ value vector (VQ context).
-    pub fn read_vector<'v>(&self, br: &mut BitReader, out: &'v mut [f32]) -> Result<(), CadenceError> {
+    pub fn read_vector(&self, br: &mut BitReader, out: &mut [f32]) -> Result<(), CadenceError> {
         let entry = self.read_scalar(br)?;
         if self.lookup_type == 0 {
             return Err(corrupt("VQ context on a book without a lookup"));
@@ -315,12 +327,6 @@ impl Codebook {
 
     pub fn has_lookup(&self) -> bool {
         self.lookup_type != 0
-    }
-
-    /// Codeword length of an entry (0 = unused); test support.
-    #[cfg(test)]
-    pub fn length_of(&self, entry: usize) -> u8 {
-        self.lengths[entry]
     }
 }
 
@@ -340,12 +346,12 @@ fn lookup1_values(entries: usize, dim: usize) -> usize {
         return 0;
     }
     let mut r = (entries as f64).powf(1.0 / dim as f64).floor() as usize;
-    while r.checked_pow(dim as u32).map_or(false, |p| p > entries) {
+    while r.checked_pow(dim as u32).is_some_and(|p| p > entries) {
         r -= 1;
     }
     while (r + 1)
         .checked_pow(dim as u32)
-        .map_or(false, |p| p <= entries)
+        .is_some_and(|p| p <= entries)
     {
         r += 1;
     }
@@ -386,7 +392,6 @@ mod tests {
         // lookup 0 (none). Canonical codewords: e0=00, e2=01, e3=1? — per
         // assignment: e0 len2 -> 00, e2 len2 -> 01, e3 len1 -> 1.
         let mut bits = Vec::new();
-        bits.extend(bits_of(0, 16)); // version
         bits.extend(bits_of(2, 16)); // dimensions
         bits.extend(bits_of(4, 24)); // entries
         bits.push(0); // ordered = 0
@@ -403,9 +408,6 @@ mod tests {
         let mut br = BitReader::new(&data);
         let cb = Codebook::parse(&mut br).unwrap();
         assert_eq!(cb.dimensions, 2);
-        assert_eq!(cb.length_of(0), 2);
-        assert_eq!(cb.length_of(1), 0);
-        assert_eq!(cb.length_of(3), 1);
 
         // Decode: bits "00" -> 0, "1" -> 3, "01" -> 2.
         let dec = |bits: &[u32]| {
@@ -424,7 +426,6 @@ mod tests {
         // simple: lengths [2,2,2,2]; lookup 1: min=-1.0, delta=0.5, value
         // bits=3, sequence_p=0; lookup1_values(4,2) = 2; multiplicands 0..3.
         let mut bits = Vec::new();
-        bits.extend(bits_of(0, 16));
         bits.extend(bits_of(2, 16));
         bits.extend(bits_of(4, 24));
         bits.push(0); // not ordered
@@ -433,8 +434,8 @@ mod tests {
             bits.extend(bits_of(1, 5)); // length 2
         }
         bits.extend(bits_of(1, 4)); // lookup type 1
-        // float32_unpack: value = mant * 2^(exp-788), mant is a 21-bit
-        // integer. -1.0: mant = 1<<20, exp = 768, sign set.
+                                    // float32_unpack: value = mant * 2^(exp-788), mant is a 21-bit
+                                    // integer. -1.0: mant = 1<<20, exp = 768, sign set.
         let f = |sign: u32, mant: u32, exp: u32| sign | (exp << 21) | mant;
         bits.extend(bits_of(f(0x8000_0000, 1 << 20, 768), 32));
         // delta 0.5: mant = 1<<19, exp = 768.
@@ -465,7 +466,6 @@ mod tests {
     #[test]
     fn single_entry_book_sinks_one_bit() {
         let mut bits = Vec::new();
-        bits.extend(bits_of(0, 16));
         bits.extend(bits_of(3, 16));
         bits.extend(bits_of(1, 24));
         bits.push(0); // not ordered
@@ -487,7 +487,6 @@ mod tests {
         // MSb first).
         let lengths = [2u32, 4, 4, 4, 4, 2, 3, 3];
         let mut bits = Vec::new();
-        bits.extend(bits_of(0, 16));
         bits.extend(bits_of(1, 16));
         bits.extend(bits_of(8, 24));
         bits.push(0); // not ordered

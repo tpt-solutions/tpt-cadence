@@ -189,8 +189,7 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> f32 {
     let mut yy = 0f32;
     let mut idx = 0usize;
     while n > 2 {
-        let val;
-        if k >= n {
+        let val = if k >= n {
             // Lots of pulses case.
             let row = ROW_OFF[n];
             let mut p = PVQ_U_DATA[row + k + 1];
@@ -222,7 +221,11 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> f32 {
             }
             i -= p;
             let d = (k0 - k) as i32;
-            val = if s { -d } else { d };
+            if s {
+                -d
+            } else {
+                d
+            }
         } else {
             // Lots of dimensions case.
             let p = pvq_u(k, n);
@@ -249,8 +252,12 @@ fn cwrsi(mut n: usize, mut k: usize, mut i: u32, y: &mut [i32]) -> f32 {
             }
             i -= p;
             let d = (k0 - k) as i32;
-            val = if s { -d } else { d };
-        }
+            if s {
+                -d
+            } else {
+                d
+            }
+        };
         y[idx] = val;
         idx += 1;
         yy += val as f32 * val as f32;

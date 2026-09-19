@@ -1,0 +1,15 @@
+[package]
+name = "tpt-av-cadence-ogg"
+description = "Ogg page/packet container layer (RFC 3533) for the tpt-cadence audio codec suite."
+readme = "README.md"
+keywords = ["audio", "ogg", "container", "codec", "decoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tpt-av-cadence-core = { workspace = true }
+log = { workspace = true }

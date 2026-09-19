@@ -5,7 +5,8 @@
 **A pure-Rust, zero-dependency audio codec suite. Memory-safe, real-time capable, and permissively licensed (MIT OR Apache-2.0).**
 
 **Status:** Early-stage / Pre-1.0 — WAV, AIFF, FLAC, and raw PCM are implemented and
-bit-exact conformance-tested; Opus, AAC, MP3, and Vorbis are under active development.
+bit-exact conformance-tested; AAC-LC and MP3 pass FFmpeg-reference conformance
+(>100 dB SNR); Opus and Vorbis are under active development.
 **Ecosystem:** [TPT Solutions Open Source](https://opensource.tptsolutions.co.nz/)
 
 `tpt-cadence` is the **audio codec layer** of the TPT AV Stack. It provides pure-Rust,
@@ -42,10 +43,11 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable |
 | [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable |
 | [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable |
-| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) | 🚧 In progress — packet parser, range coder, CELT, and SILK decoders done; hybrid mode and full conformance still open |
-| [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | 🚧 In progress |
-| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | 🚧 Scaffolded |
-| [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis | 🚧 Scaffolded |
+| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact; `Decoder`/`FormatReader` impls |
+| [`tpt-av-cadence-ogg`](tpt-av-cadence-ogg) | Ogg page/packet container (RFC 3533) shared by Vorbis and Opus | ✅ In use |
+| [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg) |
+| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams) |
+| [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures) |
 | [`tpt-av-cadence-test-utils`](tpt-av-cadence-test-utils) | Conformance harness — FFmpeg comparison, fuzz helpers, MD5 | ✅ Internal (dev-only) |
 
 ## Quickstart

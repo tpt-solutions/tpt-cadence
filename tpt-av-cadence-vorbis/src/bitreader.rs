@@ -17,7 +17,7 @@ fn overread() -> CadenceError {
 pub struct BitReader<'a> {
     data: &'a [u8],
     /// Next bit to serve, counted from the start of `data`.
-    bit_pos: usize,
+    pub bit_pos: usize,
 }
 
 impl<'a> BitReader<'a> {
@@ -29,11 +29,6 @@ impl<'a> BitReader<'a> {
     /// Number of bits still readable.
     pub fn bits_left(&self) -> usize {
         self.data.len() * 8 - self.bit_pos.min(self.data.len() * 8)
-    }
-
-    /// Bits consumed so far (spec `get_bits_count`).
-    pub fn bits_read(&self) -> usize {
-        self.bit_pos
     }
 
     /// Reads `n` bits (0..=32) as an unsigned integer, LSB-first.

@@ -1,9 +1,17 @@
-//! Ogg page layer: capture pattern, page header, CRC-32, and packet
-//! reassembly across page boundaries (Ogg bitstream spec + Vorbis I spec
-//! appendix A).
+//! # tpt-av-cadence-ogg
+//!
+//! Ogg page/packet container layer (RFC 3533) shared by the codec crates
+//! that ride in Ogg (Vorbis I, Opus per RFC 7845): capture-pattern and
+//! header parsing, the Ogg CRC-32, and packet reassembly across page
+//! boundaries via [`PageReader`].
 //!
 //! CRC checking follows libvorbis: a mismatch logs a warning but does not
 //! fail the stream (deployed files exist with wrong CRCs).
+//!
+//! The reader is codec-agnostic — it exposes complete packets with the
+//! granule position and BOS/EOS flags of the page each packet completed
+//! on; header semantics (OpusHead, Vorbis identification headers, chained
+//! links) belong to the codec crates.
 
 use std::io::Read;
 
@@ -26,8 +34,11 @@ pub struct PacketMeta {
     pub page_index: u64,
 }
 
-/// Reassembles Vorbis packets from the Ogg page sequence of one logical
-/// stream.
+/// Reassembles packets from the Ogg page sequence of one logical stream.
+///
+/// Chained links (a fresh BOS page after the stream started) end the
+/// current link: [`PageReader::next_packet`] returns `None` there, and the
+/// codec layer decides whether to open the next link.
 pub struct PageReader {
     source: BufferedSource,
     crc_table: Box<[u32; 256]>,
@@ -60,7 +71,8 @@ fn corrupt(what: &str) -> CadenceError {
 }
 
 impl PageReader {
-    /// Wraps a byte source (allocation confined here).
+    /// Wraps a byte source (allocation confined here); `max_packet` bounds
+    /// the largest reassemblable packet.
     pub fn new(source: BufferedSource, max_packet: usize) -> Self {
         PageReader {
             source,
@@ -83,10 +95,27 @@ impl PageReader {
     }
 
     /// Rewinds the reader to an absolute byte offset (seek support). The
-    /// decoder re-establishes header state itself; packet and page
+    /// codec layer re-establishes header state itself; packet and page
     /// accumulation state is dropped.
     pub fn reset(&mut self, pos: u64) -> Result<(), CadenceError> {
         self.source.seek_to(pos)?;
+        self.clear_packet_state();
+        // `started` stays set: a later BOS page marks a chained link.
+        Ok(())
+    }
+
+    /// Rewinds to the first byte of the stream and forgets ALL page state,
+    /// including the seen-BOS marker, so the leading header pages can be
+    /// parsed again without the stream's own BOS page being mistaken for a
+    /// chained link (which [`PageReader::reset`] would do).
+    pub fn restart(&mut self) -> Result<(), CadenceError> {
+        self.source.seek_to(0)?;
+        self.clear_packet_state();
+        self.started = false;
+        Ok(())
+    }
+
+    fn clear_packet_state(&mut self) {
         self.body_len = 0;
         self.body_pos = 0;
         self.segments_valid = 0;
@@ -97,8 +126,6 @@ impl PageReader {
         self.page_granule = 0;
         self.page_eos = false;
         self.page_bos = false;
-        // `started` stays set: a later BOS page marks a chained link.
-        Ok(())
     }
 
     /// The underlying buffered source (for seeking).
@@ -112,7 +139,10 @@ impl PageReader {
 
     /// Reads the next complete packet into `out`, returning its byte length
     /// and metadata, or `None` at end of stream.
-    pub fn next_packet(&mut self, out: &mut [u8]) -> Result<Option<(usize, PacketMeta)>, CadenceError> {
+    pub fn next_packet(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<Option<(usize, PacketMeta)>, CadenceError> {
         loop {
             // Serve a completed packet if the current segment ends one.
             while self.segments_valid > 0 {
@@ -189,9 +219,7 @@ impl PageReader {
         }
 
         let mut seg_table = [0u8; 255];
-        self.source
-            .take_exact(&mut seg_table[..nsegs])
-            .map_err(CadenceError::from)?;
+        self.source.take_exact(&mut seg_table[..nsegs])?;
         let body_len = seg_table[..nsegs].iter().map(|&s| s as usize).sum();
         if body_len > self.body.len() {
             return Err(corrupt("page body exceeds maximum"));
@@ -243,33 +271,35 @@ fn build_crc_table() -> [u32; 256] {
     table
 }
 
+/// CRC of a full page image: pass the header (with the 4 CRC bytes at
+/// offset 22 zeroed), the segment table, and the page body as one slice or
+/// concatenated parts.
+pub fn page_crc(data: &[u8]) -> u32 {
+    let table = build_crc_table();
+    let mut crc = 0u32;
+    for &b in data {
+        crc = (crc << 8) ^ table[(((crc >> 24) as u8) ^ b) as usize];
+    }
+    crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn crc_of(data: &[u8]) -> u32 {
-        let table = build_crc_table();
-        let mut crc = 0u32;
-        for &b in data {
-            crc = (crc << 8) ^ table[(((crc >> 24) as u8) ^ b) as usize];
-        }
-        crc
-    }
-
     #[test]
     fn crc_known_vectors() {
         // Reference values for the Ogg CRC (poly 0x04c11db7, MSB-first).
-        assert_eq!(crc_of(b""), 0);
-        assert_eq!(crc_of(&[0x00]), 0);
-        assert_eq!(crc_of(b"OggS"), 0x5fb0_a94f);
-        assert_eq!(crc_of(&[1, 2, 3, 4]), 0xbe33_eab6);
+        assert_eq!(page_crc(b""), 0);
+        assert_eq!(page_crc(&[0x00]), 0);
+        assert_eq!(page_crc(b"OggS"), 0x5fb0_a94f);
+        assert_eq!(page_crc(&[1, 2, 3, 4]), 0xbe33_eab6);
     }
 
     #[test]
     fn assembles_packets_spanning_pages() {
         // Build a tiny ogg stream by hand: two pages, packet split across
         // them (a 300-byte packet: segments 255 + 45).
-        let table = build_crc_table();
         let make_page = |granule: i64, htype: u8, segs: &[u8], body: &[u8]| {
             let mut header = vec![0u8; 27];
             header[0..4].copy_from_slice(b"OggS");
@@ -280,13 +310,7 @@ mod tests {
             let mut page = header;
             page.extend_from_slice(segs);
             page.extend_from_slice(body);
-            let mut crc = 0u32;
-            for (i, &b) in page.iter().enumerate() {
-                if (22..26).contains(&i) {
-                    continue;
-                }
-                crc = (crc << 8) ^ table[(((crc >> 24) as u8) ^ b) as usize];
-            }
+            let crc = page_crc(&page);
             page[22..26].copy_from_slice(&crc.to_le_bytes());
             page
         };

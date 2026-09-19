@@ -51,18 +51,25 @@ fn comb_filter_const(
     g11: f32,
     g12: f32,
 ) {
-    let mut x0;
-    let mut x1 = buf[x_off - t + 1];
-    let mut x2 = buf[x_off - t];
-    let mut x3 = buf[x_off - t - 1];
-    let mut x4 = buf[x_off - t - 2];
-    for i in 0..n {
-        x0 = buf[x_off + i - t + 2];
-        buf[y_off + i] = buf[x_off + i] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
-        x4 = x3;
-        x3 = x2;
-        x2 = x1;
-        x1 = x0;
+    // The reference dispatches `comb_filter_const_sse` on x86: 4-wide
+    // blocks whose per-sample arithmetic groups the terms as
+    // `(x + g10*x[-T]) + (g11*(x[-T+1]+x[-T-1]) + g12*(x[-T+2]+x[-T-2]))`
+    // (the g11 and g12 contributions are summed *before* being added to
+    // the partial result — different rounding from the scalar C). With
+    // `CUSTOM_MODES` off the kernel has no tail loop, so the last `n % 4`
+    // samples are left unwritten: in-place callers keep their previous
+    // content there.
+    let n4 = n / 4 * 4;
+    for i in 0..n4 {
+        let x = buf[x_off + i];
+        let x_m1 = buf[x_off + i - t - 1];
+        let x_0 = buf[x_off + i - t];
+        let x_p1 = buf[x_off + i - t + 1];
+        let x_m2 = buf[x_off + i - t - 2];
+        let x_p2 = buf[x_off + i - t + 2];
+        let t1 = g11 * (x_p1 + x_m1);
+        let t2 = g12 * (x_p2 + x_m2);
+        buf[y_off + i] = (x + g10 * x_0) + (t1 + t2);
     }
 }
 
@@ -185,18 +192,13 @@ pub(crate) fn comb_filter_ext(
         }
         return;
     }
-    // Straight to the constant section.
-    let mut x1 = src[src_off - t1 + 1];
-    let mut x2 = src[src_off - t1];
-    let mut x3 = src[src_off - t1 - 1];
-    let mut x4 = src[src_off - t1 - 2];
-    for i in 0..n {
-        let x0 = src[src_off + i - t1 + 2];
-        dst[dst_off + i] = src[src_off + i] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
-        x4 = x3;
-        x3 = x2;
-        x2 = x1;
-        x1 = x0;
+    // Straight to the constant section (see `comb_filter_const` for the
+    // SSE block arithmetic and the unwritten `n % 4` tail).
+    for i in 0..n / 4 * 4 {
+        let x = src[src_off + i];
+        let s11 = g11 * (src[src_off + i - t1 + 1] + src[src_off + i - t1 - 1]);
+        let s12 = g12 * (src[src_off + i - t1 + 2] + src[src_off + i - t1 - 2]);
+        dst[dst_off + i] = (x + g10 * src[src_off + i - t1]) + (s11 + s12);
     }
 }
 
@@ -224,6 +226,28 @@ pub(crate) fn celt_inner_prod(x: &[f32], y: &[f32]) -> f32 {
         sum += a * b;
     }
     sum
+}
+
+/// `celt_inner_prod_sse`: the runtime-dispatched SSE4.1 kernel the
+/// reference uses on x86 — 4 strided accumulators over 4-sample blocks,
+/// horizontal-added as `(s0+s2)+(s1+s3)`, with a scalar MAC tail. Used
+/// where its rounding order is observable (e.g. `renormalise_vector`).
+pub(crate) fn celt_inner_prod_sse_order(x: &[f32], y: &[f32]) -> f32 {
+    let n = x.len();
+    let mut s = [0f32; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        for lane in 0..4 {
+            s[lane] += x[i + lane] * y[i + lane];
+        }
+        i += 4;
+    }
+    let mut xy = (s[0] + s[2]) + (s[1] + s[3]);
+    while i < n {
+        xy += x[i] * y[i];
+        i += 1;
+    }
+    xy
 }
 
 /// `find_best_pitch` (float build: the fixed-point shifts are identity).

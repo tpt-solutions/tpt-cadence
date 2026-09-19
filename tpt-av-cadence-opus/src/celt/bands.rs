@@ -410,17 +410,16 @@ fn compute_theta(
             // Triangular pdf.
             let ft = ((qn >> 1) + 1) * ((qn >> 1) + 1);
             let fm = dec.decode(ft as u32)? as i32;
-            let fl;
-            let fs;
-            if fm < ((qn >> 1) * ((qn >> 1) + 1) >> 1) {
+            let (fs, fl) = if fm < ((qn >> 1) * ((qn >> 1) + 1) >> 1) {
                 itheta = (isqrt32(8 * fm as u32 + 1) as i32 - 1) >> 1;
-                fs = itheta + 1;
-                fl = itheta * (itheta + 1) >> 1;
+                (itheta + 1, itheta * (itheta + 1) >> 1)
             } else {
                 itheta = (2 * (qn + 1) - isqrt32(8 * (ft - fm - 1) as u32 + 1) as i32) >> 1;
-                fs = qn + 1 - itheta;
-                fl = ft - ((qn + 1 - itheta) * (qn + 2 - itheta) >> 1);
-            }
+                (
+                    qn + 1 - itheta,
+                    ft - ((qn + 1 - itheta) * (qn + 2 - itheta) >> 1),
+                )
+            };
             dec.update(fl as u32, (fl + fs) as u32, ft as u32);
         }
         debug_assert!(itheta >= 0);
@@ -565,8 +564,7 @@ fn quant_partition(
         };
 
         let mut rebalance = ctx.remaining_bits;
-        let cm;
-        if mbits >= sbits {
+        let cm = if mbits >= sbits {
             let c1 = quant_partition(
                 ctx,
                 dec,
@@ -585,21 +583,20 @@ fn quant_partition(
             if rebalance > 3 << BITRES && itheta != 0 {
                 sbits += rebalance - (3 << BITRES);
             }
-            cm = c1
-                | (quant_partition(
-                    ctx,
-                    dec,
-                    x1,
-                    n2,
-                    sbits,
-                    b2,
-                    lb2,
-                    lm2,
-                    gain * iside,
-                    fill >> b2,
-                    htmp,
-                    iy,
-                )? << (b0 >> 1));
+            c1 | (quant_partition(
+                ctx,
+                dec,
+                x1,
+                n2,
+                sbits,
+                b2,
+                lb2,
+                lm2,
+                gain * iside,
+                fill >> b2,
+                htmp,
+                iy,
+            )? << (b0 >> 1))
         } else {
             let c1 = quant_partition(
                 ctx,
@@ -619,22 +616,21 @@ fn quant_partition(
             if rebalance > 3 << BITRES && itheta != 16384 {
                 mbits += rebalance - (3 << BITRES);
             }
-            cm = c1
-                | quant_partition(
-                    ctx,
-                    dec,
-                    x0,
-                    n2,
-                    mbits,
-                    b2,
-                    lb1,
-                    lm2,
-                    gain * imid,
-                    fill,
-                    htmp,
-                    iy,
-                )?;
-        }
+            c1 | quant_partition(
+                ctx,
+                dec,
+                x0,
+                n2,
+                mbits,
+                b2,
+                lb1,
+                lm2,
+                gain * imid,
+                fill,
+                htmp,
+                iy,
+            )?
+        };
         Ok(cm)
     } else {
         // This is the basic no-split case.
@@ -650,7 +646,7 @@ fn quant_partition(
             ctx.remaining_bits -= curr_bits;
         }
 
-        if std::env::var_os("CELT_BAND_TRACE").is_some() {
+        if crate::debug::flags().celt_band_trace {
             eprintln!(
                 "  LEAF i={i} n={n} b={b} q={q} curr_bits={curr_bits} b_blocks={b_blocks} \
                  tell_frac_before={}",
@@ -662,7 +658,7 @@ fn quant_partition(
             let k = get_pulses(q);
             // Finally do the actual quantization.
             let r = alg_unquant(&mut x[..n], &mut iy[..n], k, spread, b_blocks, dec, gain)?;
-            if std::env::var_os("CELT_BAND_TRACE").is_some() {
+            if crate::debug::flags().celt_band_trace {
                 eprintln!("  LEAF i={i} k={k} tell_frac_after={}", dec.tell_frac());
             }
             Ok(r)
@@ -753,6 +749,9 @@ fn quant_band(
     if need_copy {
         let lb = lowband.take().unwrap();
         let sc = lowband_scratch.unwrap();
+        // `lowband` is an open-ended slice into the shared norm buffer
+        // (reference pointer semantics), so the full band width is always
+        // available to copy.
         sc[..n].copy_from_slice(&lb[..n]);
         lowband = Some(sc);
     }
@@ -1022,20 +1021,6 @@ fn quant_band_stereo(
     Ok(cm)
 }
 
-/// Splits `s` into two disjoint mutable subslices `[a..a+alen)` and
-/// `[b..b+blen)` with `a+alen <= b`.
-fn two_mut(
-    s: &mut [f32],
-    a: usize,
-    alen: usize,
-    b: usize,
-    blen: usize,
-) -> (&mut [f32], &mut [f32]) {
-    debug_assert!(a + alen <= b && b + blen <= s.len());
-    let (l, r) = s.split_at_mut(b);
-    (&mut l[a..a + alen], &mut r[..blen])
-}
-
 /// `quant_all_bands` (decode): decodes all bands' normalized spectra into
 /// `x` (layout: channel plane 0 `[0..N)`, channel plane 1 `[N..2N)`).
 ///
@@ -1120,7 +1105,7 @@ pub(crate) fn quant_all_bands(
             0
         };
 
-        if std::env::var_os("CELT_BAND_TRACE").is_some() {
+        if crate::debug::flags().celt_band_trace {
             eprintln!(
                 "BAND i={i} n={n} b_blocks0={b_blocks0} tell={tell} balance_in={balance} b={b} \
                  pulses_i={} remaining_bits={remaining_bits}",
@@ -1200,19 +1185,30 @@ pub(crate) fn quant_all_bands(
         let mut scratch_opt = if last { None } else { Some(&mut scratch[..]) };
 
         if dual_stereo {
-            let (lb, out_s) = match (effective_lowband, out) {
-                (Some(eff), Some((o, ln))) => {
-                    let (a, b) = two_mut(norm0, eff, n, o, ln);
-                    (Some(a), Some(b))
+            let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
+                (Some(eff), Some((o, _)), scratch) if eff + n > o => {
+                    // Hybrid folding: the fold source overlaps the output
+                    // region. libopus passes two aliased pointers into
+                    // `norm_` and relies on the fold reads preceding the
+                    // end-of-band lowband_out writes; snapshot the source
+                    // so the borrow split preserves that order. The snapshot
+                    // then also serves as this band's transform scratch.
+                    let sc = scratch.expect("overlap folding needs scratch");
+                    sc[..n].copy_from_slice(&norm0[eff..eff + n]);
+                    (Some(&mut sc[..]), Some(&mut norm0[o..]), None)
                 }
-                (Some(eff), None) => (Some(&mut norm0[eff..eff + n]), None),
-                (None, Some((o, ln))) => {
-                    let (_, b) = two_mut(norm0, 0, 0, o, ln);
-                    (None, Some(b))
+                (Some(eff), Some((o, _)), scratch) => {
+                    // Disjoint: the fold source ends before the output
+                    // region starts. Both slices are open-ended like the
+                    // reference's pointers (the pre/post band transforms
+                    // legitimately touch neighbouring bands' norm data).
+                    let (l, r) = norm0.split_at_mut(o);
+                    (Some(&mut l[eff..]), Some(&mut r[..]), scratch)
                 }
-                (None, None) => (None, None),
+                (Some(eff), None, scratch) => (Some(&mut norm0[eff..]), None, scratch),
+                (None, Some((o, _)), scratch) => (None, Some(&mut norm0[o..]), scratch),
+                (None, None, scratch) => (None, None, scratch),
             };
-            let scr = scratch_opt.as_deref_mut();
             x_cm = quant_band(
                 &mut ctx,
                 dec,
@@ -1230,19 +1226,21 @@ pub(crate) fn quant_all_bands(
                 iy,
             )?;
             let n1 = norm1.as_deref_mut().unwrap();
-            let (lb, out_s) = match (effective_lowband, out) {
-                (Some(eff), Some((o, ln))) => {
-                    let (a, b) = two_mut(n1, eff, n, o, ln);
-                    (Some(a), Some(b))
+            let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
+                (Some(eff), Some((o, _)), scratch) if eff + n > o => {
+                    // Overlap snapshot, second channel (see above).
+                    let sc = scratch.expect("overlap folding needs scratch");
+                    sc[..n].copy_from_slice(&n1[eff..eff + n]);
+                    (Some(&mut sc[..]), Some(&mut n1[o..]), None)
                 }
-                (Some(eff), None) => (Some(&mut n1[eff..eff + n]), None),
-                (None, Some((o, ln))) => {
-                    let (_, b) = two_mut(n1, 0, 0, o, ln);
-                    (None, Some(b))
+                (Some(eff), Some((o, _)), scratch) => {
+                    let (l, r) = n1.split_at_mut(o);
+                    (Some(&mut l[eff..]), Some(&mut r[..]), scratch)
                 }
-                (None, None) => (None, None),
+                (Some(eff), None, scratch) => (Some(&mut n1[eff..]), None, scratch),
+                (None, Some((o, _)), scratch) => (None, Some(&mut n1[o..]), scratch),
+                (None, None, scratch) => (None, None, scratch),
             };
-            let scr = scratch_opt.as_deref_mut();
             y_cm = quant_band(
                 &mut ctx,
                 dec,
@@ -1260,17 +1258,20 @@ pub(crate) fn quant_all_bands(
                 iy,
             )?;
         } else if stereo {
-            let (lb, out_s) = match (effective_lowband, out) {
-                (Some(eff), Some((o, ln))) => {
-                    let (a, b) = two_mut(norm0, eff, n, o, ln);
-                    (Some(a), Some(b))
+            let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt) {
+                (Some(eff), Some((o, _)), scratch) if eff + n > o => {
+                    // Overlap snapshot (see dual-stereo arm above).
+                    let sc = scratch.expect("overlap folding needs scratch");
+                    sc[..n].copy_from_slice(&norm0[eff..eff + n]);
+                    (Some(&mut sc[..]), Some(&mut norm0[o..]), None)
                 }
-                (Some(eff), None) => (Some(&mut norm0[eff..eff + n]), None),
-                (None, Some((o, ln))) => {
-                    let (_, b) = two_mut(norm0, 0, 0, o, ln);
-                    (None, Some(b))
+                (Some(eff), Some((o, _)), scratch) => {
+                    let (l, r) = norm0.split_at_mut(o);
+                    (Some(&mut l[eff..]), Some(&mut r[..]), scratch)
                 }
-                (None, None) => (None, None),
+                (Some(eff), None, scratch) => (Some(&mut norm0[eff..]), None, scratch),
+                (None, Some((o, _)), scratch) => (None, Some(&mut norm0[o..]), scratch),
+                (None, None, scratch) => (None, None, scratch),
             };
             x_cm = quant_band_stereo(
                 &mut ctx,
@@ -1283,24 +1284,27 @@ pub(crate) fn quant_all_bands(
                 lb,
                 lm as i32,
                 out_s,
-                scratch_opt,
+                scr,
                 x_cm | y_cm,
                 htmp,
                 iy,
             )?;
             y_cm = x_cm;
         } else {
-            let (lb, out_s) = match (effective_lowband, out) {
-                (Some(eff), Some((o, ln))) => {
-                    let (a, b) = two_mut(norm0, eff, n, o, ln);
-                    (Some(a), Some(b))
+            let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt) {
+                (Some(eff), Some((o, _)), scratch) if eff + n > o => {
+                    // Overlap snapshot (see dual-stereo arm above).
+                    let sc = scratch.expect("overlap folding needs scratch");
+                    sc[..n].copy_from_slice(&norm0[eff..eff + n]);
+                    (Some(&mut sc[..]), Some(&mut norm0[o..]), None)
                 }
-                (Some(eff), None) => (Some(&mut norm0[eff..eff + n]), None),
-                (None, Some((o, ln))) => {
-                    let (_, b) = two_mut(norm0, 0, 0, o, ln);
-                    (None, Some(b))
+                (Some(eff), Some((o, _)), scratch) => {
+                    let (l, r) = norm0.split_at_mut(o);
+                    (Some(&mut l[eff..]), Some(&mut r[..]), scratch)
                 }
-                (None, None) => (None, None),
+                (Some(eff), None, scratch) => (Some(&mut norm0[eff..]), None, scratch),
+                (None, Some((o, _)), scratch) => (None, Some(&mut norm0[o..]), scratch),
+                (None, None, scratch) => (None, None, scratch),
             };
             x_cm = quant_band(
                 &mut ctx,
@@ -1313,7 +1317,7 @@ pub(crate) fn quant_all_bands(
                 lm as i32,
                 out_s,
                 Q15ONE,
-                scratch_opt,
+                scr,
                 x_cm | y_cm,
                 htmp,
                 iy,

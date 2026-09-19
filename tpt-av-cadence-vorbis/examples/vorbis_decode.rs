@@ -7,12 +7,19 @@ use tpt_av_cadence_core::Decoder;
 use tpt_av_cadence_vorbis::VorbisDecoder;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: vorbis_decode <file.ogg>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: vorbis_decode <file.ogg>");
     let file = std::fs::File::open(&path).expect("open input");
     let mut decoder = VorbisDecoder::open(Box::new(file)).expect("open vorbis stream");
     let channels = decoder.info().channels;
     let total = decoder.info().total_frames;
-    eprintln!("vorbis: {} Hz, {} ch, total_frames {:?}", decoder.info().sample_rate, channels, total);
+    eprintln!(
+        "vorbis: {} Hz, {} ch, total_frames {:?}",
+        decoder.info().sample_rate,
+        channels,
+        total
+    );
     let mut out = std::io::stdout();
     let mut buf = vec![0.0f32; 8192 * channels as usize];
     loop {

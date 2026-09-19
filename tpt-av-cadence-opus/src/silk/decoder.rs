@@ -263,7 +263,7 @@ impl ChannelState {
 
         if self.fs_khz != fs_khz || frame_length != self.frame_length {
             if self.fs_khz != fs_khz {
-                if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+                if crate::debug::flags().silk_c_fs_debug {
                     eprintln!(
                         "FSCHANGE old_fs={} new_fs={} nb_subfr={}",
                         self.fs_khz, fs_khz, self.nb_subfr
@@ -307,7 +307,7 @@ fn decode_parameters(ch: &mut ChannelState, ctrl: &mut DecoderControl, cond_codi
         nb_subfr,
     );
 
-    if std::env::var_os("SILK_DBG").is_some() {
+    if crate::debug::flags().silk_dbg {
         eprintln!(
             "DP fs={} nb={} order={} cb_order={} sig={} first_frame={}",
             ch.fs_khz,
@@ -622,6 +622,8 @@ impl SilkDecoder {
     /// `silk_InitDecoder`: create a decoder for `n_channels_api`
     /// output channels (1 or 2).
     pub fn new(n_channels_api: usize) -> Result<Self> {
+        // Resolve debug-trace env flags before any decode (see debug.rs).
+        crate::debug::init();
         if !(1..=2).contains(&n_channels_api) {
             return Err(CadenceError::UnsupportedFeature(
                 "SILK decoder needs 1 or 2 output channels".to_string(),
@@ -882,7 +884,7 @@ impl SilkDecoder {
                 } else {
                     dec.as_deref_mut()
                 };
-                if std::env::var_os("SILK_DBG").is_some() {
+                if crate::debug::flags().silk_dbg {
                     eprintln!(
                         "DF ch{n} fs={} nb={} frame={} ltp={} nfp={} nfd={} new_pk={}",
                         self.channel[n].fs_khz,
@@ -941,7 +943,7 @@ impl SilkDecoder {
         let n_mix = ctrl.n_channels_api.min(ctrl.n_channels_internal);
         for n in 0..n_mix {
             if ctrl.n_channels_api == 2 {
-                if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+                if crate::debug::flags().silk_c_fs_debug {
                     eprintln!(
                         "PRERESAMP ch={n} nSamplesOutDec={n_samples_out_dec} in={:?}",
                         &self.tmp[n][1..1 + n_samples_out_dec.min(20)]
@@ -951,7 +953,7 @@ impl SilkDecoder {
                     &mut self.resample_out[..n_samples_out],
                     &self.tmp[n][1..1 + n_samples_out_dec],
                 )?;
-                if std::env::var_os("SILK_C_FS_DEBUG").is_some() {
+                if crate::debug::flags().silk_c_fs_debug {
                     eprintln!(
                         "POSTRESAMP ch={n} nSamplesOut={n_samples_out} out={:?}",
                         &self.resample_out[..n_samples_out]

@@ -139,29 +139,30 @@ pub(crate) fn unquant_coarse_energy(
     for i in start..end {
         for ci in 0..c {
             let tell = dec.tell() as i32;
-            let qi: i32;
-            if budget - tell >= 15 {
+            let qi: i32 = if budget - tell >= 15 {
                 let pi = 2 * i.min(20);
-                qi = laplace::laplace_decode(
+                laplace::laplace_decode(
                     dec,
                     (prob_model[pi] as u32) << 7,
                     (prob_model[pi + 1] as i32) << 6,
-                )?;
+                )?
             } else if budget - tell >= 2 {
                 let q = dec.decode_icdf(&SMALL_ENERGY_ICDF, 2)?;
-                qi = ((q >> 1) as i32) ^ -((q & 1) as i32);
+                ((q >> 1) as i32) ^ -((q & 1) as i32)
             } else if budget - tell >= 1 {
-                qi = -i32::from(dec.decode_bit_logp(1)?);
+                -i32::from(dec.decode_bit_logp(1)?)
             } else {
-                qi = -1;
-            }
+                -1
+            };
             let q = qi as f32;
 
             let idx = ci * NB_EBANDS + i;
             old_ebands[idx] = old_ebands[idx].max(-9.0);
             let tmp = coef * old_ebands[idx] + prev[ci] + q;
             old_ebands[idx] = tmp;
-            prev[ci] += q - beta * q;
+            // C: `prev[c] = prev[c] + SHL32(q,7) - MULT16_16(beta,PSHR32(q,8))`
+            // — left-associated; rounding differs from `prev + (q - beta*q)`.
+            prev[ci] = prev[ci] + q - beta * q;
         }
     }
     Ok(())

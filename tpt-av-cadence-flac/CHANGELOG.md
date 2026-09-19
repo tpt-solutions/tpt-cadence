@@ -18,3 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed and variable block sizes, CRC-8/CRC-16 integrity checking, and
   STREAMINFO metadata parsing.
 - MD5-verified against the official IETF FLAC decoder testbench vectors.
+
+### Added
+
+- `tests/ffmpeg_crosscheck.rs`: bit-exact (tolerance 0) cross-check of
+  every bundled subset/uncommon fixture against the FFmpeg decode.
+  Skips when FFmpeg is unavailable unless `CADENCE_REQUIRE_FFMPEG=1`.

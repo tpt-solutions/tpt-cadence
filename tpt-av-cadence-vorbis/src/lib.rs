@@ -21,24 +21,36 @@ mod fft;
 mod floor;
 mod header;
 mod mdct;
-mod ogg;
 mod residue;
 
 use std::io::Read;
 
 use tpt_av_cadence_core::{
-    BufferedSource, ByteSource, CadenceError, Decoder, Format, FormatReader, StreamInfo,
-    Unseekable,
+    BufferedSource, ByteSource, CadenceError, Decoder, Format, FormatReader, StreamInfo, Unseekable,
 };
+use tpt_av_cadence_ogg::PageReader;
 
 use crate::bitreader::BitReader;
 use crate::header::{IdHeader, Setup};
 use crate::mdct::{vector_fmul_window, Mdct};
-use crate::ogg::PageReader;
 use crate::residue::ResidueWorkspace;
 
 /// Memory budget for all codebook VQ value tables combined (elements).
 const CODEBOOK_VALUE_BUDGET: usize = 32 << 20;
+
+/// Vorbis stream order → WAV order for 3–8 channels (rows index by
+/// `channels - 3`). Vorbis orders multichannel streams L C R … with the
+/// LFE near the end; WAV (and every downstream consumer) expects L R C
+/// … LFE … — the same tables FFmpeg's Vorbis decoder applies. Mono and
+/// stereo need no permutation.
+const WAV_ORDER_PERMUTATIONS: [[usize; 8]; 6] = [
+    [0, 2, 1, 0, 0, 0, 0, 0], // 3: L C R        -> L R C
+    [0, 1, 2, 3, 0, 0, 0, 0], // 4: quad (same order)
+    [0, 2, 1, 3, 4, 0, 0, 0], // 5: L C R SL SR  -> L R C SL SR
+    [0, 2, 1, 5, 3, 4, 0, 0], // 6: 5.1
+    [0, 2, 1, 6, 4, 3, 5, 0], // 7: 6.1
+    [0, 2, 1, 7, 5, 6, 3, 4], // 8: 7.1
+];
 /// Packet buffer ceiling. Legal audio packets are far below this; oversized
 /// setup headers in the wild top out around 64 KiB.
 const MAX_PACKET: usize = 1 << 20;
@@ -49,8 +61,6 @@ pub struct VorbisDecoder {
     info: StreamInfo,
     id: IdHeader,
     setup: Setup,
-    /// Long-block sample count.
-    blocksize_1: usize,
 
     /// Synthesis transforms per block size (index 0 = short).
     mdct: [Mdct; 2],
@@ -77,14 +87,12 @@ pub struct VorbisDecoder {
     /// Blockflag of the previous packet (`None` before the first).
     prev_blockflag: Option<bool>,
     first_audio: bool,
-    /// Sum of parser durations on the current EOS page (end trim).
-    eos_page_duration: i64,
+    /// [next_window_flag] of the most recent long-block packet (window
+    /// synthesis input; spec §4.3.1).
+    next_flag: bool,
+    /// Granule position carried by the EOS page, once its first packet is
+    /// pulled (`-1` before that). Output is capped here (end trim).
     eos_granule: i64,
-    eos_page_index: u64,
-    /// Granule of the last non-EOS page.
-    last_page_granule: i64,
-    /// Leading frames still to drop (positive first-audio-page granule).
-    start_trim: u64,
     /// Frames staged after the priming packet.
     decoded_total: u64,
     /// Frames handed to the caller.
@@ -92,24 +100,28 @@ pub struct VorbisDecoder {
     /// Once the EOS page finishes: the exact cap on output frames.
     output_cap: Option<u64>,
     finished: bool,
-    /// Page index of the last packet (page-boundary detection).
-    last_page_index: u64,
-    /// Set when the packet that just completed the EOS page was decoded.
-    saw_eos_page: bool,
 }
 
 fn corrupt(what: &str) -> CadenceError {
     CadenceError::CorruptData(format!("vorbis: {what}"))
 }
 
-impl VorbisDecoder {
-    /// Opens a Vorbis stream over a byte source. Seekable sources get
-    /// working `seek()`.
-    pub fn from_source(source: Box<dyn ByteSource>) -> Result<Self, CadenceError> {
-        let buffered = BufferedSource::new(source, 32 * 1024);
-        let mut ogg = PageReader::new(buffered, MAX_PACKET);
-        let mut raw = vec![0u8; MAX_PACKET].into_boxed_slice();
+/// Tags a parse error with the header stage it occurred in.
+fn stage_err(stage: &str, e: CadenceError) -> CadenceError {
+    match e {
+        CadenceError::CorruptData(msg) => CadenceError::CorruptData(format!(
+            "vorbis {stage}: {}",
+            msg.strip_prefix("vorbis: ").unwrap_or(&msg)
+        )),
+        other => other,
+    }
+}
 
+impl VorbisDecoder {
+    /// Parses the three header packets from the current stream position
+    /// (identification, comment, setup).
+    fn parse_headers(ogg: &mut PageReader) -> std::result::Result<(IdHeader, Setup), CadenceError> {
+        let mut raw = vec![0u8; MAX_PACKET].into_boxed_slice();
         let mut id: Option<IdHeader> = None;
         let mut setup: Option<Setup> = None;
         for expected in [1u8, 3, 5] {
@@ -117,14 +129,33 @@ impl VorbisDecoder {
                 .next_packet(&mut raw)?
                 .ok_or_else(|| corrupt("stream ended before the setup headers"))?;
             match expected {
-                1 => id = Some(header::parse_id(&raw[..len])?),
-                3 => header::skip_comment(&raw[..len])?,
+                1 => {
+                    id = Some(
+                        header::parse_id(&raw[..len])
+                            .map_err(|e| stage_err("identification header", e))?,
+                    )
+                }
+                3 => {
+                    header::skip_comment(&raw[..len]).map_err(|e| stage_err("comment header", e))?
+                }
                 _ => {
-                    setup = Some(header::parse_setup(&raw[..len], id.as_ref().unwrap())?);
+                    setup = Some(
+                        header::parse_setup(&raw[..len], id.as_ref().unwrap())
+                            .map_err(|e| stage_err("setup header", e))?,
+                    );
                 }
             }
         }
-        Self::assemble(ogg, &id.unwrap(), setup.unwrap())
+        Ok((id.unwrap(), setup.unwrap()))
+    }
+
+    /// Opens a Vorbis stream over a byte source. Seekable sources get
+    /// working `seek()`.
+    pub fn from_source(source: Box<dyn ByteSource>) -> Result<Self, CadenceError> {
+        let buffered = BufferedSource::new(source, 32 * 1024);
+        let mut ogg = PageReader::new(buffered, MAX_PACKET);
+        let (id, setup) = Self::parse_headers(&mut ogg)?;
+        Self::assemble(ogg, &id, setup)
     }
 
     /// Convenience constructor over a plain readable (unseekable) source.
@@ -132,7 +163,7 @@ impl VorbisDecoder {
         Self::from_source(Box::new(Unseekable(source)))
     }
 
-    fn assemble(mut ogg: PageReader, id: &IdHeader, mut setup: Setup) -> Result<Self, CadenceError> {
+    fn assemble(ogg: PageReader, id: &IdHeader, mut setup: Setup) -> Result<Self, CadenceError> {
         let channels = id.channels as usize;
         let blocksize_0 = 1usize << id.blocksize_0_exp;
         let blocksize_1 = 1usize << id.blocksize_1_exp;
@@ -167,7 +198,6 @@ impl VorbisDecoder {
             info,
             id: id.clone(),
             setup,
-            blocksize_1,
             mdct: [Mdct::new(blocksize_0), Mdct::new(blocksize_1)],
             residues: (0..channels)
                 .map(|_| vec![0.0f32; blocksize_1 / 2].into_boxed_slice())
@@ -186,17 +216,12 @@ impl VorbisDecoder {
             packet: vec![0u8; MAX_PACKET].into_boxed_slice(),
             prev_blockflag: None,
             first_audio: true,
-            eos_page_duration: 0,
+            next_flag: false,
             eos_granule: -1,
-            eos_page_index: 0,
-            last_page_granule: 0,
-            start_trim: 0,
             decoded_total: 0,
             delivered: 0,
             output_cap: None,
             finished: false,
-            last_page_index: 0,
-            saw_eos_page: false,
         })
     }
 
@@ -215,17 +240,12 @@ impl VorbisDecoder {
         self.staging_pos = 0;
         self.prev_blockflag = None;
         self.first_audio = true;
-        self.eos_page_duration = 0;
+        self.next_flag = false;
         self.eos_granule = -1;
-        self.eos_page_index = 0;
-        self.last_page_granule = 0;
-        self.start_trim = 0;
         self.decoded_total = 0;
         self.delivered = 0;
         self.output_cap = None;
         self.finished = false;
-        self.last_page_index = 0;
-        self.saw_eos_page = false;
     }
 
     /// Decodes one audio packet, writing its `retlen` frames interleaved
@@ -251,14 +271,16 @@ impl VorbisDecoder {
         }
         let blockflag = self.setup.modes[mode_number].blockflag;
         let mapping_idx = self.setup.modes[mode_number].mapping;
-        let prev_flag = if blockflag {
-            let _window = br.read_bit()?;
-            let prev = br.read_bit()?;
-            let _next = br.read_bit()?;
-            prev
+        // Spec §4.3.1: a long-window packet carries exactly TWO flag bits —
+        // [previous_window_flag] then [next_window_flag]. The current window
+        // comes from the mode's blockflag; there is no separate "window" bit.
+        let mut prev_flag = false;
+        if blockflag {
+            prev_flag = br.read_bit()?;
+            self.next_flag = br.read_bit()?;
         } else {
-            false
-        };
+            self.next_flag = false;
+        }
         let n = if blockflag {
             1usize << self.id.blocksize_1_exp
         } else {
@@ -268,23 +290,23 @@ impl VorbisDecoder {
 
         // Floor decode (channel order).
         let mut no_residue = [false; 256];
-        for ch in 0..channels {
+        for (ch, is_empty) in no_residue.iter_mut().enumerate().take(channels) {
             let (floor_idx, submap) = {
                 let m = &self.setup.mappings[mapping_idx];
                 let submap = if m.submaps > 1 { m.mux[ch] as usize } else { 0 };
                 (m.submap_floor[submap] as usize, submap)
             };
             let _ = submap;
-            let mut curve = &mut self.floors[ch][..vlen];
+            let curve = &mut self.floors[ch][..vlen];
             let nonzero = crate::floor::floor_decode(
                 &self.setup.floors[floor_idx],
                 &self.setup.codebooks,
                 &mut br,
                 blockflag as usize,
-                &mut curve,
+                curve,
                 vlen,
             )?;
-            no_residue[ch] = !nonzero;
+            *is_empty = !nonzero;
             if !nonzero {
                 self.floors[ch][..vlen].fill(0.0);
             }
@@ -302,16 +324,23 @@ impl VorbisDecoder {
             }
         }
 
-        // Residue decode (submap order).
+        // Residue decode (submap order). The spec allocates and zeroes the
+        // return vectors per packet (§8: "allocate and zero all vectors")
+        // because residue decoding ADDS into them — without this, stale
+        // values from the previous packet accumulate into the output
+        // (libvorbis memsets pcm[i] to n/2 in mapping0_inverse).
+        for ch in 0..channels {
+            self.residues[ch][..vlen].fill(0.0);
+        }
         for submap in 0..self.setup.mappings[mapping_idx].submaps {
             let mut do_not_decode = [false; 256];
             let mut members = [usize::MAX; 256];
             let mut ch_count = 0usize;
             let m = &self.setup.mappings[mapping_idx];
-            for j in 0..channels {
+            for (j, empty) in no_residue.iter().enumerate().take(channels) {
                 if m.submaps == 1 || m.mux[j] as usize == submap {
                     members[ch_count] = j;
-                    do_not_decode[ch_count] = no_residue[j];
+                    do_not_decode[ch_count] = *empty;
                     ch_count += 1;
                 }
             }
@@ -320,18 +349,14 @@ impl VorbisDecoder {
             }
             let res_idx = m.submap_residue[submap] as usize;
             let res = &self.setup.residues[res_idx];
-            let mut vecs: Vec<&mut [f32]> = Vec::with_capacity(ch_count);
-            for (idx, r) in self.residues.iter_mut().enumerate() {
-                if members[..ch_count].contains(&idx) {
-                    vecs.push(&mut r[..vlen]);
-                }
-            }
             res.decode(
                 &self.setup.codebooks,
                 &mut br,
-                &mut vecs,
+                &mut self.residues[..],
+                &members[..ch_count],
                 &do_not_decode[..ch_count],
                 &mut self.workspace,
+                vlen,
             )?;
         }
         for ch in 0..channels {
@@ -345,7 +370,11 @@ impl VorbisDecoder {
                 (m.magnitude[i], m.angle[i])
             };
             // Indices are distinct (validated at setup).
-            let (lo, hi) = if m_idx < a_idx { (m_idx, a_idx) } else { (a_idx, m_idx) };
+            let (lo, hi) = if m_idx < a_idx {
+                (m_idx, a_idx)
+            } else {
+                (a_idx, m_idx)
+            };
             let (first, second) = self.residues.split_at_mut(hi);
             let (mag, ang) = if m_idx < a_idx {
                 (&mut first[lo], &mut second[0])
@@ -356,8 +385,8 @@ impl VorbisDecoder {
         }
 
         // Dot product with the floor curve + inverse MDCT per channel.
-        for ch in 0..channels {
-            if no_residue[ch] {
+        for (ch, empty) in no_residue.iter().enumerate().take(channels) {
+            if *empty {
                 self.residues[ch][..vlen].fill(0.0);
                 continue;
             }
@@ -387,18 +416,33 @@ impl VorbisDecoder {
         let bs1 = 1usize << self.id.blocksize_1_exp;
         let retlen = (n + if prev { bs1 } else { bs0 }) / 4;
         let win_idx = (blockflag as usize) & (prev as usize);
-        for ch in 0..channels {
+        // `dst` indexes both the permutation table and the destination
+        // stride; iterator style obscures the dual indexing.
+        #[allow(clippy::needless_range_loop)]
+        for dst in 0..channels {
             let win: &[f32] = if win_idx == 1 {
                 self.mdct[1].window()
             } else {
                 self.mdct[0].window()
             };
+            // Vorbis orders multichannel output in its own stream order
+            // (e.g. 6 ch: L C R SL SR LFE); the decoded PCM handed to the
+            // engine follows WAV order (L R C LFE SL SR), matching
+            // FFmpeg's ff_vorbis_channel_layout_offsets: WAV channel
+            // `dst` carries the content of source channel perm[dst].
+            // Channel state (residues/saved) stays indexed by source
+            // channel; only the staging destination is permuted.
+            let src = if channels <= 2 {
+                dst
+            } else {
+                WAV_ORDER_PERMUTATIONS[(channels - 3).min(5)][dst]
+            };
             overlap_add_channel(
                 &mut self.staging[..],
-                ch,
+                dst,
                 channels,
-                &self.residues[ch][..],
-                &mut self.saved[ch][..],
+                &self.residues[src][..],
+                &mut self.saved[src][..],
                 win,
                 blockflag,
                 prev,
@@ -410,28 +454,6 @@ impl VorbisDecoder {
         }
         self.prev_blockflag = Some(blockflag);
         Ok((retlen, blockflag, was_first))
-    }
-
-    /// Finalizes the end trim when the EOS page has completed.
-    fn finish_eos_page(&mut self) {
-        if self.saw_eos_page && self.output_cap.is_none() {
-            if self.eos_granule >= 0 {
-                // FFmpeg Ogg demuxer semantics: trailing samples beyond the
-                // final granule are dropped.
-                let delta = self.eos_granule - self.last_page_granule;
-                let skip = self.eos_page_duration - delta;
-                if skip > 0 {
-                    self.output_cap = Some(self.decoded_total.saturating_sub(skip as u64));
-                } else {
-                    self.output_cap = Some(self.decoded_total);
-                }
-                self.info.total_frames = Some(self.eos_granule as u64);
-            } else {
-                self.output_cap = Some(self.decoded_total);
-            }
-        }
-        self.saw_eos_page = false;
-        self.eos_page_duration = 0;
     }
 }
 
@@ -491,7 +513,7 @@ fn overlap_add_channel(
         scratch[..lead].copy_from_slice(&saved[..lead]);
         vector_fmul_window(
             &mut scratch[lead..lead + bs0 / 2],
-            &mut saved[lead..],
+            &saved[lead..],
             buf,
             win,
             bs0 / 4,
@@ -530,14 +552,35 @@ impl Decoder for VorbisDecoder {
     }
 
     fn seek(&mut self, frame: u64) -> Result<(), CadenceError> {
-        // Decode-and-discard seek: scan page headers to the last page whose
-        // granule is <= `frame`, then decode forward discarding PCM until
-        // the internal decoded position reaches `frame` exactly.
-        let resume_pos = {
+        // Decode-and-discard seek: scan the page headers for the page
+        // boundary at-or-before `frame`, then decode forward from there
+        // discarding PCM until the delivered position reaches `frame`.
+        //
+        // A resume boundary is the granule of some audio page (pages whose
+        // first packet follows the three header packets): decoding from the
+        // NEXT page's start replays every packet, so the post-seek stream
+        // is bit-identical to an uninterrupted decode. The page boundary's
+        // stream position is that page's own granule (samples are numbered
+        // from the end of the priming discard).
+        #[derive(Clone)]
+        struct Candidate {
+            page_pos: u64,
+            /// Stream position at the page's first packet.
+            start: u64,
+            is_first_audio_page: bool,
+        }
+        let mut candidate: Option<Candidate> = None;
+        {
+            use crate::bitreader::BitReader;
             let source = self.ogg.source_mut();
             source.seek_to(0)?;
-            let mut resume = 0u64;
             let mut pos = 0u64;
+            let mut packets_seen = 0u64;
+            // Stream position of the next audio packet's first sample.
+            let mut stream_pos = 0u64;
+            let mut prev_n: Option<u64> = None;
+            let mut first_audio_page_pos: Option<u64> = None;
+            let mut last: Option<Candidate> = None;
             loop {
                 let mut header = [0u8; 27];
                 if !read_exact_or_eof(source, &mut header)? {
@@ -553,28 +596,127 @@ impl Decoder for VorbisDecoder {
                 let granule = i64::from_le_bytes(header[6..14].try_into().unwrap());
                 let is_bos = header[5] & 0x02 != 0;
                 let is_eos = header[5] & 0x04 != 0;
-                if !is_bos && granule >= 0 && (granule as u64) <= frame {
-                    resume = pos;
+                let page_pos = pos;
+                let page_start_stream_pos = stream_pos;
+                let is_first_audio_page = first_audio_page_pos.is_none() && packets_seen >= 3;
+
+                // Walk the page's packets: count them and sum their PCM
+                // durations (from each packet's mode bits) so the page's
+                // start position is known for the NEXT page's accounting.
+                let seg_pos = 27usize + nsegs;
+                let mut packet: Vec<u8> = Vec::new();
+                for &seg in &seg_table[..nsegs] {
+                    let mut buf = vec![0u8; seg as usize];
+                    source.take_exact(&mut buf)?;
+                    packet.extend_from_slice(&buf);
+                    if seg == 255 {
+                        continue;
+                    }
+                    // Packet completed.
+                    let headered =
+                        packets_seen < 3 || is_bos && packet.first().is_some_and(|b| b & 1 == 1);
+                    if !headered && granule >= 0 {
+                        let mut br = BitReader::new(&packet);
+                        let type_bit = br.read_bit().unwrap_or(true);
+                        let mut n = 0u64;
+                        if !type_bit {
+                            let mode_bits = BitReader::ilog(self.setup.modes.len() as i64 - 1);
+                            let mode = if mode_bits > 0 {
+                                br.read_bits(mode_bits).unwrap_or(0) as usize
+                            } else {
+                                0
+                            };
+                            let blockflag = self.setup.modes.get(mode).is_some_and(|m| m.blockflag);
+                            n = 1u64
+                                << if blockflag {
+                                    self.id.blocksize_1_exp
+                                } else {
+                                    self.id.blocksize_0_exp
+                                };
+                            let _ = br.read_bits(if blockflag { 2 } else { 0 });
+                        }
+                        let first = packets_seen == 3;
+                        let duration = if first {
+                            n / 4
+                        } else {
+                            (n + prev_n.unwrap_or(n)) / 4
+                        };
+                        stream_pos += duration;
+                        prev_n = Some(n);
+                    }
+                    packets_seen += 1;
+                    packet.clear();
                 }
+                let _ = seg_pos;
+
+                if is_first_audio_page {
+                    first_audio_page_pos = Some(page_pos);
+                }
+                if is_first_audio_page || packets_seen > 3 {
+                    // Track the latest audio page as a decode restart point.
+                    let start = if is_first_audio_page {
+                        0
+                    } else {
+                        page_start_stream_pos
+                    };
+                    last = Some(Candidate {
+                        page_pos,
+                        start,
+                        is_first_audio_page,
+                    });
+                    // The candidate for `frame` is the latest page whose
+                    // START position is <= frame (start <= granule).
+                    if start <= frame {
+                        candidate = last.clone();
+                    }
+                }
+
                 pos += 27 + nsegs as u64 + body;
                 if is_eos {
                     break;
                 }
                 source.seek_to(pos)?;
             }
-            resume
+            // If no page qualified (frame beyond the stream), decode to the end.
+            if candidate.is_none() {
+                candidate = last;
+            }
+        }
+        let Some(c) = candidate else {
+            // No audio at all: nothing to seek within.
+            return Ok(());
         };
 
-        self.ogg.reset(resume_pos)?;
+        // Re-parse the headers (the decoder state is rebuilt from them).
+        self.ogg.restart()?;
+        let (id, mut setup) = Self::parse_headers(&mut self.ogg)?;
+        // Floor 0 bark maps need the block sizes (same stream, so the
+        // block sizes are unchanged, but the setup was re-parsed).
+        for f in setup.floors.iter_mut() {
+            if let crate::floor::Floor::Zero(f0) = f {
+                f0.build_maps(1 << id.blocksize_0_exp, 1 << id.blocksize_1_exp);
+            }
+        }
+        self.id = id;
+        self.setup = setup;
         self.reset_decode_state();
+        if c.page_pos > 0 {
+            self.ogg.reset(c.page_pos)?;
+        }
+        if !c.is_first_audio_page {
+            // Mid-stream resume: there is no priming packet to discard.
+            self.first_audio = false;
+        }
 
-        // Decode-and-discard up to `frame`.
+        // Decode-and-discard exactly to `frame` (one frame per call so the
+        // landing is sample-exact).
         let channels = self.id.channels as usize;
-        let mut discard = vec![0.0f32; channels * self.blocksize_1];
-        while self.decoded_total < frame {
-            let frames = self.decode(&mut discard)?;
-            if frames == 0 {
-                break;
+        let mut discard = vec![0.0f32; channels];
+        let mut to_skip = frame.saturating_sub(c.start);
+        while to_skip > 0 {
+            match self.decode(&mut discard) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => to_skip -= 1,
             }
         }
         Ok(())
@@ -592,28 +734,27 @@ impl Decoder for VorbisDecoder {
         let cap = buffer.len() - buffer.len() % channels;
 
         loop {
-            // Deliver from staging, honoring the output cap and start trim.
+            // Deliver from staging, honoring the end-trim output cap.
             if self.staging_pos < self.staging_frames * channels {
                 let avail = self.staging_frames * channels - self.staging_pos;
                 let want = ((cap - written).min(avail) / channels) * channels;
                 let mut frames_want = want / channels;
-                let mut skip_now = 0usize;
-                if self.start_trim > 0 {
-                    skip_now = (self.start_trim as usize).min(frames_want);
-                    frames_want -= skip_now;
-                }
                 if let Some(cap_frames) = self.output_cap {
                     let room = cap_frames.saturating_sub(self.delivered) as usize;
                     frames_want = frames_want.min(room);
                 }
-                let src = self.staging_pos + skip_now * channels;
+                if frames_want == 0 {
+                    // The end-trim cap is exhausted: the stream is over.
+                    self.finished = true;
+                    return Ok(written / channels);
+                }
+                let src = self.staging_pos;
                 let copy_samples = frames_want * channels;
                 buffer[written..written + copy_samples]
                     .copy_from_slice(&self.staging[src..src + copy_samples]);
                 written += copy_samples;
                 self.staging_pos = src + copy_samples;
                 self.delivered += frames_want as u64;
-                self.start_trim -= skip_now as u64;
                 if written == cap {
                     return Ok(written / channels);
                 }
@@ -628,77 +769,44 @@ impl Decoder for VorbisDecoder {
             let (len, meta) = match self.ogg.next_packet(&mut self.packet)? {
                 Some(x) => x,
                 None => {
-                    self.finish_eos_page();
                     self.finished = true;
                     return Ok(written / channels);
                 }
             };
 
-            // Page boundary: the previous page is now complete.
-            if meta.page_index != self.last_page_index {
-                let eos_done = self.saw_eos_page;
-                self.finish_eos_page();
-                self.last_page_index = meta.page_index;
-                if eos_done {
-                    self.finished = true;
-                    continue;
-                }
+            // The EOS page's granule is the exact end of the program: cap
+            // delivery there (end trim) from the moment it is known.
+            if meta.eos_page && meta.granule >= 0 && self.eos_granule < 0 {
+                self.eos_granule = meta.granule;
+                self.output_cap = Some(meta.granule as u64);
+                self.info.total_frames = Some(meta.granule as u64);
             }
 
             // Decode it (take the packet buffer to appease the borrow
             // checker; it is put back below).
-            let mut pkt = std::mem::take(&mut self.packet);
+            let pkt = std::mem::take(&mut self.packet);
             let decoded = self.decode_packet(&pkt[..len]);
             self.packet = pkt;
-            let (retlen, blockflag, was_first) = decoded?;
+            let (retlen, _blockflag, was_first) = decoded?;
 
             if was_first {
                 // The priming packet is parsed (its `saved` cache is used)
-                // but its PCM is not delivered (spec 4.3.8).
+                // but its PCM is not delivered (spec 4.3.8). A stream opened
+                // from byte 0 has no leading trim: the priming discard is
+                // the entire pre-roll (a page's granule counts samples at
+                // its END and is nonzero even for the first page, so it
+                // must not be used as a start offset).
                 self.first_audio = false;
-                // A positive first-audio-page granule marks a mid-program
-                // start; drop that many leading samples.
-                if meta.granule > 0 {
-                    self.start_trim = meta.granule as u64;
-                }
             } else {
                 self.decoded_total += retlen as u64;
                 self.staging_frames = retlen;
                 self.staging_pos = 0;
             }
-
-            // Per-page duration sums use the demuxer's parser durations
-            // (first audio packet: current blocksize/4, no previous block).
-            let parser_duration = if was_first {
-                (if blockflag {
-                    1i64 << self.id.blocksize_1_exp
-                } else {
-                    1i64 << self.id.blocksize_0_exp
-                }) / 4
-            } else {
-                retlen as i64
-            };
-            if meta.eos_page {
-                if self.eos_page_index != meta.page_index {
-                    self.eos_page_index = meta.page_index;
-                    self.eos_page_duration = 0;
-                }
-                self.eos_page_duration += parser_duration;
-                if meta.granule >= 0 {
-                    self.eos_granule = meta.granule;
-                    self.saw_eos_page = true;
-                }
-            } else {
-                self.last_page_granule = meta.granule;
-            }
         }
     }
 }
 
-fn read_exact_or_eof(
-    source: &mut BufferedSource,
-    buf: &mut [u8],
-) -> Result<bool, CadenceError> {
+fn read_exact_or_eof(source: &mut BufferedSource, buf: &mut [u8]) -> Result<bool, CadenceError> {
     let mut got = 0usize;
     while got < buf.len() {
         let n = source.read(&mut buf[got..]).map_err(CadenceError::from)?;
