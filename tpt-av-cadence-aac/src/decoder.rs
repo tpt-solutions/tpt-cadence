@@ -12,11 +12,21 @@ use crate::bitreader::BitReader;
 use crate::huffman::HuffmanTable;
 use crate::imdct::{kbd_window, sine_window, vector_fmul_window, Mdct};
 use crate::pns::NoiseGenerator;
+
+thread_local! {
+    static FIL_SPANS: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+use crate::sbr;
 use crate::stereo;
 use crate::tables;
 use crate::tns::{self, Tns};
 
 const MAX_CHANNELS: usize = 8;
+/// Channel count per ISO/IEC 14496-3 channel configuration (Table 1.4).
+/// Configuration 0 is PCE-configured (count declared in-band); note
+/// configuration 7 ("7.1") carries EIGHT channels.
+const CONFIG_CHANNEL_COUNTS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 8];
 /// ADTS frames cannot exceed 6144/8 · channels + header bytes; 16 KiB is a
 /// generous cap allocated once at open time.
 const FRAME_BUF_LEN: usize = 16 * 1024;
@@ -29,8 +39,10 @@ const BLOCK_LEN: usize = 128;
 
 const SCE: u32 = 0;
 const CPE: u32 = 1;
+const CCE: u32 = 2;
 const LFE: u32 = 3;
 const DSE: u32 = 4;
+const PCE: u32 = 5;
 const FIL: u32 = 6;
 const END: u32 = 7;
 
@@ -52,11 +64,17 @@ const EIGHT_SHORT: u8 = 2;
 #[allow(dead_code)]
 const LONG_STOP: u8 = 3;
 
+// PCE plan entry types.
+const PCE_SCE: u8 = 0;
+const PCE_CPE: u8 = 1;
+const PCE_LFE: u8 = 2;
+
 /// Per-channel decoding state (allocation confined to open()).
 struct ChannelState {
     /// Spectral coefficients of the current transform (1024).
     coeffs: Box<[f32]>,
-    /// Dequantized time-domain output of the current transform (1024).
+    /// Dequantized time-domain output of the current transform (1024;
+    /// extended to 2048 when SBR is active).
     out: Box<[f32]>,
     /// Overlap history: the reference decoder's `saved` buffer (512).
     saved: Box<[f32]>,
@@ -75,11 +93,37 @@ struct ChannelState {
     window_seq_prev: u8,
 }
 
+/// One coupling-channel element: its decoded spectrum plus the coupling
+/// targets and per-band gains (reference `ChannelCoupling`).
+const MAX_CCE_TARGETS: usize = 8;
+struct CouplingChannel {
+    state: ChannelState,
+    /// Window info of the CCE's own ICS (gain index layout).
+    window: WindowInfo,
+    /// 0 = before TNS, 1 = between TNS and IMDCT, 3 = after IMDCT
+    /// (reference `CouplingPoint`).
+    coupling_point: u8,
+    /// Number of coupled targets minus one.
+    num_coupled: usize,
+    /// Per target: element type (SCE/CPE), tag, and channel selection.
+    ty: [u8; MAX_CCE_TARGETS],
+    id_select: [u8; MAX_CCE_TARGETS],
+    ch_select: [u8; MAX_CCE_TARGETS],
+    /// (sign flag, scale index) read before the ICS.
+    sign_and_scale: (u8, usize),
+    /// Number of gain sets (targets, +1 for split stereo selections).
+    num_gain: usize,
+    /// Per target per band gains: gain[target][band_index] (8 × 512).
+    gain: Box<[f32]>,
+    /// Whether this slot carries a CCE decoded in the current block.
+    coupled: bool,
+}
+
 impl ChannelState {
     fn new() -> Self {
         ChannelState {
             coeffs: vec![0.0; 1024].into_boxed_slice(),
-            out: vec![0.0; 1024].into_boxed_slice(),
+            out: vec![0.0; 2048].into_boxed_slice(),
             saved: vec![0.0; 512].into_boxed_slice(),
             band_type: vec![0u8; 512].into_boxed_slice(),
             sfo: vec![0i32; 512].into_boxed_slice(),
@@ -105,6 +149,18 @@ struct WindowInfo {
 }
 
 impl WindowInfo {
+    fn placeholder(sf_index: usize) -> Self {
+        WindowInfo {
+            sequence: ONLY_LONG,
+            num_windows: 1,
+            num_window_groups: 1,
+            group_len: [1; 8],
+            max_sfb: 0,
+            num_swb: 0,
+            sf_index,
+        }
+    }
+
     fn swb_offsets(&self) -> &'static [u16] {
         let table = if self.sequence == EIGHT_SHORT {
             tables::SWB_OFFSET_128[self.sf_index]
@@ -130,6 +186,15 @@ struct Pulse {
     amp: [i32; 4],
 }
 
+/// One channel element decoded in the current block.
+#[derive(Clone, Copy)]
+struct BlockElem {
+    ch: usize,
+    win: WindowInfo,
+    is_cpe: bool,
+    tag: u8,
+}
+
 /// AAC-LC decoder.
 ///
 /// Accepts an ADTS stream (auto-detected) or, via
@@ -141,12 +206,31 @@ pub struct AacDecoder {
     source: BufferedSource,
     info: StreamInfo,
     channels: usize,
+    /// The stream's fixed channel configuration value (0 = PCE-configured).
+    channel_configuration: u8,
     sf_index: usize,
     /// Header of the first ADTS frame, consumed during open.
     pending_header: Option<[u8; 7]>,
     frame_count: u64,
     /// Raw-block framing (no ADTS headers) when opened from a config.
     raw_blocks: bool,
+    /// Raw-block stream state: frame_buf[raw_pos..raw_len] holds the not
+    /// yet parsed bytes of the current read window.
+    raw_pos: usize,
+    raw_len: usize,
+    /// Channel plan from the most recent Program Config Element (channel
+    /// configuration 0), in declaration order: front, side, back, then LFE.
+    /// Elements are mapped to channels SOLELY BY TAG (reference:
+    /// `ff_aac_get_che`'s `tag_che_map`); `pce_plan_chan` holds each
+    /// entry's output channel index.
+    pce_plan_type: [u8; MAX_CHANNELS],
+    pce_plan_tag: [u8; MAX_CHANNELS],
+    pce_plan_chan: [u8; MAX_CHANNELS],
+    pce_plan_len: usize,
+    /// Element counts per position class: front, side, back, LFE.
+    pce_class_counts: [usize; 4],
+    /// Output permutation for PCE streams (sniffed WAV order).
+    pce_out_order: [u8; MAX_CHANNELS],
 
     channels_state: Vec<ChannelState>,
     spectral_books: Vec<HuffmanTable>,
@@ -164,6 +248,14 @@ pub struct AacDecoder {
     /// Short-window lap scratch (128).
     temp: Box<[f32]>,
     noise: NoiseGenerator,
+    /// Coupling channel elements decoded in the current block.
+    cces: Vec<CouplingChannel>,
+    /// SBR enhancement state (present once an SBR extension is seen).
+    sbr: Option<sbr::Sbr>,
+    /// The channel range (first, count) the SBR FIL applied to.
+    sbr_channels: Option<(usize, usize)>,
+    /// Once true, all subsequent frames output 2048 samples/channel.
+    sbr_output_active: bool,
 
     /// M/S decision bits for the current common-window CPE (512 entries).
     ms_mask: Box<[bool]>,
@@ -209,6 +301,7 @@ impl AacDecoder {
             first.channel_configuration,
             first.sampling_frequency_index as usize,
             false,
+            None,
         )?;
         decoder.pending_header = Some(header);
         Ok(decoder)
@@ -226,28 +319,59 @@ impl AacDecoder {
         source: Box<dyn ByteSource>,
     ) -> Result<Self, CadenceError> {
         let sample_rate = config.sample_rate()?;
-        Self::open_with_params(
+        let mut decoder = Self::open_with_params(
             BufferedSource::new(source, 8192),
             sample_rate,
             config.channel_configuration,
             config.sampling_frequency_index as usize,
             true,
-        )
+            config.program_config.as_ref(),
+        )?;
+        if config.program_config.is_some() {
+            decoder.recompute_pce_out_order();
+        }
+        Ok(decoder)
     }
 
     fn open_with_params(
         source: BufferedSource,
         sample_rate: u32,
-        channels: u8,
+        channel_configuration: u8,
         sf_index: usize,
         raw_blocks: bool,
+        asc_pce: Option<&crate::audio_specific::AacPcePlan>,
     ) -> Result<Self, CadenceError> {
-        let channels = channels as usize;
-        if channels == 0 || channels > MAX_CHANNELS {
-            return Err(CadenceError::UnsupportedFeature(format!(
-                "AAC channel configuration {channels} is out of range (1..={MAX_CHANNELS})"
-            )));
-        }
+        // Channel count and initial PCE plan: an ASC-carried program
+        // config element (channel configuration 0) fixes both at open.
+        let (channels, pce_plan, pce_class_counts) = match asc_pce {
+            Some(plan) => {
+                let counts = plan.class_counts;
+                let total: usize = plan
+                    .entries
+                    .iter()
+                    .map(|&(ty, _)| 1 + usize::from(ty == PCE_CPE))
+                    .sum();
+                if plan.entries.len() > MAX_CHANNELS || total == 0 {
+                    return Err(CadenceError::CorruptData(
+                        "ASC program configuration is empty or exceeds the channel limit"
+                            .to_string(),
+                    ));
+                }
+                (total, Some(plan.entries.as_slice()), counts)
+            }
+            None => (
+                match usize::from(channel_configuration) {
+                    c if c < CONFIG_CHANNEL_COUNTS.len() => CONFIG_CHANNEL_COUNTS[c],
+                    _ => {
+                        return Err(CadenceError::UnsupportedFeature(
+                            "reserved AAC channel configuration".to_string(),
+                        ))
+                    }
+                },
+                None,
+                [0; 4],
+            ),
+        };
         if sf_index >= tables::NUM_SWB_1024.len() {
             return Err(CadenceError::UnsupportedFeature(
                 "sampling frequency index is reserved".to_string(),
@@ -277,23 +401,63 @@ impl AacDecoder {
             HuffmanTable::new(&tables::SCALEFACTOR_BITS, &codes)?
         };
 
-        let mut channels_state = Vec::with_capacity(channels);
-        for _ in 0..channels {
+        // Channel state exists for every possible channel: with channel
+        // configuration 0 the count is only known once the first in-band
+        // PCE arrives, so `channels` starts at 0 and is upgraded then.
+        let mut channels_state = Vec::with_capacity(MAX_CHANNELS);
+        for _ in 0..MAX_CHANNELS {
             channels_state.push(ChannelState::new());
         }
 
         let mut info = StreamInfo::new(Format::Aac, sample_rate, channels as u16, 16);
         info.total_frames = None;
-        info.validate()?;
+        if channels > 0 {
+            info.validate()?;
+        }
 
         Ok(AacDecoder {
             source,
             info,
             channels,
+            channel_configuration,
             sf_index,
             pending_header: None,
             frame_count: 0,
             raw_blocks,
+            raw_pos: 0,
+            raw_len: 0,
+            pce_plan_type: {
+                let mut t = [0u8; MAX_CHANNELS];
+                if let Some(plan) = pce_plan {
+                    for (i, &(ty, _)) in plan.iter().enumerate() {
+                        t[i] = ty;
+                    }
+                }
+                t
+            },
+            pce_plan_tag: {
+                let mut t = [0u8; MAX_CHANNELS];
+                if let Some(plan) = pce_plan {
+                    for (i, &(_, tag)) in plan.iter().enumerate() {
+                        t[i] = tag;
+                    }
+                }
+                t
+            },
+            pce_plan_chan: {
+                let mut t = [0u8; MAX_CHANNELS];
+                if let Some(plan) = pce_plan {
+                    let mut ch = 0usize;
+                    for (i, &(ty, _)) in plan.iter().enumerate() {
+                        t[i] = ch as u8;
+                        ch += 1 + usize::from(ty == PCE_CPE);
+                    }
+                }
+                t
+            },
+            pce_plan_len: pce_plan.map_or(0, |p| p.len()),
+            pce_class_counts,
+            pce_out_order: [0; MAX_CHANNELS],
             channels_state,
             spectral_books,
             sf_book,
@@ -307,10 +471,32 @@ impl AacDecoder {
             buf: vec![0.0; 1024].into_boxed_slice(),
             temp: vec![0.0; 128].into_boxed_slice(),
             noise: NoiseGenerator::new(),
+            sbr: None,
+            sbr_channels: None,
+            sbr_output_active: false,
+            cces: (0..4)
+                .map(|_| CouplingChannel {
+                    state: ChannelState::new(),
+                    window: WindowInfo::placeholder(sf_index),
+                    coupling_point: 0,
+                    num_coupled: 0,
+                    ty: [0; MAX_CCE_TARGETS],
+                    id_select: [0; MAX_CCE_TARGETS],
+                    ch_select: [0; MAX_CCE_TARGETS],
+                    sign_and_scale: (0, 0),
+                    num_gain: 0,
+                    gain: vec![0.0; MAX_CCE_TARGETS * 512].into_boxed_slice(),
+                    coupled: false,
+                })
+                .collect(),
             ms_mask: vec![false; 512].into_boxed_slice(),
             frame_buf: vec![0u8; FRAME_BUF_LEN].into_boxed_slice(),
             work_buf: vec![0u8; FRAME_BUF_LEN].into_boxed_slice(),
-            staged: Vec::new(),
+            // One transform's worth of interleaved PCM for any channel
+            // count: `decode()` clears and refills in place, so no
+            // allocation happens after open (real-time contract). Sized
+            // for MAX_CHANNELS because configuration 0 starts at 0.
+            staged: Vec::with_capacity(1024 * MAX_CHANNELS),
             staged_pos: 0,
             eof: false,
         })
@@ -323,39 +509,121 @@ impl AacDecoder {
 
     /// Reads and decodes the next frame into staging. Ok(false) at EOS.
     fn decode_next_frame(&mut self) -> Result<bool, CadenceError> {
+        if self.raw_blocks {
+            return self.decode_next_raw_block();
+        }
         if self.eof {
             return Ok(false);
         }
 
-        let (num_blocks, body_len) = if self.raw_blocks {
-            let len = self.fill_frame_buf()?;
-            if len == 0 {
-                return Ok(false);
-            }
-            (1u32, len)
-        } else {
-            match self.read_adts_frame() {
-                Ok((h, l)) => (u32::from(h.raw_blocks_minus_one) + 1, l),
-                Err(CadenceError::EndOfStream) => return Ok(false),
-                Err(e) => return Err(e),
-            }
+        let (num_blocks, body_len) = match self.read_adts_frame() {
+            Ok((h, l)) => (u32::from(h.raw_blocks_minus_one) + 1, l),
+            Err(CadenceError::EndOfStream) => return Ok(false),
+            Err(e) => return Err(e),
         };
         self.work_buf[..body_len].copy_from_slice(&self.frame_buf[..body_len]);
         // Lend the work buffer out so the block decoder can use &mut self.
         let work = std::mem::take(&mut self.work_buf);
         let mut br = BitReader::new(&work[..body_len]);
-        let dbg = std::env::var("AAC_DEBUG").is_ok();
-        if dbg {
-            eprintln!("[block] body_len={body_len} num_blocks={num_blocks}");
-        }
         let result = self.decode_raw_block(&mut br, num_blocks);
-        if dbg {
-            eprintln!("[block] done");
-        }
         self.work_buf = work;
         result?;
         self.frame_count += 1;
         Ok(true)
+    }
+
+    /// Parses one raw_data_block from the raw-block stream. Raw blocks carry
+    /// no length prefix: blocks are parsed from the buffered bytes, and a
+    /// parse that runs out of data at the buffer end is retried after
+    /// refilling from the source (a block may straddle a refill boundary).
+    /// Ok(false) once the stream is exhausted.
+    fn decode_next_raw_block(&mut self) -> Result<bool, CadenceError> {
+        loop {
+            if self.raw_pos >= self.raw_len && self.refill_raw()? == 0 {
+                return Ok(false);
+            }
+            let avail = self.raw_len - self.raw_pos;
+            self.work_buf[..avail].copy_from_slice(&self.frame_buf[self.raw_pos..self.raw_len]);
+            // A parse that runs out of data may leave non-idempotent state
+            // behind (the PNS LCG advances one-way and the per-channel
+            // window-shape flags shift); snapshot those so the retry after
+            // a refill decodes from the same state as a first attempt.
+            let noise_state = self.noise.state();
+            let kb_flags: [(bool, bool); MAX_CHANNELS] = std::array::from_fn(|i| {
+                self.channels_state
+                    .get(i)
+                    .map_or((false, false), |c| (c.kb_window_prev, c.kb_window_cur))
+            });
+            // Lend the work buffer out so the block decoder can use &mut self.
+            let work = std::mem::take(&mut self.work_buf);
+            let (result, consumed, overread) = {
+                let mut br = BitReader::new(&work[..avail]);
+                let r = self.decode_raw_block(&mut br, 1);
+                (r, br.pos(), br.overread())
+            };
+            self.work_buf = work;
+            match result {
+                Ok(()) => {
+                    if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
+                        use std::io::Write;
+                        let nbits = consumed;
+                        let nbytes = nbits.div_ceil(8);
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("blocks.bin")
+                            .unwrap();
+                        f.write_all(&self.work_buf[..nbytes]).unwrap();
+                        let spans = FIL_SPANS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+                        let mut f2 = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("spans.txt")
+                            .unwrap();
+                        let _ = writeln!(f2, "{} {:?}", nbits, spans);
+                    }
+                    // A raw_data_block ends byte-aligned, so the next one
+                    // starts at the next byte boundary.
+                    self.raw_pos += consumed.div_ceil(8);
+                    self.frame_count += 1;
+                    return Ok(true);
+                }
+                Err(e) => {
+                    if overread && self.refill_raw()? > 0 {
+                        self.noise.set_state(noise_state);
+                        for (i, (prev, cur)) in kb_flags.iter().enumerate() {
+                            if let Some(c) = self.channels_state.get_mut(i) {
+                                c.kb_window_prev = *prev;
+                                c.kb_window_cur = *cur;
+                            }
+                        }
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Slides the unconsumed raw-block bytes to the front of the frame
+    /// buffer and reads more from the source. Returns how many NEW bytes
+    /// were added (0 at EOF, or when the buffer was already full).
+    fn refill_raw(&mut self) -> Result<usize, CadenceError> {
+        self.frame_buf.copy_within(self.raw_pos..self.raw_len, 0);
+        self.raw_len -= self.raw_pos;
+        let before = self.raw_len;
+        self.raw_pos = 0;
+        while self.raw_len < self.frame_buf.len() {
+            match self.source.read(&mut self.frame_buf[self.raw_len..]) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => self.raw_len += n,
+                Err(e) => return Err(CadenceError::from(e)),
+            }
+        }
+        Ok(self.raw_len - before)
     }
 
     /// Reads one ADTS frame, returning (header, body length). Handles the
@@ -366,9 +634,6 @@ impl AacDecoder {
             header = pending;
         } else {
             loop {
-                if std::env::var("AAC_DEBUG").is_ok() {
-                    eprintln!("[adts] scanning, header={:02X?}", &header[..2]);
-                }
                 match self.source.take_exact(&mut header) {
                     Ok(()) => {}
                     Err(CadenceError::EndOfStream) => {
@@ -394,12 +659,13 @@ impl AacDecoder {
         }
 
         let parsed = AdtsHeader::parse(&header)?;
-        if parsed.channel_configuration == 0 {
-            return Err(CadenceError::UnsupportedFeature(
-                "channel configuration 0 (PCE) is not supported".to_string(),
-            ));
-        }
-        if parsed.channel_configuration as usize != self.channels {
+        // Channel configuration 0 means the stream is configured by an
+        // in-band PCE; the fixed-configuration consistency check applies
+        // only when both sides name a concrete configuration.
+        if parsed.channel_configuration != 0
+            && self.channel_configuration != 0
+            && parsed.channel_configuration != self.channel_configuration
+        {
             return Err(CadenceError::UnsupportedFeature(
                 "channel configuration changes between ADTS frames".to_string(),
             ));
@@ -416,42 +682,25 @@ impl AacDecoder {
         Ok((parsed, body_len))
     }
 
-    /// Fills the frame buffer for raw-block framing (reads to EOF once).
-    fn fill_frame_buf(&mut self) -> Result<usize, CadenceError> {
-        let mut len = 0usize;
-        while len < self.frame_buf.len() {
-            match self.source.read(&mut self.frame_buf[len..]) {
-                Ok(0) => {
-                    self.eof = true;
-                    break;
-                }
-                Ok(n) => len += n,
-                Err(e) => return Err(CadenceError::from(e)),
-            }
-        }
-        Ok(len)
-    }
-
     /// Parses `num_blocks` raw_data_blocks and stages interleaved PCM.
     fn decode_raw_block(
         &mut self,
         br: &mut BitReader,
         num_blocks: u32,
     ) -> Result<(), CadenceError> {
-        // (channel, window info) in output order for this frame.
-        let mut block_channels = [(
-            0usize,
-            WindowInfo {
-                sequence: ONLY_LONG,
-                num_windows: 1,
-                num_window_groups: 1,
-                group_len: [1; 8],
-                max_sfb: 0,
-                num_swb: 0,
-                sf_index: self.sf_index,
-            },
-        ); MAX_CHANNELS];
+        // Channel elements decoded in this frame, in output order: target
+        // records for coupling (element type, tag) plus the channel and
+        // window info.
+        let mut block_channels = [BlockElem {
+            ch: 0,
+            win: WindowInfo::placeholder(self.sf_index),
+            is_cpe: false,
+            tag: 0,
+        }; MAX_CHANNELS];
         let mut block_count = 0usize;
+        // The last channel element seen (first channel, count, element id):
+        // an SBR extension payload in a FIL applies to this element.
+        let mut che_prev: Option<(usize, usize, u32)> = None;
 
         for _ in 0..num_blocks {
             let mut iter: u64 = 0;
@@ -470,18 +719,30 @@ impl AacDecoder {
                 let id = br.read_bits(3);
                 match id {
                     SCE | LFE => {
-                        let _tag = br.read_bits(4);
-                        let ch =
-                            Self::next_free_channel(&block_channels[..block_count], self.channels)?;
+                        let tag = br.read_bits(4);
+                        let ch = if self.pce_plan_len > 0 {
+                            self.pce_channel_for(false, id == LFE, tag)?
+                        } else {
+                            Self::next_free_channel(&block_channels[..block_count], self.channels)?
+                        };
                         let win = self.decode_ics(br, ch, false, None)?;
-                        block_channels[block_count] = (ch, win);
+                        block_channels[block_count] = BlockElem {
+                            ch,
+                            win,
+                            is_cpe: false,
+                            tag: tag as u8,
+                        };
                         block_count += 1;
+                        che_prev = Some((ch, 1, id));
                     }
                     CPE => {
-                        let _tag = br.read_bits(4);
+                        let tag = br.read_bits(4);
                         let common_window = br.read_bit();
-                        let ch_l =
-                            Self::next_free_channel(&block_channels[..block_count], self.channels)?;
+                        let ch_l = if self.pce_plan_len > 0 {
+                            self.pce_channel_for(true, false, tag)?
+                        } else {
+                            Self::next_free_channel(&block_channels[..block_count], self.channels)?
+                        };
                         let ch_r = ch_l + 1;
                         if ch_r >= self.channels {
                             return Err(CadenceError::CorruptData(
@@ -489,7 +750,7 @@ impl AacDecoder {
                             ));
                         }
 
-                        let (win, ms_present) = if common_window {
+                        let (win, win_r, ms_present) = if common_window {
                             // common_window: ics_info precedes the ms data and
                             // the per-channel ICS bodies (which start with
                             // global_gain).
@@ -525,50 +786,117 @@ impl AacDecoder {
                             ch1.kb_window_prev = ch1.kb_window_cur;
                             ch1.kb_window_cur = ch0_cur;
                             ch1.window_seq_prev = ch0_prev_seq;
-                            (win, ms_present)
+                            (win, win, ms_present)
                         } else {
-                            let win = self.decode_ics(br, ch_l, false, None)?;
-                            let _win_r = self.decode_ics(br, ch_r, false, None)?;
-                            (win, 0u32)
+                            // Each channel carries its own ics_info and is
+                            // parsed exactly once (no ms data).
+                            let win_l = self.decode_ics(br, ch_l, false, None)?;
+                            let win_r = self.decode_ics(br, ch_r, false, None)?;
+                            (win_l, win_r, 0u32)
                         };
 
-                        self.decode_ics(br, ch_l, true, Some(win))?;
-                        self.decode_ics(br, ch_r, true, Some(win))?;
-
                         if common_window {
+                            self.decode_ics(br, ch_l, true, Some(win))?;
+                            self.decode_ics(br, ch_r, true, Some(win))?;
                             self.apply_cpe_stereo(ch_l, ch_r, &win, ms_present != 0);
                         }
 
-                        block_channels[block_count] = (ch_l, win);
+                        block_channels[block_count] = BlockElem {
+                            ch: ch_l,
+                            win,
+                            is_cpe: true,
+                            tag: tag as u8,
+                        };
                         block_count += 1;
-                        block_channels[block_count] = (ch_r, win);
+                        block_channels[block_count] = BlockElem {
+                            ch: ch_r,
+                            win: win_r,
+                            is_cpe: true,
+                            tag: tag as u8,
+                        };
                         block_count += 1;
+                        che_prev = Some((ch_l, 2, id));
                     }
+                    CCE => self.decode_cce(br)?,
                     FIL => {
+                        let fil_start_bit = if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
+                            br.pos()
+                        } else {
+                            0
+                        };
                         let mut count = br.read_bits(4) as usize;
                         if count == 15 {
                             count = 14 + br.read_bits(8) as usize;
                         }
-                        br.skip_bytes(count);
+                        if count == 0 {
+                            // Empty fill element: nothing to skip.
+                            continue;
+                        }
+                        // extension_payload: extension_type(4) then payload.
+                        let ext_type = br.read_bits(4);
+                        match ext_type {
+                            13 | 14 => {
+                                // SBR extension (13 = plain, 14 = with CRC).
+                                let crc = ext_type == 14;
+                                let payload_bits = count * 8 - 4;
+                                let payload_start = br.pos();
+                                let nbytes = payload_bits.div_ceil(8);
+                                let mut payload = [0u8; 272];
+                                for byte in payload[..nbytes.min(272)].iter_mut() {
+                                    *byte = br.read_bits(8) as u8;
+                                }
+                                // The FIL payload is bit-packed: restore the
+                                // exact position after the rounded-up capture.
+                                br.set_pos(payload_start + payload_bits);
+                                let (id_type, nch) = match che_prev {
+                                    Some((ch0, n, ty)) => (ty, (ch0, n)),
+                                    None => (id, (0usize, 1usize)),
+                                };
+                                let sbr = self.sbr.get_or_insert_with(|| {
+                                    // First SBR discovery: the output rate
+                                    // doubles (implicit SBR signaling).
+                                    sbr::Sbr::new(id_type as usize)
+                                });
+                                if sbr.sample_rate == 0 {
+                                    sbr.sample_rate = 2 * self.info.sample_rate as i32;
+                                    self.info.sample_rate = sbr.sample_rate as u32;
+                                }
+                                sbr::parse::decode_sbr_extension(
+                                    sbr,
+                                    &payload,
+                                    crc,
+                                    count,
+                                    id_type as usize,
+                                );
+                                self.sbr_channels = Some(nch);
+                                self.sbr_output_active = true;
+                                if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
+                                    FIL_SPANS.with(|s| {
+                                        s.borrow_mut()
+                                            .push((fil_start_bit, payload_start + payload_bits))
+                                    });
+                                }
+                            }
+                            _ => {
+                                br.skip_bits(count * 8 - 4);
+                            }
+                        }
                     }
                     DSE => {
                         let _tag = br.read_bits(4);
                         let align = br.read_bit();
-                        let mut count = br.read_bits(4) as usize;
-                        if count == 15 {
-                            count = br.read_bits(8) as usize;
+                        // Count is EIGHT bits with a 255 escape byte
+                        // (ISO/IEC 14496-3 Table 4.8).
+                        let mut count = br.read_bits(8) as usize;
+                        if count == 255 {
+                            count += br.read_bits(8) as usize;
                         }
                         if align {
                             br.byte_align();
                         }
                         br.skip_bytes(count);
                     }
-                    2 | 5 => {
-                        return Err(CadenceError::UnsupportedFeature(
-                            "channel coupling / program config elements are not supported"
-                                .to_string(),
-                        ));
-                    }
+                    PCE => self.decode_pce(br)?,
                     END => break,
                     other => {
                         return Err(CadenceError::CorruptData(format!(
@@ -580,91 +908,168 @@ impl AacDecoder {
             br.byte_align();
         }
 
-        // TNS, windowing, and staging for every decoded channel.
-        let mut decoded = [(
-            0usize,
-            WindowInfo {
-                sequence: ONLY_LONG,
-                num_windows: 1,
-                num_window_groups: 1,
-                group_len: [1; 8],
-                max_sfb: 0,
-                num_swb: 0,
-                sf_index: self.sf_index,
-            },
-        ); MAX_CHANNELS];
+        // Spectral-domain tool ordering per the reference decoder: each
+        // channel element receives BEFORE_TNS dependent coupling, its own
+        // TNS, BETWEEN_TNS_AND_IMDCT dependent coupling, then the IMDCT;
+        // AFTER_IMDCT independent coupling acts on the time-domain output.
+        let mut decoded = [BlockElem {
+            ch: 0,
+            win: WindowInfo::placeholder(self.sf_index),
+            is_cpe: false,
+            tag: 0,
+        }; MAX_CHANNELS];
         let mut decoded_count = 0usize;
-        for (ch, win) in &block_channels[..block_count] {
-            if decoded[..decoded_count].iter().any(|(c, _)| c == ch) {
+        for el in &block_channels[..block_count] {
+            if decoded[..decoded_count].iter().any(|d| d.ch == el.ch) {
                 continue;
             }
-            decoded[decoded_count] = (*ch, *win);
+            decoded[decoded_count] = *el;
             decoded_count += 1;
-            let state = &mut self.channels_state[*ch];
-            if std::env::var("AAC_DUMP").is_ok() {
-                let n = self.frame_count;
-                let dir = std::path::Path::new("target/dump");
-                let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(
-                    dir.join(format!("pre_{n}_{ch}.f32")),
-                    f32_slice_bytes(&state.coeffs),
-                );
-                let bands: Vec<u8> = state.band_type[..win.max_sfb.max(1)].to_vec();
-                let sfs: Vec<i32> = state.sfo[..win.max_sfb.max(1)].to_vec();
-                let bands = bands.iter().map(|&b| b.to_string()).collect::<Vec<_>>();
-                let sfs = sfs.iter().map(|&b| b.to_string()).collect::<Vec<_>>();
-                let _ = std::fs::write(
-                    dir.join(format!("meta_{n}_{ch}.txt")),
-                    format!("bands: {}\nsfo: {}\n", bands.join(","), sfs.join(",")),
-                );
-                eprintln!(
-                    "[frame {n} ch{ch}] seq={} kb_prev={} kb_cur={} max_sfb={} tns_n_filt={:?}",
-                    win.sequence,
-                    state.kb_window_prev,
-                    state.kb_window_cur,
-                    win.max_sfb,
-                    &state.tns.n_filt[..win.num_windows],
-                );
-            }
-            tns::apply(
-                &state.tns,
-                &mut state.coeffs,
-                win.num_windows,
-                win.num_swb,
-                win.swb_offsets(),
-                win.tns_max_bands(),
-                win.max_sfb,
-            );
-            if std::env::var("AAC_DUMP").is_ok() {
-                let n = self.frame_count;
-                let dir = std::path::Path::new("target/dump");
-                let _ = std::fs::write(
-                    dir.join(format!("post_{n}_{ch}.f32")),
-                    f32_slice_bytes(&state.coeffs),
-                );
-            }
-        }
-        for (ch, win) in &decoded[..decoded_count] {
-            self.imdct_and_window(*ch, win);
         }
 
-        // Interleave into staging.
-        for i in 0..1024usize {
-            for (ch, _) in &decoded[..decoded_count] {
-                self.staged.push(self.channels_state[*ch].out[i]);
+        // The coupling channels' own TNS runs before any coupling is
+        // applied (reference: the CCE elements are processed first in the
+        // type loop, where their own TNS is applied).
+        for cce in &mut self.cces {
+            if cce.coupled {
+                let win = cce.window;
+                let state = &mut cce.state;
+                tns::apply(
+                    &state.tns,
+                    &mut state.coeffs,
+                    win.num_windows,
+                    win.num_swb,
+                    win.swb_offsets(),
+                    win.tns_max_bands(),
+                    win.max_sfb,
+                );
             }
+        }
+
+        // Coupling channels with an after-IMDCT point are transformed
+        // first: their time-domain output feeds the targets' independent
+        // coupling below (reference processes CCE elements before CPE/SCE).
+        for i in 0..self.cces.len() {
+            let (point, win) = {
+                let cce = &self.cces[i];
+                (cce.coupling_point, cce.window)
+            };
+            if self.cces[i].coupled && point == 3 {
+                std::mem::swap(&mut self.channels_state[0], &mut self.cces[i].state);
+                self.imdct_and_window(0, &win);
+                std::mem::swap(&mut self.channels_state[0], &mut self.cces[i].state);
+            }
+        }
+        let mut sbr_frame_out: Option<(usize, usize)> = None; // (first ch, nch)
+        for el in &decoded[..decoded_count] {
+            let win = el.win;
+            self.apply_coupling(el, 0);
+            {
+                let state = &mut self.channels_state[el.ch];
+                tns::apply(
+                    &state.tns,
+                    &mut state.coeffs,
+                    win.num_windows,
+                    win.num_swb,
+                    win.swb_offsets(),
+                    win.tns_max_bands(),
+                    win.max_sfb,
+                );
+            }
+            self.apply_coupling(el, 1);
+            self.imdct_and_window(el.ch, &win);
+            self.apply_coupling(el, 3);
+        }
+
+        // SBR enhancement: replaces the 1024-sample core output with 2048
+        // samples per channel for the element the FIL data applied to.
+        if self.sbr_output_active {
+            if let Some((first, count)) = self.sbr_channels {
+                let nch = count.min(2);
+                if decoded[..decoded_count].iter().any(|d| d.ch == first) {
+                    let mut core = [
+                        self.channels_state[first].out.to_vec(),
+                        if nch == 2 {
+                            self.channels_state[first + 1].out.to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                    ];
+                    let id = if nch == 2 { 1 } else { 0 };
+                    let sbr = self.sbr.get_or_insert_with(|| sbr::Sbr::new(id));
+                    sbr.apply(id, &mut core, nch);
+                    for (c, dst_ch) in (first..first + nch).enumerate() {
+                        let dst = &mut self.channels_state[dst_ch].out;
+                        dst[..2048].copy_from_slice(&core[c][..2048]);
+                    }
+                    sbr_frame_out = Some((first, nch));
+                }
+            }
+        }
+
+        // Interleave into staging. For the fixed channel configurations the
+        // output follows the WAV channel order: the bitstream carries
+        // front-center first, while the convention is front pairs first
+        // (mappings verified against FFmpeg's decoder; see the round-trip
+        // conformance tests). PCE-configured and incomplete blocks keep
+        // bitstream element order. SBR-enhanced elements stage 2048
+        // samples per channel.
+        enum Order<'a> {
+            Borrowed(&'static [usize]),
+            Pce(&'a [u8]),
+            Element,
+        }
+        let frame_len = if sbr_frame_out.is_some() { 2048 } else { 1024 };
+        let order: Order = if self.pce_plan_len > 0 && block_count == self.channels {
+            Order::Pce(&self.pce_out_order[..self.channels])
+        } else if self.pce_plan_len == 0 && block_count == self.channels {
+            match self.channels {
+                1 => Order::Borrowed(&[0]),
+                2 => Order::Borrowed(&[0, 1]),
+                3 => Order::Borrowed(&[1, 2, 0]),
+                4 => Order::Borrowed(&[1, 2, 0, 3]),
+                5 => Order::Borrowed(&[1, 2, 0, 3, 4]),
+                6 => Order::Borrowed(&[1, 2, 0, 5, 3, 4]),
+                8 => Order::Borrowed(&[1, 2, 0, 7, 5, 6, 3, 4]),
+                _ => Order::Element,
+            }
+        } else {
+            Order::Element
+        };
+        match order {
+            Order::Borrowed(order) => {
+                for i in 0..frame_len {
+                    for &ch in order.iter().take(self.channels) {
+                        self.staged.push(self.channels_state[ch].out[i]);
+                    }
+                }
+            }
+            Order::Pce(order) => {
+                for i in 0..frame_len {
+                    for &ch in order.iter().take(self.channels) {
+                        self.staged.push(self.channels_state[ch as usize].out[i]);
+                    }
+                }
+            }
+            Order::Element => {
+                for i in 0..frame_len {
+                    for el in &decoded[..decoded_count] {
+                        self.staged.push(self.channels_state[el.ch].out[i]);
+                    }
+                }
+            }
+        }
+        for cce in &mut self.cces {
+            cce.coupled = false;
         }
         Ok(())
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn next_free_channel(
-        used: &[(usize, WindowInfo)],
-        channels: usize,
-    ) -> Result<usize, CadenceError> {
+    fn next_free_channel(used: &[BlockElem], channels: usize) -> Result<usize, CadenceError> {
         let mut used_flags = [false; MAX_CHANNELS];
-        for (ch, _) in used {
-            used_flags[*ch] = true;
+        for el in used {
+            used_flags[el.ch] = true;
         }
         for ch in 0..channels {
             if !used_flags[ch] {
@@ -674,6 +1079,430 @@ impl AacDecoder {
         Err(CadenceError::CorruptData(
             "more channels in the block than the configuration".to_string(),
         ))
+    }
+
+    /// cc_element (ISO/IEC 14496-3 4.6.8.2.2): decodes the coupling
+    /// channel's target list, gains, and its own individual channel stream.
+    /// The spectrum is consumed by coupling application, not windowed
+    /// (except for after-IMDCT coupling, which consumes time samples).
+    fn decode_cce(&mut self, br: &mut BitReader) -> Result<(), CadenceError> {
+        let _instance_tag = br.read_bits(4);
+        let slot = (0..self.cces.len())
+            .find(|&i| !self.cces[i].coupled)
+            .ok_or_else(|| {
+                CadenceError::UnsupportedFeature(
+                    "more coupling channels in one block than supported".to_string(),
+                )
+            })?;
+        {
+            let cce = &mut self.cces[slot];
+            cce.coupled = true;
+            cce.coupling_point = 2 * u8::from(br.read_bit());
+            cce.num_coupled = br.read_bits(3) as usize;
+            let mut num_gain = 0usize;
+            for c in 0..=cce.num_coupled {
+                num_gain += 1;
+                cce.ty[c] = if br.read_bit() { CPE as u8 } else { SCE as u8 };
+                cce.id_select[c] = br.read_bits(4) as u8;
+                if cce.ty[c] == CPE as u8 {
+                    cce.ch_select[c] = br.read_bits(2) as u8;
+                    if cce.ch_select[c] == 3 {
+                        num_gain += 1;
+                    }
+                } else {
+                    cce.ch_select[c] = 2;
+                }
+            }
+            cce.coupling_point += u8::from(br.read_bit() || cce.coupling_point >> 1 != 0);
+            cce.sign_and_scale = (u8::from(br.read_bit()), br.read_bits(2) as usize);
+            cce.num_gain = num_gain;
+        }
+
+        // The CCE's own individual channel stream, decoded through a spare
+        // channel slot (state swapped in and back out).
+        std::mem::swap(&mut self.channels_state[0], &mut self.cces[slot].state);
+        let win = self.decode_ics(br, 0, false, None);
+        std::mem::swap(&mut self.channels_state[0], &mut self.cces[slot].state);
+        let win = win?;
+        self.cces[slot].window = win;
+
+        // Coupling gains. Target 0 carries a unit gain; later targets are
+        // coded as scalefactor deltas against the running gain.
+        const CCE_SCALE: [f32; 4] = [
+            1.0905077,                // 2^(1/8)
+            1.1892071,                // 2^(1/4)
+            std::f32::consts::SQRT_2, // 2^(2/4)
+            2.0,                      // 2^(3/4)
+        ];
+        let (sign, scale_idx) = self.cces[slot].sign_and_scale;
+        let scale = CCE_SCALE[scale_idx];
+        let num_gain = self.cces[slot].num_gain;
+        let (point, max_sfb, num_groups) = {
+            let cce = &self.cces[slot];
+            (
+                cce.coupling_point,
+                cce.window.max_sfb,
+                cce.window.num_window_groups,
+            )
+        };
+        let mut gain = 0i32;
+        for c in 0..num_gain {
+            let mut cge = 1i32;
+            let mut gain_cache = 1.0f32;
+            if c > 0 {
+                cge = if point == 3 {
+                    1
+                } else {
+                    i32::from(br.read_bit())
+                };
+                gain = if cge == 1 {
+                    self.sf_book.decode_scalefactor_delta(br)?
+                } else {
+                    0
+                };
+                gain_cache = scale.powf(-(gain as f32));
+            }
+            // Malformed streams can declare more gain sets than target
+            // slots; the gain bits are still consumed for alignment, only
+            // the storage is skipped.
+            if c * 512 >= self.cces[slot].gain.len() {
+                continue;
+            }
+            if point == 3 {
+                self.cces[slot].gain[c * 512] = gain_cache;
+            } else {
+                let mut idx = 0usize;
+                // Stack copy (band_type is at most 512 entries): the gain
+                // writes below mutate `self.cces[slot]` through the loop.
+                let mut band_types = [0u8; 512];
+                band_types[..max_sfb * num_groups]
+                    .copy_from_slice(&self.cces[slot].state.band_type[..max_sfb * num_groups]);
+                for _ in 0..num_groups {
+                    for _sfb in 0..max_sfb {
+                        let band = band_types[idx];
+                        if band != ZERO_BT {
+                            if cge == 0 {
+                                let delta = self.sf_book.decode_scalefactor_delta(br)?;
+                                if delta != 0 {
+                                    let mut s = 1.0f32;
+                                    gain += delta;
+                                    let mut t = gain;
+                                    if sign != 0 {
+                                        s -= 2.0 * f32::from((t & 1) != 0);
+                                        t >>= 1;
+                                    }
+                                    gain_cache = scale.powf(-(t as f32)) * s;
+                                }
+                            }
+                            self.cces[slot].gain[c * 512 + idx.min(511)] = gain_cache;
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies every matching coupling channel to the target channel
+    /// element at `point` (0/1: dependent, spectral; 3: independent,
+    /// time-domain), mirroring the reference dispatcher's gain indexing.
+    fn apply_coupling(&mut self, target: &BlockElem, point: u8) {
+        let target_ty = if target.is_cpe { CPE as u8 } else { SCE as u8 };
+        for ci in 0..self.cces.len() {
+            let (coupled, cce_point) = (self.cces[ci].coupled, self.cces[ci].coupling_point);
+            if !coupled || cce_point != point {
+                continue;
+            }
+            let mut index = 0usize;
+            for c in 0..=self.cces[ci].num_coupled {
+                let (ty, id, sel) = (
+                    self.cces[ci].ty[c],
+                    self.cces[ci].id_select[c],
+                    self.cces[ci].ch_select[c],
+                );
+                if ty == target_ty && id == target.tag {
+                    if sel != 1 {
+                        self.apply_coupling_method(target.ch, ci, index, point);
+                        if sel != 0 {
+                            index += 1;
+                        }
+                    }
+                    if sel != 2 && target.is_cpe {
+                        self.apply_coupling_method(target.ch + 1, ci, index, point);
+                        index += 1;
+                    }
+                } else {
+                    index += 1 + usize::from(sel == 3);
+                }
+            }
+        }
+    }
+
+    /// One coupling application to one target channel (reference
+    /// `apply_dependent_coupling` / `apply_independent_coupling`).
+    fn apply_coupling_method(&mut self, target_ch: usize, cce_idx: usize, index: usize, point: u8) {
+        if point == 3 {
+            // Independent: add the CCE's time output scaled by gain[0].
+            let gain = self.cces[cce_idx].gain[index * 512];
+            let src: &[f32] = &self.cces[cce_idx].state.out;
+            let dst = &mut self.channels_state[target_ch].out;
+            for k in 0..1024 {
+                dst[k] += gain * src[k];
+            }
+            return;
+        }
+        // Dependent: add gain[band] * cce_coeff[band] over the CCE's
+        // non-zero bands, walking the CCE's window grouping.
+        let (max_sfb, num_groups) = {
+            let cce = &self.cces[cce_idx];
+            (cce.window.max_sfb, cce.window.num_window_groups)
+        };
+        let band_types: &[u8] = &self.cces[cce_idx].state.band_type[..max_sfb * num_groups];
+        let group_len: &[usize] = &self.cces[cce_idx].window.group_len;
+        let offsets: &[u16] = self.cces[cce_idx].window.swb_offsets();
+        let src: &[f32] = &self.cces[cce_idx].state.coeffs;
+        let gains: &[f32] = &self.cces[cce_idx].gain[index * 512..(index + 1) * 512];
+        let dst = &mut self.channels_state[target_ch].coeffs;
+        let mut idx = 0usize;
+        for group_len_g in group_len.iter().take(num_groups) {
+            for i in 0..max_sfb {
+                if band_types[idx] != ZERO_BT {
+                    let gain = gains[idx];
+                    for group in 0..*group_len_g {
+                        let base = group * 128 + offsets[i] as usize;
+                        let len = (offsets[i + 1] - offsets[i]) as usize;
+                        for k in 0..len {
+                            dst[base + k] += gain * src[base + k];
+                        }
+                    }
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    /// Resolves a channel element's tag to its output channel via the PCE
+    /// plan. PCE-configured streams map elements SOLELY by tag (reference:
+    /// `ff_aac_get_che`'s `tag_che_map`, where later entries overwrite
+    /// earlier ones, so the LAST matching entry wins).
+    fn pce_channel_for(
+        &self,
+        want_cpe: bool,
+        want_lfe: bool,
+        tag: u32,
+    ) -> Result<usize, CadenceError> {
+        let want_type = match (want_cpe, want_lfe) {
+            (true, _) => PCE_CPE,
+            (_, true) => PCE_LFE,
+            _ => PCE_SCE,
+        };
+        let mut found = None;
+        for i in 0..self.pce_plan_len {
+            if self.pce_plan_type[i] == want_type && self.pce_plan_tag[i] as u32 == tag {
+                found = Some(self.pce_plan_chan[i] as usize);
+            }
+        }
+        found.ok_or_else(|| {
+            CadenceError::CorruptData(format!(
+                "channel element tag {tag} is not in the program configuration"
+            ))
+        })
+    }
+
+    /// program_config_element (ISO/IEC 14496-3 4.4.4). Channel
+    /// configuration 0 streams are shaped by this element: it declares the
+    /// channel elements (front/side/back/LFE, each single or pair) that
+    /// the following raw data blocks carry, in decode order. The plan
+    /// persists until a new PCE redefines it.
+    fn decode_pce(&mut self, br: &mut BitReader) -> Result<(), CadenceError> {
+        let _instance_tag = br.read_bits(4);
+        let _object_type = br.read_bits(2);
+        let sfi = br.read_bits(4) as usize;
+        let num_front = br.read_bits(4) as usize;
+        let num_side = br.read_bits(4) as usize;
+        let num_back = br.read_bits(4) as usize;
+        let num_lfe = br.read_bits(2) as usize;
+        let num_assoc = br.read_bits(3) as usize;
+        let num_cc = br.read_bits(4) as usize;
+        let _mono_mixdown = br.read_bit();
+        if _mono_mixdown {
+            br.read_bits(4); // mono_mixdown_tag
+        }
+        let _stereo_mixdown = br.read_bit();
+        if _stereo_mixdown {
+            br.read_bits(4); // stereo_mixdown_tag
+        }
+        if br.read_bit() {
+            // matrix_mixdown_idx + pseudo_surround_enable
+            br.read_bits(3);
+        }
+
+        let mut plan_len = 0usize;
+        let mut total = 0usize;
+        for (count, ty) in [
+            (num_front, PCE_SCE),
+            (num_side, PCE_SCE),
+            (num_back, PCE_SCE),
+        ] {
+            for _ in 0..count {
+                if plan_len >= MAX_CHANNELS {
+                    return Err(CadenceError::CorruptData(
+                        "program configuration exceeds the channel limit".to_string(),
+                    ));
+                }
+                let is_cpe = br.read_bit();
+                let tag = br.read_bits(4) as u8;
+                self.pce_plan_type[plan_len] = if is_cpe { PCE_CPE } else { ty };
+                self.pce_plan_tag[plan_len] = tag;
+                self.pce_plan_chan[plan_len] = total as u8;
+                plan_len += 1;
+                total += 1 + usize::from(is_cpe);
+            }
+        }
+        for _ in 0..num_lfe {
+            if plan_len >= MAX_CHANNELS {
+                return Err(CadenceError::CorruptData(
+                    "program configuration exceeds the channel limit".to_string(),
+                ));
+            }
+            let tag = br.read_bits(4) as u8;
+            self.pce_plan_type[plan_len] = PCE_LFE;
+            self.pce_plan_tag[plan_len] = tag;
+            self.pce_plan_chan[plan_len] = total as u8;
+            plan_len += 1;
+            total += 1;
+        }
+        // Associated-data (4-bit tags) and coupling-element (is_ind_sw + 4-bit
+        // tag) lists are declarations only; the elements themselves, if any,
+        // appear in the raw data block and are rejected there.
+        br.skip_bits(4 * num_assoc + 5 * num_cc);
+        if sfi != self.sf_index {
+            log::warn!(
+                "PCE sampling frequency index {sfi} differs from the stream's index {}",
+                self.sf_index
+            );
+        }
+        br.byte_align();
+        let comment_bytes = br.read_bits(8) as usize;
+        br.skip_bytes(comment_bytes);
+
+        if total == 0 || total > MAX_CHANNELS {
+            return Err(CadenceError::CorruptData(
+                "program configuration channel count is out of range".to_string(),
+            ));
+        }
+        if self.pce_plan_len > 0 && total != self.channels {
+            return Err(CadenceError::UnsupportedFeature(
+                "PCE changes the channel configuration mid-stream".to_string(),
+            ));
+        }
+
+        let info = StreamInfo::new(Format::Aac, self.info.sample_rate, total as u16, 16);
+        info.validate()?;
+        self.info = info;
+        self.channels = total;
+        self.pce_plan_len = plan_len;
+        self.pce_class_counts = [num_front, num_side, num_back, num_lfe];
+        self.recompute_pce_out_order();
+        Ok(())
+    }
+
+    /// Rebuilds `pce_out_order` from the installed plan, mirroring the
+    /// reference's `sniff_channel_order`: elements get WAV channel
+    /// positions per class (front/side/back/LFE; a leading single takes
+    /// the class's center position, pairs take the left/right positions —
+    /// "wide" positions once a class holds more than three channels),
+    /// then entries stably sort by position.
+    fn recompute_pce_out_order(&mut self) {
+        if self.pce_plan_len == 0 {
+            for (i, slot) in self.pce_out_order.iter_mut().enumerate() {
+                *slot = i as u8;
+            }
+            return;
+        }
+        // WAV position bits per class row: leading single, wide pair,
+        // inner pair. FRONT: FC | FLOC FROC | FL FR; SIDE/BACK:
+        // (center unused) | SL SR | BL BR BC; LFE: LFE, LFE2.
+        const FRONT: [i64; 6] = [4, 64, 128, 1, 2, 0];
+        const SIDE: [i64; 6] = [0, 512, 1024, 16, 32, 256];
+        const LFE_ROW: [i64; 6] = [8, 1032, 0, 0, 0, 0];
+
+        let mut positions = [0i64; MAX_CHANNELS];
+        let mut entry = 0usize;
+        for (ci, count) in self.pce_class_counts.iter().enumerate() {
+            let row = match ci {
+                0 => FRONT,
+                1 | 2 => SIDE,
+                _ => LFE_ROW,
+            };
+            let mut nb = 0usize;
+            for k in 0..*count {
+                nb += 1 + usize::from(self.pce_plan_type[entry + k] == PCE_CPE);
+            }
+            if ci == 3 {
+                for (k, slot) in positions[entry..entry + *count].iter_mut().enumerate() {
+                    *slot = row[k];
+                }
+                entry += *count;
+                continue;
+            }
+            let mut j = 0usize;
+            while nb & 1 == 1 && entry < self.pce_plan_len {
+                positions[entry] = row[j];
+                entry += 1;
+                nb -= 1;
+                if row[j] == 0 {
+                    break;
+                }
+                j = if ci != 1 && nb <= 3 { 3 } else { 1 };
+            }
+            j = j.min(4);
+            while nb >= 2 && entry + 1 < self.pce_plan_len.max(MAX_CHANNELS) && j + 1 < row.len() {
+                if row[j] < 0 || row[j + 1] < 0 {
+                    break; // NONE sentinel: no more positions in this class
+                }
+                if self.pce_plan_type[entry] == PCE_CPE {
+                    positions[entry] = row[j] | row[j + 1];
+                    entry += 1;
+                } else if entry + 1 < self.pce_plan_len.max(MAX_CHANNELS) {
+                    positions[entry] = row[j];
+                    positions[entry + 1] = row[j + 1];
+                    entry += 2;
+                } else {
+                    break;
+                }
+                j += 2;
+                nb -= 2;
+            }
+        }
+
+        // Stable sort of (position, declaration index); a CPE entry sorts
+        // by its left position and expands to both channels.
+        let mut order: [(i64, u8); MAX_CHANNELS] = [(0, 0); MAX_CHANNELS];
+        for (i, o) in order.iter_mut().enumerate().take(self.pce_plan_len) {
+            *o = (positions[i], i as u8);
+        }
+        for i in 1..self.pce_plan_len {
+            let mut j = i;
+            while j > 0 && order[j - 1].0 > order[j].0 {
+                order.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        let mut out_slot = 0usize;
+        for &(_pos, entry) in order.iter().take(self.pce_plan_len) {
+            let chan = self.pce_plan_chan[entry as usize] as usize;
+            if out_slot >= MAX_CHANNELS {
+                break;
+            }
+            self.pce_out_order[out_slot] = chan as u8;
+            out_slot += 1;
+            if self.pce_plan_type[entry as usize] == PCE_CPE && out_slot < MAX_CHANNELS {
+                self.pce_out_order[out_slot] = (chan + 1) as u8;
+                out_slot += 1;
+            }
+        }
     }
 
     /// decode_ics_info (ISO/IEC 14496-3 Table 4.5).
@@ -712,10 +1541,18 @@ impl AacDecoder {
         } else {
             info.max_sfb = br.read_bits(6) as usize;
             info.num_swb = tables::NUM_SWB_1024[info.sf_index] as usize;
+            // predictor_data_present: for non-Main profiles this signals
+            // LTP data. The syntax must be consumed for alignment (lag 11
+            // bits, coefficient 3 bits, one used-bit per scalefactor band
+            // up to 40), but LTP is not applied outside the LTP profile —
+            // matching the reference decoder.
             if br.read_bit() {
-                return Err(CadenceError::UnsupportedFeature(
-                    "prediction/LTP is not part of AAC-LC".to_string(),
-                ));
+                br.read_bits(11);
+                br.read_bits(3);
+                let used_bands = info.max_sfb.min(40);
+                for _ in 0..used_bands {
+                    br.read_bit();
+                }
             }
         }
 
@@ -744,33 +1581,12 @@ impl AacDecoder {
         pre_window: Option<WindowInfo>,
     ) -> Result<WindowInfo, CadenceError> {
         let global_gain = br.read_bits(8);
-        if std::env::var("AAC_DEBUG").is_ok() {
-            eprintln!("[ics ch{ch}] gg={global_gain} at bit {}", br.pos());
-        }
         let win = match pre_window {
             Some(w) => w,
             None => self.decode_ics_info(br, ch)?,
         };
-        if std::env::var("AAC_DEBUG").is_ok() {
-            eprintln!(
-                "[ics ch{ch}] after info: seq={} max_sfb={} at bit {}",
-                win.sequence,
-                win.max_sfb,
-                br.pos()
-            );
-        }
         self.decode_band_types(br, ch, &win)?;
         self.decode_scalefactors(br, ch, global_gain, &win)?;
-        if std::env::var("AAC_DEBUG").is_ok() {
-            let n = win.max_sfb * win.num_window_groups;
-            let state = &self.channels_state[ch];
-            let bands: Vec<u8> = state.band_type[..n].to_vec();
-            let sfs: Vec<i32> = state.sfo[..n].to_vec();
-            eprintln!(
-                "[ics ch{ch}] gg={global_gain} seq={} max_sfb={} bands={:?} sfo={:?}",
-                win.sequence, win.max_sfb, bands, sfs
-            );
-        }
         let pulse = self.decode_optional_tools(br, ch, &win)?;
         self.decode_spectral(br, ch, &win, pulse.as_ref())?;
         Ok(win)
@@ -1000,9 +1816,12 @@ impl AacDecoder {
                             }
                         }
                         NOISE_BT => {
-                            // Reference scalefactors are negative; the noise
-                            // band gain inherits that sign.
-                            self.noise.fill_scaled(out, -gain);
+                            // The noise band gain is the same dequantized
+                            // 2^(sfo/4) as any other band: this decoder's
+                            // MDCT kernel already carries the global −1 that
+                            // the reference expresses as a negative sf
+                            // (negating here too would invert the noise).
+                            self.noise.fill_scaled(out, gain);
                         }
                         cb => {
                             let book = &self.spectral_books[(cb - 1) as usize];
@@ -1021,12 +1840,6 @@ impl AacDecoder {
                                 let list_index = book.decode(br)?;
                                 let packed =
                                     idx_table.get(list_index as usize).copied().unwrap_or(0) as u32;
-                                if std::env::var("AAC_TRACE").is_ok()
-                                    && window_base == 0
-                                    && (band_type == 2 || band_type == 13)
-                                {
-                                    eprintln!("[tr] p={} wb={window_base} sfb={sfb} sym={list_index} packed={packed:#06x}", br.pos());
-                                }
 
                                 if cb <= 4 {
                                     // Quads: 2-bit value fields, low bits =
@@ -1047,7 +1860,11 @@ impl AacDecoder {
                                         // consumed in dim order over the
                                         // nonzero dims.
                                         let nnz = (packed >> 8) & 15;
-                                        let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
+                                        let mut sign_bits = if nnz == 0 {
+                                            0
+                                        } else {
+                                            br.read_bits(nnz) << (32 - nnz)
+                                        };
                                         for d in 0..4 {
                                             let vi = (packed >> (2 * d)) & 3;
                                             let mut mag = tables::CODEBOOK_VALS_10_16
@@ -1063,10 +1880,27 @@ impl AacDecoder {
                                             out[k + d] = mag * gain;
                                         }
                                     }
+                                } else if cb <= 6 {
+                                    // Signed pairs (ISO codebooks 5/6): the
+                                    // sign is part of the value table; no
+                                    // sign bits in the bitstream (reference
+                                    // `VMUL2` with `codebook_vector4_vals`).
+                                    for d in 0..2 {
+                                        let vi = (packed >> (4 * d)) & 15;
+                                        let mag = tables::CODEBOOK_VALS_SIGNED_PAIR
+                                            .get(vi as usize)
+                                            .copied()
+                                            .unwrap_or(0.0);
+                                        out[k + d] = mag * gain;
+                                    }
                                 } else if cb <= 10 {
                                     // Unsigned pairs with nnz sign bits.
                                     let nnz = (packed >> 8) & 15;
-                                    let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
+                                    let mut sign_bits = if nnz == 0 {
+                                        0
+                                    } else {
+                                        br.read_bits(nnz) << (32 - nnz)
+                                    };
                                     for d in 0..2 {
                                         let vi = (packed >> (4 * d)) & 15;
                                         let mut mag = tables::CODEBOOK_VALS_10_16
@@ -1094,7 +1928,11 @@ impl AacDecoder {
                                     // dims.
                                     let nnz = (packed >> 12) & 15;
                                     let esc_mask = (packed >> 8) & 15;
-                                    let mut sign_bits = br.read_bits(nnz) << (32 - nnz);
+                                    let mut sign_bits = if nnz == 0 {
+                                        0
+                                    } else {
+                                        br.read_bits(nnz) << (32 - nnz)
+                                    };
                                     for d in 0..2 {
                                         let vi = (packed >> (4 * d)) & 15;
                                         let escaped = (esc_mask >> d) & 1 == 1;
@@ -1138,9 +1976,6 @@ impl AacDecoder {
             window_base += group_len;
         }
 
-        if std::env::var("AAC_DEBUG").is_ok() {
-            eprintln!("[spec ch{ch}] first 16: {:?}", &coeffs[..16]);
-        }
         // Pulses modify specific quantized coefficients; applied in the
         // dequantized domain like the reference decoder.
         if let Some(pulse) = pulse {
@@ -1321,11 +2156,6 @@ impl AacDecoder {
     }
 }
 
-/// Little-endian bytes of an f32 slice (AAC_DUMP debug-dump helper).
-fn f32_slice_bytes(slice: &[f32]) -> Vec<u8> {
-    slice.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
 impl Decoder for AacDecoder {
     fn info(&self) -> &StreamInfo {
         &self.info
@@ -1337,6 +2167,8 @@ impl Decoder for AacDecoder {
         // real-time safe.)
         self.source.seek_to(0)?;
         self.pending_header = None;
+        self.raw_pos = 0;
+        self.raw_len = 0;
         self.staged.clear();
         self.staged_pos = 0;
         self.eof = false;
@@ -1364,6 +2196,18 @@ impl Decoder for AacDecoder {
     }
 
     fn decode(&mut self, buffer: &mut [f32]) -> Result<usize, CadenceError> {
+        if self.channels == 0 {
+            // Channel configuration 0: the first PCE configures the channel
+            // count. Decode frames until it arrives; the configuring
+            // frame's own output is kept in staging.
+            while self.channels == 0 {
+                self.staged.clear();
+                self.staged_pos = 0;
+                if !self.decode_next_frame()? {
+                    return Ok(0);
+                }
+            }
+        }
         let channels = self.channels;
         if buffer.len() % channels != 0 {
             return Err(CadenceError::InvalidFormat(format!(

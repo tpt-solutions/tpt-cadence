@@ -40,6 +40,7 @@ pub mod decoder;
 pub mod huffman;
 pub mod imdct;
 pub mod pns;
+pub mod sbr;
 pub mod stereo;
 pub mod tables;
 pub mod tns;

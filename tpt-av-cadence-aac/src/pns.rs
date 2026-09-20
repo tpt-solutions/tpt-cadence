@@ -15,6 +15,16 @@ impl NoiseGenerator {
         NoiseGenerator { state: 0x1f2e_3d4c }
     }
 
+    /// Current LCG state (for snapshotting around speculative parses).
+    pub fn state(&self) -> u32 {
+        self.state
+    }
+
+    /// Restores a previously snapshotted LCG state.
+    pub fn set_state(&mut self, state: u32) {
+        self.state = state;
+    }
+
     /// Next raw LCG value (wrapping 32-bit).
     pub fn next_u32(&mut self) -> u32 {
         self.state = self

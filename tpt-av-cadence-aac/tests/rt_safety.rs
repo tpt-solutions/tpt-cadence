@@ -1,14 +1,14 @@
-//! Real-time-safety verification for the Vorbis decoder: after `open()`,
+//! Real-time-safety verification for the AAC-LC decoder: after `open()`,
 //! `Decoder::decode` must perform zero allocations on successful calls
-//! (the crate's RT contract; error paths may format messages).
+//! (error paths may format messages; accepted project-wide).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use tpt_av_cadence_aac::AacDecoder;
 use tpt_av_cadence_core::Decoder;
-use tpt_av_cadence_vorbis::VorbisDecoder;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static COUNTING: AtomicUsize = AtomicUsize::new(0);
@@ -45,24 +45,17 @@ static A: Counting = Counting;
 fn decode_is_allocation_free_after_init() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     let mut fixtures = 0usize;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("ogg") {
-            continue;
-        }
-        let data = std::fs::read(&path).unwrap();
-        let mut decoder = VorbisDecoder::open(Box::new(Cursor::new(data.clone()))).unwrap();
+    for name in ["test.aac", "tone.aac"] {
+        let data = std::fs::read(dir.join(name)).unwrap();
+        let mut decoder = AacDecoder::from_source(Box::new(Cursor::new(data))).unwrap();
 
-        // Prime once (headers, first audio packets, any lazy setup), then
-        // count allocations across a full decode sweep with per-call
-        // accounting so error-path formatting stays exempt.
         let channels = decoder.info().channels as usize;
-        let mut priming = vec![0.0f32; 8192 * channels];
+        let mut priming = vec![0.0f32; 2048 * channels];
         let _ = decoder.decode(&mut priming).unwrap();
 
         let mut worst = 0usize;
         let mut total = 0usize;
-        let mut buf = vec![0.0f32; 8192 * channels];
+        let mut buf = vec![0.0f32; 2048 * channels];
         COUNTING.store(1, Ordering::Relaxed);
         loop {
             ALLOCATIONS.store(0, Ordering::Relaxed);
@@ -77,14 +70,12 @@ fn decode_is_allocation_free_after_init() {
         }
         COUNTING.store(0, Ordering::Relaxed);
 
-        assert!(total > 0, "{}: decode produced no audio", path.display());
+        assert!(total > 0, "{name}: decode produced no audio");
         assert_eq!(
-            worst,
-            0,
-            "{}: a successful decode allocated {worst} times (real-time contract violation)",
-            path.display()
+            worst, 0,
+            "{name}: a successful decode allocated {worst} times (real-time contract violation)"
         );
         fixtures += 1;
     }
-    assert!(fixtures >= 9, "expected the nine bundled fixtures");
+    assert_eq!(fixtures, 2);
 }

@@ -281,6 +281,14 @@ pub const CODEBOOK_VALS_10_16: [f32; 16] = [
     16.0000000, 18.7207544, 21.5443469, 24.4637810, 27.4731418, 30.5673509, 33.7419917, 36.9931811,
 ];
 
+/// Signed-pair values for codebooks 5 and 6 (reference
+/// `codebook_vector4_vals`): the sign is part of the table; these books read
+/// no sign bits from the bitstream.
+pub const CODEBOOK_VALS_SIGNED_PAIR: [f32; 9] = [
+    -6.3496042, -4.3267487, -2.5198421, -1.0000000, 0.0000000, 1.0000000, 2.5198421, 4.3267487,
+    6.3496042,
+];
+
 pub const TNS_TMP2_MAP_0_3: [f32; 8] = [
     0.00000000,
     -0.43388373,

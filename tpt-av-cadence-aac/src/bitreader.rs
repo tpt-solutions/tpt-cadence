@@ -71,6 +71,19 @@ impl<'a> BitReader<'a> {
         self.pos = (self.pos + 7) & !7;
     }
 
+    /// Restores an exact bit position (used to undo rounded-up reads).
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    /// Skips `n` bits (used by declared-but-unsupported field lists).
+    pub fn skip_bits(&mut self, n: usize) {
+        self.pos += n;
+        if self.pos >> 3 > self.bytes.len() {
+            self.overread = true;
+        }
+    }
+
     /// Skips `n` bytes (used by fill/data-stream elements).
     pub fn skip_bytes(&mut self, n: usize) {
         self.pos += n * 8;

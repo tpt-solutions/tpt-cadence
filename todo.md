@@ -124,25 +124,53 @@ application at all three reference coupling points. PCE-configured
 streams additionally output in the sniffed WAV channel order (reference
 `sniff_channel_order` semantics: class positions, stable sort).
 
-Remaining known gaps (hardening, not blockers): SBR/PS absent (HE-AAC
-decodes core-only), and the four multichannel FATE items' residual
-(al06/al07/al15/al22, 2-53 dB): frame-level forensics narrowed it to the
-coupling/intensity interaction in PCE multichannel streams — the failing
-channels are exactly the coupling targets (e.g. al07 frame 189+: FL and
-the back pair degrade while the uncoupled FR/FC/LFE stay at 126-131 dB),
-and TNS was ruled out (its applications in these items are order-0
-no-ops; the 44.1kHz items with real TNS filters pass at 125-128 dB). My
-dispatcher and gain indexing match FFmpeg's source exactly, so the
-divergent detail needs an oracle-coefficients comparison (instrument
-FFmpeg to dump coupling gains and target spectra for one frame). Final
-quantification (al07): the transition frames at coupling-mode changes sit
-at reference rms 0.00002 (near digital silence, err ~1e-5), and steady
-state matches at corr >= 0.9998 with absolute errors ~3e-5 on channels of
-rms 0.003-0.02 — inaudible-level residuals whose cause is a subtle
-coupling-ordering detail, not a structural error. LTP data
-is parsed for alignment but not applied (matching the reference for LC
-streams), error paths still allocate (accepted project-wide), and the
-O(M^2) IMDCT is slow in debug builds (release is real-time).
+SBR (HE-AAC) is now implemented — the fourth major effort of this crate.
+A new `sbr` module ports the reference decoder line-for-line: bitstream
+parsing (header/grid/dtdf/invf/envelope/noise/harmonics, ten Huffman
+tables), frequency-table derivation (master/derived tables, patch
+construction, limiter bands), dequantization with coupled-stereo balance,
+envelope estimation, gain calculation with limiter boost, chirp inverse
+filtering, HF generation/assembly with smoothing and sinusoid addition,
+and the 64-band QMF analysis/synthesis pair on a dedicated 64-point MDCT
+matching the reference transform's exact semantics (f64 accumulation).
+Detecting an SBR fill element doubles the output rate and stages 2048
+samples per channel; decode() stays allocation-free. Verification went
+deeper than the usual SNR loops: the QMF filterbank and the full
+frequency-table derivation were checked against an INDEPENDENT BUILD of
+the reference C implementation (av_tx + aacsbr + sbrdsp compiled
+standalone), matching coefficient-for-coefficient, and those values are
+pinned as unit tests. Four real port bugs fell out of the line-by-line
+audit: the QMF analysis result was never committed to the per-channel
+history (the low band was built from two-frames-old data), the sinusoid
+addition branch used wrong band indexing and a wrong sign derivation, the
+noise-floor index was double-incremented per envelope, and the patch
+construction inner loop read the next master-band entry before testing
+the loop condition (the C tests the PREVIOUS sb first) — which failed
+patch construction on every reset and silently collapsed HE-AAC to pure
+upsampling. Whole-file SNR against FFmpeg's HE-AAC decode went from 0 dB
+(pre-fix) to ~22 dB, and that fidelity is gated (>20 dB) in the FATE
+conformance test alongside structural checks for the 5.1 and full-rate
+SBR samples.
+
+Remaining SBR gap: the ~22 dB residual is uniform across frames and
+bands (coherence ~0.999 in the lowest core bands, degrading with
+frequency; ~0.88 in the enhancement band). The filterbank, tables, and
+all kernels are verified, the parsed spectrum parameters match the
+bitstream, and this stream's core is all-Huffman (no PNS/TNS), so the
+divergence must sit in either a subtle core-side difference this stream
+exposes or a residual stage-level difference (candidate: the limiter/
+envelope interaction). Next forensic step: instrument the standalone C
+build to dump per-stage intermediates (X_low, e_curr, gains) for one
+frame and diff against the Rust stage-by-stage. PS (HE-AACv2) remains
+unimplemented; 5.1/7.1 HE-AAC applies only the first element's SBR
+payload (one SBR context per decoder, not per channel element).
+
+Other remaining gaps (hardening, not blockers): the four multichannel
+FATE items' residual (al06/al07/al15/al22, 2-53 dB): frame-level
+forensics narrowed it to the coupling/intensity interaction in PCE
+multichannel streams — the failing channels are exactly the coupling
+targets (e.g. al07 frame 189+: FL and the back pair degrade while the
+uncoupled FR/
 
 
 ## Phase 3 — Modern Compressed
