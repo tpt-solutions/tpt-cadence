@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  schedule:
+    # Nightly fuzz run (03:00 UTC) — see the `fuzz` job below.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,3 +60,50 @@ jobs:
 
       - name: cargo-deny license audit
         run: cargo deny check licenses
+
+  # Nightly (scheduled) fuzz sweep. Also runs on manual dispatch, but not on
+  # every push/PR — each target gets a fixed time budget rather than gating
+  # normal CI latency on fuzzing.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aac_adts
+          - aiff_decode
+          - flac_decode
+          - mp3_decode
+          - ogg_pages
+          - opus_decode
+          - opus_ogg_decode
+          - opus_packet
+          - vorbis_stream
+          - wav_decode
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Restore corpus cache
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz ${{ matrix.target }} (5 min)
+        working-directory: fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

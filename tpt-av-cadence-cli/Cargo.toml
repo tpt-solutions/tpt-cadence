@@ -1,0 +1,27 @@
+[package]
+name = "tpt-av-cadence-cli"
+description = "Unified command-line tool for the tpt-cadence audio codec suite: format auto-detection, stream inspection, and decode-to-WAV."
+readme = "README.md"
+keywords = ["audio", "codec", "decoder", "cli"]
+categories = ["multimedia::audio", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "cadence"
+path = "src/main.rs"
+
+[dependencies]
+tpt-av-cadence-core = { workspace = true }
+tpt-av-cadence-pcm = { path = "../tpt-av-cadence-pcm" }
+tpt-av-cadence-wav = { path = "../tpt-av-cadence-wav" }
+tpt-av-cadence-aiff = { path = "../tpt-av-cadence-aiff" }
+tpt-av-cadence-flac = { path = "../tpt-av-cadence-flac" }
+tpt-av-cadence-opus = { path = "../tpt-av-cadence-opus" }
+tpt-av-cadence-aac = { path = "../tpt-av-cadence-aac" }
+tpt-av-cadence-mp3 = { path = "../tpt-av-cadence-mp3" }
+tpt-av-cadence-vorbis = { path = "../tpt-av-cadence-vorbis" }

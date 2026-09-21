@@ -12,6 +12,7 @@ members = [
     "tpt-av-cadence-mp3",
     "tpt-av-cadence-vorbis",
     "tpt-av-cadence-test-utils",
+    "tpt-av-cadence-cli",
 ]
 exclude = ["fuzz"]
 

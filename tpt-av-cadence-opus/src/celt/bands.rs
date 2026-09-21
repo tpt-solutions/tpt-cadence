@@ -28,8 +28,8 @@ use super::rate::{
     QTHETA_OFFSET_TWOPHASE,
 };
 use super::tables::{EBAND5MS, LOGN400};
-use super::vq::{alg_unquant, renormalise_vector, SPREAD_AGGRESSIVE};
-use crate::range::RangeDecoder;
+use super::vq::{alg_quant, alg_unquant, renormalise_vector, SPREAD_AGGRESSIVE};
+use crate::range::{RangeDecoder, RangeEncoder};
 
 /// `Q15ONE` (float build).
 pub(crate) const Q15ONE: f32 = 1.0;
@@ -465,6 +465,108 @@ fn compute_theta(
     })
 }
 
+/// Encode-side counterpart of [`compute_theta`], **scoped to mono,
+/// non-transient bands** (`stereo == false`, `b0 <= 1` — matching this
+/// crate's current encoder milestone; see `todo.md`). That scope means
+/// only two of `compute_theta`'s cases are reachable: `qn == 1` (itheta
+/// forced to 0, no bits — the same fallthrough the decoder takes since the
+/// `else if stereo` branch never applies here) and the triangular-pdf
+/// entropy path for `qn != 1` (the `stereo && n > 2` step-coded path and
+/// the `b0 > 1 || stereo` uniform path are for time-split/stereo bands,
+/// out of scope for now).
+///
+/// Unlike the decoder (which discovers `itheta` from the bitstream), the
+/// encoder derives it from the actual energy split between `x0` and `x1`
+/// (`itheta = 2/pi * atan2(|x1|, |x0|)` in the same Q14 units the decoder
+/// uses), quantizes it to the `qn`-level grid, and encodes that level with
+/// [`encode_theta_triangular`] — the exact bijective inverse of the
+/// decoder's triangular-pdf search (verified in `tests` below).
+fn compute_theta_encode(
+    ctx: &mut BandCtx,
+    enc: &mut RangeEncoder,
+    n: usize,
+    b: &mut i32,
+    x0: &[f32],
+    x1: &[f32],
+    bs: usize,
+    lm: i32,
+    fill: &mut u32,
+) -> SplitCtx {
+    let i = ctx.i;
+    let pulse_cap = LOGN400[i] as i32 + lm * (1 << BITRES);
+    let offset = (pulse_cap >> 1) - QTHETA_OFFSET;
+    let qn = compute_qn(n, *b, offset, pulse_cap, false);
+
+    let tell = enc.tell_frac();
+    let mut level = 0i32;
+    if qn != 1 {
+        let norm0: f64 = x0
+            .iter()
+            .map(|&v| (v as f64) * (v as f64))
+            .sum::<f64>()
+            .sqrt();
+        let norm1: f64 = x1
+            .iter()
+            .map(|&v| (v as f64) * (v as f64))
+            .sum::<f64>()
+            .sqrt();
+        let theta = if norm0 == 0.0 && norm1 == 0.0 {
+            0.0
+        } else {
+            norm1.atan2(norm0)
+        };
+        let theta_q14 = theta * (2.0 / std::f64::consts::PI) * 16384.0;
+        level = (theta_q14 * qn as f64 / 16384.0).round() as i32;
+        level = level.clamp(0, qn);
+        encode_theta_triangular(enc, qn, level);
+    }
+    let itheta = celt_udiv((level * 16384) as u32, qn.max(1) as u32) as i32;
+    let qalloc = enc.tell_frac() as i32 - tell as i32;
+    *b -= qalloc;
+
+    let (imid, iside, delta);
+    if itheta == 0 {
+        imid = 32767;
+        iside = 0;
+        *fill &= (1u32 << bs).wrapping_sub(1);
+        delta = -16384;
+    } else if itheta == 16384 {
+        imid = 0;
+        iside = 32767;
+        *fill &= ((1u32 << bs).wrapping_sub(1)) << bs;
+        delta = 16384;
+    } else {
+        imid = bitexact_cos(itheta as i16);
+        iside = bitexact_cos((16384 - itheta) as i16);
+        delta = frac_mul16(((n - 1) << 7) as i32, bitexact_log2tan(iside, imid));
+    }
+    SplitCtx {
+        inv: false,
+        imid,
+        iside,
+        delta,
+        itheta,
+        qalloc,
+    }
+}
+
+/// Encodes `x` (an integer level in `0..=qn`) with the same triangular pdf
+/// [`compute_theta`]'s decode path decodes: `ft = ((qn>>1)+1)^2`, and (by
+/// direct inversion of that decode search) `(fl, fs) = (x(x+1)/2, x+1)` for
+/// `x <= qn>>1`, or the mirror image for `x > qn>>1`. The two halves are
+/// exact complements — verified by an exhaustive round trip in `tests`
+/// below (every `x` in `0..=qn` for a range of `qn`).
+fn encode_theta_triangular(enc: &mut RangeEncoder, qn: i32, x: i32) {
+    let ft = ((qn >> 1) + 1) * ((qn >> 1) + 1);
+    let (fl, fs) = if x <= qn >> 1 {
+        (x * (x + 1) >> 1, x + 1)
+    } else {
+        let fs = qn + 1 - x;
+        (ft - (fs * (fs + 1) >> 1), fs)
+    };
+    enc.encode(fl as u32, (fl + fs) as u32, ft as u32);
+}
+
 /// `quant_band_n1`: the special case for one-sample bands (a raw sign per
 /// channel).
 fn quant_band_n1(
@@ -492,6 +594,29 @@ fn quant_band_n1(
         lb[0] = x[0];
     }
     Ok(())
+}
+
+/// Encode-side counterpart of [`quant_band_n1`]: writes the actual sign of
+/// `x[0]` (mono only, matching this crate's current encoder scope).
+fn quant_band_n1_encode(
+    ctx: &mut BandCtx,
+    enc: &mut RangeEncoder,
+    x: &mut [f32],
+    lowband_out: Option<&mut [f32]>,
+) {
+    // No bits available to signal the sign: the decoder assumes positive,
+    // so the encoder must reconstruct the same value regardless of the
+    // real target's sign.
+    if ctx.remaining_bits >= 1 << BITRES {
+        enc.write_raw_bits(u32::from(x[0] < 0.0), 1);
+        ctx.remaining_bits -= 1 << BITRES;
+        x[0] = if x[0] < 0.0 { -1.0 } else { 1.0 };
+    } else {
+        x[0] = 1.0;
+    }
+    if let Some(lb) = lowband_out {
+        lb[0] = x[0];
+    }
 }
 
 static BIT_INTERLEAVE: [u32; 16] = [0, 1, 1, 1, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3];
@@ -702,6 +827,201 @@ fn quant_partition(
     }
 }
 
+/// Encode-side counterpart of [`quant_partition`], scoped to mono
+/// (`stereo == false`, matching [`compute_theta_encode`]'s scope — see its
+/// doc comment). Structurally an exact mirror of the decoder: the same
+/// split threshold (`cache`-based), the same bit accounting
+/// (`bits2pulses`/`pulses2bits`), and the same no-pulse noise/fold
+/// resynthesis (driven only by `ctx.seed`, so it needs no bitstream I/O
+/// and is copied verbatim). The only real *encoder* decision is the split
+/// angle itself, made by [`compute_theta_encode`] from the actual `x0`/`x1`
+/// energies; everything else here just has to stay bit-for-bit consistent
+/// with what [`quant_partition`] will reconstruct.
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
+fn quant_partition_encode(
+    ctx: &mut BandCtx,
+    enc: &mut RangeEncoder,
+    x: &mut [f32],
+    n: usize,
+    mut b: i32,
+    b_blocks: usize,
+    mut lowband: Option<&mut [f32]>,
+    lm: i32,
+    gain: f32,
+    mut fill: u32,
+    htmp: &mut [f32],
+    iy: &mut [i32],
+) -> u32 {
+    let i = ctx.i;
+    let spread = ctx.spread;
+    let b0 = b_blocks;
+
+    let cache = cache_bits_row(i, lm + 1);
+    if lm != -1 && b > cache[cache[0] as usize] as i32 + 12 && n > 2 {
+        let n2 = n >> 1;
+        let (x0, x1) = x.split_at_mut(n2);
+        let lm2 = lm - 1;
+        if b_blocks == 1 {
+            fill = (fill & 1) | (fill << 1);
+        }
+        let b2 = (b_blocks + 1) >> 1;
+
+        let sctx = compute_theta_encode(ctx, enc, n2, &mut b, x0, x1, b2, lm2, &mut fill);
+        let imid = (1.0f32 / 32768.0) * sctx.imid as f32;
+        let iside = (1.0f32 / 32768.0) * sctx.iside as f32;
+        let mut delta = sctx.delta;
+        let itheta = sctx.itheta;
+        let qalloc = sctx.qalloc;
+
+        if b0 > 1 && (itheta & 0x3fff) != 0 {
+            if itheta > 8192 {
+                delta -= delta >> (4 - lm2);
+            } else {
+                delta = 0.min(delta + ((n2 << BITRES) >> (5 - lm2) as u32) as i32);
+            }
+        }
+        let mut mbits = 0.max(b.min((b - delta) / 2));
+        let mut sbits = b - mbits;
+        ctx.remaining_bits -= qalloc;
+
+        let (lb1, lb2) = match lowband.take() {
+            Some(lb) => {
+                let (a, c) = lb.split_at_mut(n2);
+                (Some(a), Some(c))
+            }
+            None => (None, None),
+        };
+
+        let mut rebalance = ctx.remaining_bits;
+        if mbits >= sbits {
+            let c1 = quant_partition_encode(
+                ctx,
+                enc,
+                x0,
+                n2,
+                mbits,
+                b2,
+                lb1,
+                lm2,
+                gain * imid,
+                fill,
+                htmp,
+                iy,
+            );
+            rebalance = mbits - (rebalance - ctx.remaining_bits);
+            if rebalance > 3 << BITRES && itheta != 0 {
+                sbits += rebalance - (3 << BITRES);
+            }
+            c1 | (quant_partition_encode(
+                ctx,
+                enc,
+                x1,
+                n2,
+                sbits,
+                b2,
+                lb2,
+                lm2,
+                gain * iside,
+                fill >> b2,
+                htmp,
+                iy,
+            ) << (b0 >> 1))
+        } else {
+            let c1 = quant_partition_encode(
+                ctx,
+                enc,
+                x1,
+                n2,
+                sbits,
+                b2,
+                lb2,
+                lm2,
+                gain * iside,
+                fill >> b2,
+                htmp,
+                iy,
+            ) << (b0 >> 1);
+            rebalance = sbits - (rebalance - ctx.remaining_bits);
+            if rebalance > 3 << BITRES && itheta != 16384 {
+                mbits += rebalance - (3 << BITRES);
+            }
+            c1 | quant_partition_encode(
+                ctx,
+                enc,
+                x0,
+                n2,
+                mbits,
+                b2,
+                lb1,
+                lm2,
+                gain * imid,
+                fill,
+                htmp,
+                iy,
+            )
+        }
+    } else {
+        // This is the basic no-split case.
+        let mut q = bits2pulses(i, lm, b);
+        let mut curr_bits = pulses2bits(i, lm, q);
+        ctx.remaining_bits -= curr_bits;
+
+        while ctx.remaining_bits < 0 && q > 0 {
+            ctx.remaining_bits += curr_bits;
+            q -= 1;
+            curr_bits = pulses2bits(i, lm, q);
+            ctx.remaining_bits -= curr_bits;
+        }
+
+        if q != 0 {
+            let k = get_pulses(q);
+            alg_quant(
+                &mut x[..n],
+                &mut iy[..n],
+                k,
+                spread,
+                b_blocks,
+                enc,
+                gain,
+                true,
+            )
+        } else {
+            // No pulses: fold/synthesize noise exactly like the decoder
+            // (pure function of `ctx.seed`, no bitstream I/O either side).
+            let cm_mask = (1u32 << b_blocks).wrapping_sub(1);
+            fill &= cm_mask;
+            if fill == 0 {
+                x[..n].fill(0.0);
+                0
+            } else {
+                let cm = match lowband {
+                    None => {
+                        for j in 0..n {
+                            ctx.seed = celt_lcg_rand(ctx.seed);
+                            x[j] = ((ctx.seed as i32) >> 20) as f32;
+                        }
+                        cm_mask
+                    }
+                    Some(lb) => {
+                        for j in 0..n {
+                            ctx.seed = celt_lcg_rand(ctx.seed);
+                            let tmp = if ctx.seed & 0x8000 != 0 {
+                                1.0f32 / 256.0
+                            } else {
+                                -(1.0f32 / 256.0)
+                            };
+                            x[j] = lb[j] + tmp;
+                        }
+                        fill
+                    }
+                };
+                renormalise_vector(&mut x[..n], gain);
+                cm
+            }
+        }
+    }
+}
+
 /// `quant_band`: decodes one band for the mono case (with the time /
 /// frequency recombination pre/post-processing around `quant_partition`).
 #[allow(clippy::too_many_arguments)]
@@ -828,6 +1148,60 @@ fn quant_band(
         }
     }
     Ok(cm & ((1u32 << b_final) - 1))
+}
+
+/// Encode-side counterpart of [`quant_band`], **scoped to non-transient,
+/// single-block mono** (`b_blocks == 1` and `ctx.tf_change == 0` — no
+/// transient detection or TF analysis exists in this crate's encoder yet;
+/// see `todo.md`). Under that precondition `quant_band`'s recombine/
+/// time-divide/Hadamard machinery is all dead code (every gate depends on
+/// `tf_change` or `b0_orig > 1`, both excluded here), so this reduces to:
+/// handle `n == 1` specially, otherwise call [`quant_partition_encode`]
+/// directly and scale the result into `lowband_out`. Panics (debug-only,
+/// via `debug_assert!`) if called outside that scope rather than silently
+/// producing a bitstream the full decoder wouldn't reconstruct correctly.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn quant_band_encode(
+    ctx: &mut BandCtx,
+    enc: &mut RangeEncoder,
+    x: &mut [f32],
+    n: usize,
+    b: i32,
+    b_blocks: usize,
+    lowband: Option<&mut [f32]>,
+    lm: i32,
+    lowband_out: Option<&mut [f32]>,
+    gain: f32,
+    fill: u32,
+    htmp: &mut [f32],
+    iy: &mut [i32],
+) -> u32 {
+    debug_assert_eq!(
+        b_blocks, 1,
+        "quant_band_encode: only b_blocks == 1 is implemented"
+    );
+    debug_assert_eq!(
+        ctx.tf_change, 0,
+        "quant_band_encode: only tf_change == 0 is implemented"
+    );
+    let n0 = n;
+
+    if n == 1 {
+        quant_band_n1_encode(ctx, enc, x, lowband_out);
+        return 1;
+    }
+
+    let cm = quant_partition_encode(
+        ctx, enc, x, n, b, b_blocks, lowband, lm, gain, fill, htmp, iy,
+    );
+
+    if let Some(lb) = lowband_out {
+        let nn = celt_sqrt(n0 as f32);
+        for j in 0..n0 {
+            lb[j] = nn * x[j];
+        }
+    }
+    cm & 1
 }
 
 /// `quant_band_stereo`: decodes one band for the stereo case.
@@ -1342,6 +1716,151 @@ pub(crate) fn quant_all_bands(
     Ok(())
 }
 
+/// Encode-side counterpart of [`quant_all_bands`], **scoped to mono,
+/// non-transient, non-hybrid frames** (matching [`quant_band_encode`]'s
+/// scope — no transient detection, TF analysis, or stereo encode policy
+/// exist yet in this crate; see `todo.md`). For that case, `stereo`,
+/// `dual_stereo`, `intensity`, `short_blocks`, and per-band `tf_res` are
+/// all fixed/irrelevant in the decoder's own version too (every branch
+/// that reads them either never triggers or reduces to a constant), so
+/// they're dropped from the signature entirely rather than threaded
+/// through as always-default arguments.
+///
+/// What's left is genuinely shared with the decoder: the per-band bit
+/// budget arithmetic (`balance`/`b` from `pulses`/`total_bits`), the
+/// lowband-folding bookkeeping (`lowband_offset`, `effective_lowband`, the
+/// fold-source aliasing/overlap-snapshot logic — all pure index/slice
+/// management, no bitstream I/O), and the collapse-mask propagation
+/// between bands. The only encoder-specific piece is calling
+/// [`quant_band_encode`] instead of [`quant_band`].
+///
+/// `x`/`norm`/`scratch`/`htmp`/`iy`/`collapse_masks` have the same shapes
+/// and roles as in [`quant_all_bands`] (mono: `x` is `n_total` samples,
+/// `norm` is `norm_len`, `collapse_masks` one byte per band).
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn quant_all_bands_encode(
+    enc: &mut RangeEncoder,
+    start: usize,
+    end: usize,
+    x: &mut [f32],
+    collapse_masks: &mut [u8],
+    pulses: &[i32],
+    spread: i32,
+    total_bits: i32,
+    mut balance: i32,
+    lm: usize,
+    coded_bands: usize,
+    seed: &mut u32,
+    disable_inv: bool,
+    norm: &mut [f32],
+    scratch: &mut [f32],
+    htmp: &mut [f32],
+    iy: &mut [i32],
+) {
+    let m = 1 << lm;
+    let b_blocks0 = 1usize;
+    let norm_offset = m * EBAND5MS[start] as usize;
+
+    let mut lowband_offset = 0usize;
+    let mut update_lowband = true;
+    let mut ctx = BandCtx {
+        i: start,
+        intensity: 0,
+        spread,
+        tf_change: 0,
+        remaining_bits: 0,
+        seed: *seed,
+        disable_inv,
+    };
+
+    for i in start..end {
+        ctx.i = i;
+        let last = i == end - 1;
+        let n = m * (EBAND5MS[i + 1] - EBAND5MS[i]) as usize;
+        debug_assert!(n > 0);
+        let tell = enc.tell_frac() as i32;
+
+        if i != start {
+            balance -= tell;
+        }
+        let remaining_bits = total_bits - tell - 1;
+        ctx.remaining_bits = remaining_bits;
+        let b = if i < coded_bands {
+            let curr_balance = celt_sudiv(balance, 3.min((coded_bands - i) as i32));
+            0.max(16383.min((remaining_bits + 1).min(pulses[i] + curr_balance)))
+        } else {
+            0
+        };
+
+        if (m * EBAND5MS[i] as usize >= n + m * EBAND5MS[start] as usize || i == start + 1)
+            && (update_lowband || lowband_offset == 0)
+        {
+            lowband_offset = i;
+        }
+        ctx.tf_change = 0;
+
+        let effective_lowband = if lowband_offset != 0 && spread != SPREAD_AGGRESSIVE {
+            Some((m * EBAND5MS[lowband_offset] as usize).saturating_sub(norm_offset + n))
+        } else {
+            None
+        };
+        let mut x_cm;
+        if let Some(eff) = effective_lowband {
+            let mut fold_start = lowband_offset;
+            loop {
+                fold_start -= 1;
+                if m * EBAND5MS[fold_start] as usize <= eff + norm_offset {
+                    break;
+                }
+            }
+            let mut fold_end = lowband_offset - 1;
+            loop {
+                fold_end += 1;
+                if !(fold_end < i && (m * EBAND5MS[fold_end] as usize) < eff + norm_offset + n) {
+                    break;
+                }
+            }
+            x_cm = 0;
+            for fold_i in fold_start..fold_end {
+                x_cm |= collapse_masks[fold_i] as u32;
+            }
+        } else {
+            x_cm = (1u32 << b_blocks0) - 1;
+        }
+
+        let out_off = m * EBAND5MS[i] as usize - norm_offset;
+        let x_band = &mut x[m * EBAND5MS[i] as usize..m * EBAND5MS[i] as usize + n];
+        let out = if last { None } else { Some((out_off, n)) };
+        let scratch_opt = if last { None } else { Some(&mut scratch[..]) };
+
+        let (lb, out_s, _scr) = match (effective_lowband, out, scratch_opt) {
+            (Some(eff), Some((o, _)), scratch) if eff + n > o => {
+                // Overlap: snapshot the fold source before this band's own
+                // `lowband_out` write could alias it (see `quant_all_bands`).
+                let sc = scratch.expect("overlap folding needs scratch");
+                sc[..n].copy_from_slice(&norm[eff..eff + n]);
+                (Some(&mut sc[..]), Some(&mut norm[o..]), None)
+            }
+            (Some(eff), Some((o, _)), scratch) => {
+                let (l, r) = norm.split_at_mut(o);
+                (Some(&mut l[eff..]), Some(&mut r[..]), scratch)
+            }
+            (Some(eff), None, scratch) => (Some(&mut norm[eff..]), None, scratch),
+            (None, Some((o, _)), scratch) => (None, Some(&mut norm[o..]), scratch),
+            (None, None, scratch) => (None, None, scratch),
+        };
+
+        x_cm = quant_band_encode(
+            &mut ctx, enc, x_band, n, b, b_blocks0, lb, lm as i32, out_s, Q15ONE, x_cm, htmp, iy,
+        );
+
+        collapse_masks[i] = x_cm as u8;
+        balance += pulses[i] + tell;
+        update_lowband = b > (n << BITRES) as i32;
+    }
+    *seed = ctx.seed;
+}
+
 /// `tf_decode` (celt_decoder.c).
 pub(crate) fn tf_decode(
     start: usize,
@@ -1384,4 +1903,356 @@ pub(crate) fn tf_decode(
             as i32;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+    use crate::celt::vq::SPREAD_NORMAL;
+    use crate::range::RangeEncoder;
+
+    fn lcg_next(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 32) & 0x3fff_ffff) as f32 / 0x3fff_ffff as f32 - 0.5
+    }
+
+    /// `encode_theta_triangular` must be the exact inverse of the decode
+    /// side's triangular-pdf search in `compute_theta`, for every level
+    /// `x` in `0..=qn` and a spread of `qn` values.
+    #[test]
+    fn encode_theta_triangular_round_trips() {
+        for qn in [2i32, 4, 6, 8, 16, 30] {
+            for x in 0..=qn {
+                let mut enc = RangeEncoder::new();
+                encode_theta_triangular(&mut enc, qn, x);
+                let frame = enc.done();
+                let mut dec = RangeDecoder::new(&frame);
+
+                // Mirrors compute_theta's triangular-pdf decode branch.
+                let ft = ((qn >> 1) + 1) * ((qn >> 1) + 1);
+                let fm = dec.decode(ft as u32).unwrap() as i32;
+                let (got, fs, fl) = if fm < ((qn >> 1) * ((qn >> 1) + 1) >> 1) {
+                    let itheta = (isqrt32(8 * fm as u32 + 1) as i32 - 1) >> 1;
+                    (itheta, itheta + 1, itheta * (itheta + 1) >> 1)
+                } else {
+                    let itheta = (2 * (qn + 1) - isqrt32(8 * (ft - fm - 1) as u32 + 1) as i32) >> 1;
+                    (
+                        itheta,
+                        qn + 1 - itheta,
+                        ft - ((qn + 1 - itheta) * (qn + 2 - itheta) >> 1),
+                    )
+                };
+                dec.update(fl as u32, (fl + fs) as u32, ft as u32);
+                assert_eq!(got, x, "qn={qn} x={x}");
+            }
+        }
+    }
+
+    /// `quant_partition_encode` then `quant_partition` (the trusted,
+    /// RFC-conformance-tested decoder) must reproduce the encoder's own
+    /// state exactly: same collapse mask, same quantized spectrum, same
+    /// bit accounting, same LCG seed progression (mono, non-transient
+    /// scope — see the functions' doc comments).
+    #[test]
+    fn quant_partition_encode_round_trips_through_decoder() {
+        let mut seed = 0xDEADBEEFu64;
+        // (band index, lm, bit budget in 1/8-bit units) — chosen so at
+        // least one covers a large-enough band/budget to force the
+        // recursive split path, and one stays in the single-leaf case.
+        for &(i, lm, b) in &[
+            (17usize, 3i32, 3000i32),
+            (5usize, 2i32, 40i32),
+            (10, 3, 800),
+        ] {
+            let n = (1usize << lm) * (EBAND5MS[i + 1] - EBAND5MS[i]) as usize;
+            let mut target = vec![0.0f32; n];
+            for v in target.iter_mut() {
+                *v = lcg_next(&mut seed);
+            }
+
+            let mut htmp = vec![0.0f32; n];
+            let mut iy_enc = vec![0i32; n];
+            let mut x_enc = target.clone();
+            let mut ctx_enc = BandCtx {
+                i,
+                intensity: 0,
+                spread: crate::celt::vq::SPREAD_NORMAL,
+                tf_change: 0,
+                remaining_bits: b,
+                seed: 0x1234_5678,
+                disable_inv: false,
+            };
+            let mut enc = RangeEncoder::new();
+            let cm_enc = quant_partition_encode(
+                &mut ctx_enc,
+                &mut enc,
+                &mut x_enc,
+                n,
+                b,
+                1,
+                None,
+                lm,
+                1.0,
+                1,
+                &mut htmp,
+                &mut iy_enc,
+            );
+            let frame = enc.done();
+
+            let mut iy_dec = vec![0i32; n];
+            let mut x_dec = vec![0.0f32; n];
+            let mut ctx_dec = BandCtx {
+                i,
+                intensity: 0,
+                spread: crate::celt::vq::SPREAD_NORMAL,
+                tf_change: 0,
+                remaining_bits: b,
+                seed: 0x1234_5678,
+                disable_inv: false,
+            };
+            let mut dec = RangeDecoder::new(&frame);
+            let cm_dec = quant_partition(
+                &mut ctx_dec,
+                &mut dec,
+                &mut x_dec,
+                n,
+                b,
+                1,
+                None,
+                lm,
+                1.0,
+                1,
+                &mut htmp,
+                &mut iy_dec,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cm_enc, cm_dec,
+                "i={i} lm={lm} b={b}: collapse mask mismatch"
+            );
+            assert_eq!(x_enc, x_dec, "i={i} lm={lm} b={b}: spectrum mismatch");
+            assert_eq!(
+                ctx_enc.remaining_bits, ctx_dec.remaining_bits,
+                "i={i} lm={lm} b={b}: bit accounting diverged"
+            );
+            assert_eq!(
+                ctx_enc.seed, ctx_dec.seed,
+                "i={i} lm={lm} b={b}: LCG seed diverged"
+            );
+
+            // The quantized spectrum should correlate positively with the
+            // original target (search-quality sanity check).
+            let dot: f32 = target.iter().zip(x_dec.iter()).map(|(a, b)| a * b).sum();
+            assert!(dot > 0.0, "i={i} lm={lm} b={b} dot={dot}");
+        }
+    }
+
+    /// `quant_band_encode` (the outer wrapper: `n == 1` special case plus
+    /// `lowband_out` scaling around `quant_partition_encode`) round-tripped
+    /// against `quant_band`, covering both the `n == 1` path and a normal
+    /// multi-sample band with `lowband_out` populated.
+    #[test]
+    fn quant_band_encode_round_trips_through_decoder() {
+        let mut seed = 0xC0FF_EE12_3456u64;
+        // (band index, lm, bit budget) — includes i=0 at lm=0, which is a
+        // single-sample band (EBAND5MS[1]-EBAND5MS[0] == 1, n == 1<<0 == 1).
+        for &(i, lm, b) in &[(0usize, 0i32, 40i32), (17, 3, 3000)] {
+            let n = (1usize << lm) * (EBAND5MS[i + 1] - EBAND5MS[i]) as usize;
+            let mut target = vec![0.0f32; n];
+            for v in target.iter_mut() {
+                *v = lcg_next(&mut seed);
+            }
+
+            let mut htmp = vec![0.0f32; n];
+            let mut iy_enc = vec![0i32; n];
+            let mut x_enc = target.clone();
+            let mut lb_out_enc = vec![0.0f32; n];
+            let mut ctx_enc = BandCtx {
+                i,
+                intensity: 0,
+                spread: crate::celt::vq::SPREAD_NORMAL,
+                tf_change: 0,
+                remaining_bits: b,
+                seed: 0xABCD,
+                disable_inv: false,
+            };
+            let mut enc = RangeEncoder::new();
+            let cm_enc = quant_band_encode(
+                &mut ctx_enc,
+                &mut enc,
+                &mut x_enc,
+                n,
+                b,
+                1,
+                None,
+                lm,
+                Some(&mut lb_out_enc),
+                1.0,
+                1,
+                &mut htmp,
+                &mut iy_enc,
+            );
+            let frame = enc.done();
+
+            let mut iy_dec = vec![0i32; n];
+            let mut x_dec = vec![0.0f32; n];
+            let mut lb_out_dec = vec![0.0f32; n];
+            let mut ctx_dec = BandCtx {
+                i,
+                intensity: 0,
+                spread: crate::celt::vq::SPREAD_NORMAL,
+                tf_change: 0,
+                remaining_bits: b,
+                seed: 0xABCD,
+                disable_inv: false,
+            };
+            let mut dec = RangeDecoder::new(&frame);
+            let cm_dec = quant_band(
+                &mut ctx_dec,
+                &mut dec,
+                &mut x_dec,
+                n,
+                b,
+                1,
+                None,
+                lm,
+                Some(&mut lb_out_dec),
+                1.0,
+                None,
+                1,
+                &mut htmp,
+                &mut iy_dec,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cm_enc, cm_dec,
+                "i={i} lm={lm} b={b}: collapse mask mismatch"
+            );
+            assert_eq!(x_enc, x_dec, "i={i} lm={lm} b={b}: spectrum mismatch");
+            assert_eq!(
+                lb_out_enc, lb_out_dec,
+                "i={i} lm={lm} b={b}: lowband_out mismatch"
+            );
+        }
+    }
+
+    /// End-to-end mono frame test: chains `compute_allocation_encode`
+    /// (rate.rs) into `quant_all_bands_encode` on the same range coder —
+    /// exactly how a real encoder would sequence them — covering multiple
+    /// consecutive bands so the cross-band lowband-folding/collapse-mask
+    /// bookkeeping (the whole reason `quant_all_bands` is more than just a
+    /// loop over `quant_band`) is actually exercised. Decodes the result
+    /// through the real, trusted `compute_allocation` + `quant_all_bands`
+    /// decoder pair and asserts the encoder's own final spectrum,
+    /// collapse masks, and RNG seed are bit-for-bit identical to what the
+    /// decoder reconstructs.
+    #[test]
+    fn quant_all_bands_encode_round_trips_through_decoder() {
+        use crate::celt::rate::{compute_allocation, compute_allocation_encode, init_caps};
+
+        let lm = 2i32;
+        let m = 1usize << lm;
+        let start = 0usize;
+        let end = 10usize;
+        let data_len = 60usize; // packet size in bytes
+        let offsets = [0i32; NB_EBANDS];
+        let cap = init_caps(lm as usize, 1);
+        let alloc_trim = 5i32;
+
+        let n_total = m * EBAND5MS[end] as usize;
+        let mut seed = 0x5EED_5EEDu64;
+        let mut target = vec![0.0f32; n_total];
+        for v in target.iter_mut() {
+            *v = lcg_next(&mut seed);
+        }
+
+        // --- Encode ---
+        let mut enc = RangeEncoder::new();
+        let alloc_bits = ((data_len as i32 * 8) << 3) - enc.tell_frac() as i32 - 1;
+        let alloc = compute_allocation_encode(
+            start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 1, &mut enc,
+        );
+        let total_bits_q = (data_len as i32 * 8) * 8;
+        let mut x_enc = target.clone();
+        let mut collapse_masks_enc = vec![0u8; end];
+        let mut norm_enc = vec![0.0f32; n_total];
+        let mut scratch = vec![0.0f32; 256];
+        let mut htmp = vec![0.0f32; 256];
+        let mut iy = vec![0i32; 256];
+        let mut rng_seed = 0x1357_9BDFu32;
+        quant_all_bands_encode(
+            &mut enc,
+            start,
+            end,
+            &mut x_enc,
+            &mut collapse_masks_enc,
+            &alloc.pulses,
+            SPREAD_NORMAL,
+            total_bits_q,
+            alloc.alloc.balance,
+            lm as usize,
+            alloc.alloc.coded_bands,
+            &mut rng_seed,
+            false,
+            &mut norm_enc,
+            &mut scratch,
+            &mut htmp,
+            &mut iy,
+        );
+        let final_seed_enc = rng_seed;
+        let frame = enc.done();
+
+        // --- Decode (trusted, RFC-conformance-tested path) ---
+        let mut dec = RangeDecoder::new(&frame);
+        let dec_alloc = compute_allocation(
+            start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 1, &mut dec,
+        )
+        .unwrap();
+        let mut x_dec = vec![0.0f32; n_total];
+        let mut collapse_masks_dec = vec![0u8; end];
+        let mut norm_dec = vec![0.0f32; n_total];
+        let mut rng_seed_dec = 0x1357_9BDFu32;
+        quant_all_bands(
+            &mut dec,
+            start,
+            end,
+            &mut x_dec,
+            false,
+            &mut collapse_masks_dec,
+            &dec_alloc.pulses,
+            false,
+            SPREAD_NORMAL,
+            false,
+            0,
+            &[0i32; NB_EBANDS],
+            total_bits_q,
+            dec_alloc.alloc.balance,
+            lm as usize,
+            dec_alloc.alloc.coded_bands,
+            &mut rng_seed_dec,
+            false,
+            &mut norm_dec,
+            &mut scratch,
+            &mut htmp,
+            &mut iy,
+        )
+        .unwrap();
+
+        assert_eq!(alloc.pulses, dec_alloc.pulses, "pulse allocation mismatch");
+        assert_eq!(x_enc, x_dec, "final spectrum mismatch");
+        assert_eq!(
+            collapse_masks_enc, collapse_masks_dec,
+            "collapse masks mismatch"
+        );
+        assert_eq!(final_seed_enc, rng_seed_dec, "RNG seed mismatch");
+
+        // Sanity: the reconstructed spectrum should correlate with the
+        // original target, not just be a valid-but-unrelated bitstream.
+        let dot: f32 = target.iter().zip(x_dec.iter()).map(|(a, b)| a * b).sum();
+        assert!(dot > 0.0, "dot={dot}");
+    }
 }

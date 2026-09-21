@@ -1,6 +1,6 @@
 [package]
 name = "tpt-av-cadence-mp3"
-description = "mp3 decoder for the tpt-cadence audio codec suite (under construction)."
+description = "MPEG-1/2/2.5 Layer III (MP3) decoder for the tpt-cadence audio codec suite."
 readme = "README.md"
 keywords = ["audio", "mp3", "codec", "decoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]

@@ -18,9 +18,9 @@
     clippy::too_many_arguments
 )]
 
-use super::cwrs::decode_pulses;
+use super::cwrs::{decode_pulses, encode_pulses};
 use super::math::{celt_cos_norm, celt_div, celt_udiv, EPSILON};
-use crate::range::RangeDecoder;
+use crate::range::{RangeDecoder, RangeEncoder};
 
 /// `SPREAD_NONE` (from bands.h).
 pub(crate) const SPREAD_NONE: i32 = 0;
@@ -144,6 +144,124 @@ pub(crate) fn alg_unquant(
     Ok(extract_collapse_mask(&iy[..n], b))
 }
 
+/// `alg_quant`: finds an integer pulse vector with exactly `k` pulses that
+/// approximates the normalized band `x`, encodes it, and (when `resynth`)
+/// overwrites `x` with the quantized reconstruction so downstream encoder
+/// stages (e.g. folding into the next band) see what the decoder will.
+///
+/// The search is a greedy correlation maximizer (project onto the pyramid
+/// `sum|y|==k` first when `k` is large relative to `n`, then place any
+/// remaining pulses one at a time on whichever dimension best increases
+/// `(x·y)^2 / |y|^2`). This is *not* a port of libopus's `alg_quant` — RFC
+/// 6716 only specifies the decoder, so an encoder's pulse-search heuristic
+/// has no normative reference to match bit-for-bit. Correctness here means
+/// "produces a vector [`decode_pulses`] reconstructs exactly", which
+/// [`encode_pulses`] guarantees by construction (see its own tests); the
+/// search quality only affects coding efficiency, not correctness.
+///
+/// `x` holds the rotated input and (when `resynth`) receives the quantized
+/// output; `iy` is caller-provided scratch of length `n == x.len()`.
+/// Returns the collapse mask.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn alg_quant(
+    x: &mut [f32],
+    iy: &mut [i32],
+    k: i32,
+    spread: i32,
+    b: usize,
+    enc: &mut RangeEncoder,
+    gain: f32,
+    resynth: bool,
+) -> u32 {
+    debug_assert!(k > 0 && x.len() > 1);
+    let n = x.len();
+    exp_rotation(x, 1, b, k, spread);
+
+    // Strip the sign (PVQ search works on magnitudes; the sign is folded
+    // back in once the pulse counts are chosen).
+    let mut sign = vec![false; n];
+    for (j, xj) in x.iter_mut().enumerate() {
+        if *xj < 0.0 {
+            sign[j] = true;
+            *xj = -*xj;
+        }
+        iy[j] = 0;
+    }
+
+    let mut y = vec![0.0f32; n];
+    let mut xy = 0.0f32;
+    let mut yy = 0.0f32;
+    let mut pulses_left = k;
+
+    // Pre-search: when there are more pulses than dimensions, project x
+    // onto the K-pulse pyramid directly instead of placing pulses one at a
+    // time (an O(n) shortcut for the common "most dimensions get >=1
+    // pulse" case).
+    if k > (n as i32) >> 1 {
+        let mut sum: f32 = x[..n].iter().sum();
+        if !(sum > EPSILON && sum < 64.0) {
+            // Degenerate (near-silent or non-finite) band: put everything
+            // on the first coefficient rather than divide by a tiny/huge
+            // sum.
+            x[0] = 1.0;
+            for v in x[1..n].iter_mut() {
+                *v = 0.0;
+            }
+            sum = 1.0;
+        }
+        let rcp = (k as f32 + 0.8) / sum;
+        for j in 0..n {
+            let iyj = (rcp * x[j]).floor() as i32;
+            iy[j] = iyj;
+            y[j] = iyj as f32;
+            yy += y[j] * y[j];
+            xy += x[j] * y[j];
+            y[j] *= 2.0;
+            pulses_left -= iyj;
+        }
+    }
+    debug_assert!(pulses_left >= 0);
+
+    // Greedy refinement: place each remaining pulse on the dimension that
+    // most increases the normalized correlation (x.y)^2 / yy.
+    for _ in 0..pulses_left {
+        let mut best_id = 0usize;
+        let mut best_num = f32::NEG_INFINITY;
+        let mut best_den = 0.0f32;
+        yy += 1.0;
+        for j in 0..n {
+            let rxy = xy + x[j];
+            let ryy = yy + y[j];
+            let score = rxy * rxy;
+            if best_den * score > ryy * best_num {
+                best_den = ryy;
+                best_num = score;
+                best_id = j;
+            }
+        }
+        xy += x[best_id];
+        yy += y[best_id];
+        y[best_id] += 2.0;
+        iy[best_id] += 1;
+    }
+
+    // Restore signs.
+    for j in 0..n {
+        if sign[j] {
+            x[j] = -x[j];
+            iy[j] = -iy[j];
+        }
+    }
+
+    let ryy = encode_pulses(&iy[..n], n, k as usize, enc);
+
+    if resynth {
+        normalise_residual(&iy[..n], x, ryy, gain);
+        exp_rotation(x, -1, b, k, spread);
+    }
+    extract_collapse_mask(&iy[..n], b)
+}
+
 /// `renormalise_vector`: rescales `x` to norm `gain`.
 pub(crate) fn renormalise_vector(x: &mut [f32], gain: f32) {
     // The reference computes the energy with `celt_inner_prod`, whose
@@ -206,6 +324,77 @@ mod tests {
                 assert_eq!(cm, 1);
                 let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
                 assert!((norm - 1.0).abs() < 1e-4, "n={n} k={k} norm={norm}");
+            }
+        }
+    }
+
+    fn lcg_next(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 32) & 0x3fff_ffff) as f32 / 0x3fff_ffff as f32 - 0.5
+    }
+
+    /// `alg_quant` then `alg_unquant` round-trips through the real range
+    /// coder: the decoded vector must be unit-norm (gain=1) and correlate
+    /// strongly with the original target (the PVQ search should find a
+    /// vector close to it, not just any valid `k`-pulse codeword).
+    #[test]
+    fn alg_quant_round_trips_and_correlates_with_target() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        // (n, k) pairs reused from cwrs.rs's own round-trip tests, which
+        // are the ones actually verified to fit the PVQ_U table's shape
+        // (not every (n, k) with min(n, k) <= 14 fits — the per-row column
+        // budget shrinks as the row index grows).
+        for &(n, k) in &[(4usize, 3i32), (176, 3), (8, 12), (16, 5), (2, 1), (12, 15)] {
+            for _ in 0..8 {
+                let mut target: Vec<f32> = (0..n).map(|_| lcg_next(&mut seed)).collect();
+                renormalise_vector(&mut target, 1.0);
+                let original = target.clone();
+
+                let mut x = target.clone();
+                let mut iy = vec![0i32; n];
+                let mut enc = RangeEncoder::new();
+                let cm_enc = alg_quant(&mut x, &mut iy, k, SPREAD_NONE, 1, &mut enc, 1.0, true);
+                let frame = enc.done();
+
+                // The encoder's own resynth output must already be unit norm.
+                let enc_norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+                assert!(
+                    (enc_norm - 1.0).abs() < 1e-3,
+                    "n={n} k={k} enc_norm={enc_norm}"
+                );
+
+                let mut dec = RangeDecoder::new(&frame);
+                let mut x2 = original.clone();
+                let mut iy2 = vec![0i32; n];
+                let cm_dec =
+                    alg_unquant(&mut x2, &mut iy2, k, SPREAD_NONE, 1, &mut dec, 1.0).unwrap();
+
+                assert_eq!(cm_enc, cm_dec, "n={n} k={k} collapse mask mismatch");
+                assert_eq!(
+                    iy, iy2,
+                    "n={n} k={k}: decoder didn't reproduce the encoded pulses"
+                );
+                // What the encoder resynthesized and what the decoder
+                // independently reconstructs from the bitstream must match
+                // bit-for-bit (both are `normalise_residual` over the same
+                // `iy`).
+                assert_eq!(x, x2, "n={n} k={k}: encoder resynth != decoder output");
+
+                // The quantized vector should correlate positively with
+                // the original target (sanity check that the search moves
+                // toward it at all, not just that the bitstream is valid).
+                // With very few pulses spread over many dimensions (e.g.
+                // n=176, k=3) most of the target's energy is necessarily
+                // uncaptured, so the bound scales down with k/n instead of
+                // being a fixed threshold.
+                let dot: f32 = original.iter().zip(x2.iter()).map(|(a, b)| a * b).sum();
+                let min_dot = 0.15 * (k as f32 / n as f32).sqrt().min(1.0);
+                assert!(
+                    dot > min_dot,
+                    "n={n} k={k} dot={dot} min_dot={min_dot} target={original:?} got={x2:?}"
+                );
             }
         }
     }

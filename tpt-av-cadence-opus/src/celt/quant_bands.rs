@@ -20,7 +20,7 @@
 
 use super::laplace;
 use super::rate::{MAX_FINE_BITS, NB_EBANDS};
-use crate::range::RangeDecoder;
+use crate::range::{RangeDecoder, RangeEncoder};
 
 /// Mean energy in each band (Q4, converted back to float).
 static E_MEANS: [f32; 25] = [
@@ -227,4 +227,274 @@ pub(crate) fn unquant_energy_finalise(
 #[inline]
 pub(crate) fn e_means(i: usize) -> f32 {
     E_MEANS[i]
+}
+
+// ---------------------------------------------------------------------------
+// Encode side (not present in libopus's decode-only port this crate started
+// from; see the "Opus CELT encoder — foundation" entry in `todo.md` for
+// scope notes). Each function below mirrors its `unquant_*` counterpart's
+// budget/branch structure and state-update formulas exactly, so that
+// decoding the bits it writes reproduces precisely the `old_ebands`/`error`
+// state it computed — verified by round-tripping through the real
+// `unquant_*` functions in `tests` below.
+// ---------------------------------------------------------------------------
+
+/// `quant_coarse_energy`: encode-side counterpart of `unquant_coarse_energy`.
+///
+/// `means` holds the actual (unquantized) per-band log-energy the caller
+/// measured from the MDCT spectrum, in the same `[ci*NB_EBANDS+i]` layout
+/// as `old_ebands`. On return, `old_ebands` holds exactly what
+/// `unquant_coarse_energy` will reconstruct from the emitted bits, and
+/// `error` holds the residual (`means - old_ebands`) that
+/// `quant_fine_energy` refines further.
+///
+/// Not yet called from a top-level encoder (see `todo.md`); round-tripped
+/// against `unquant_coarse_energy` in `encode_tests` below.
+#[allow(dead_code)]
+pub(crate) fn quant_coarse_energy(
+    start: usize,
+    end: usize,
+    means: &[f32],
+    old_ebands: &mut [f32],
+    error: &mut [f32],
+    intra: bool,
+    len: usize,
+    enc: &mut RangeEncoder,
+    c: usize,
+    lm: usize,
+) {
+    let prob_model = &E_PROB_MODEL[lm][usize::from(intra)];
+    let (coef, beta) = if intra {
+        (0.0f32, BETA_INTRA)
+    } else {
+        (PRED_COEF[lm], BETA_COEF[lm])
+    };
+
+    let budget = (len * 8) as i32;
+    let mut prev = [0f32; 2];
+
+    for i in start..end {
+        for ci in 0..c {
+            let idx = ci * NB_EBANDS + i;
+            let tell = enc.tell() as i32;
+            old_ebands[idx] = old_ebands[idx].max(-9.0);
+            let predicted = coef * old_ebands[idx] + prev[ci];
+            let target = means[idx] - predicted;
+
+            let qi: i32 = if budget - tell >= 15 {
+                let pi = 2 * i.min(20);
+                let want = target.round() as i32;
+                laplace::laplace_encode(
+                    enc,
+                    want,
+                    (prob_model[pi] as u32) << 7,
+                    (prob_model[pi + 1] as i32) << 6,
+                )
+            } else if budget - tell >= 2 {
+                let want = target.round().clamp(-1.0, 1.0) as i32;
+                let k = match want {
+                    0 => 0u32,
+                    -1 => 1,
+                    1 => 2,
+                    _ => unreachable!(),
+                };
+                enc.encode_icdf(k, &SMALL_ENERGY_ICDF, 2);
+                want
+            } else if budget - tell >= 1 {
+                let bit = target < -0.5;
+                enc.encode_bit_logp(bit, 1);
+                -i32::from(bit)
+            } else {
+                -1
+            };
+            let q = qi as f32;
+
+            let tmp = coef * old_ebands[idx] + prev[ci] + q;
+            old_ebands[idx] = tmp;
+            error[idx] = means[idx] - tmp;
+            prev[ci] = prev[ci] + q - beta * q;
+        }
+    }
+}
+
+/// `quant_fine_energy`: encode-side counterpart of `unquant_fine_energy`.
+/// Refines `old_ebands`/`error` with `fine_quant[i]` raw bits per band,
+/// choosing the value closest to the residual `error` left by coarse
+/// quantization.
+#[allow(dead_code)]
+pub(crate) fn quant_fine_energy(
+    start: usize,
+    end: usize,
+    old_ebands: &mut [f32],
+    error: &mut [f32],
+    fine_quant: &[i32],
+    enc: &mut RangeEncoder,
+    c: usize,
+) {
+    for i in start..end {
+        if fine_quant[i] <= 0 {
+            continue;
+        }
+        let frac = 1u32 << fine_quant[i];
+        for ci in 0..c {
+            let idx = ci * NB_EBANDS + i;
+            let q2f = (error[idx] + 0.5) * frac as f32 - 0.5;
+            let q2 = q2f.round().clamp(0.0, (frac - 1) as f32) as u32;
+            enc.write_raw_bits(q2, fine_quant[i] as u32);
+            let offset =
+                (q2 as f32 + 0.5) * ((1 << (14 - fine_quant[i])) as f32) * (1.0 / 16384.0) - 0.5;
+            old_ebands[idx] += offset;
+            error[idx] -= offset;
+        }
+    }
+}
+
+/// `quant_energy_finalise`: encode-side counterpart of
+/// `unquant_energy_finalise`. Spends any leftover bits on one extra fine
+/// bit per selected band, priority-ordered, each bit chosen to reduce the
+/// remaining `error`.
+#[allow(dead_code)]
+pub(crate) fn quant_energy_finalise(
+    start: usize,
+    end: usize,
+    old_ebands: &mut [f32],
+    error: &[f32],
+    fine_quant: &[i32],
+    fine_priority: &[i32],
+    mut bits_left: i32,
+    enc: &mut RangeEncoder,
+    c: usize,
+) {
+    for prio in 0..2 {
+        let mut i = start;
+        while i < end && bits_left >= c as i32 {
+            if fine_quant[i] >= MAX_FINE_BITS || fine_priority[i] != prio {
+                i += 1;
+                continue;
+            }
+            for ci in 0..c {
+                let idx = ci * NB_EBANDS + i;
+                let bit = error[idx] >= 0.0;
+                enc.write_raw_bits(u32::from(bit), 1);
+                let offset = (if bit { 0.5 } else { -0.5 })
+                    * ((1 << (14 - fine_quant[i] - 1)) as f32)
+                    * (1.0 / 16384.0);
+                old_ebands[idx] += offset;
+                bits_left -= 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+    use crate::range::RangeEncoder;
+
+    fn lcg_next(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((*state >> 32) & 0xffff) as f32 / 65536.0) * 12.0 - 4.0
+    }
+
+    /// Full coarse+fine+finalise energy round trip: encode a synthetic
+    /// per-band target spectrum, then decode the emitted bits and check the
+    /// reconstructed `old_ebands` state matches the encoder's own state
+    /// exactly (both apply the identical prediction/update formulas, so
+    /// this must be bit-for-bit, not just approximately close).
+    #[test]
+    fn coarse_fine_finalise_round_trip_matches_decoder_state() {
+        let c = 2usize;
+        let lm = 3usize;
+        let start = 0usize;
+        let end = NB_EBANDS;
+        let mut seed = 0xA11CE5EEDu64;
+
+        // A generous byte budget so every band takes the main Laplace path
+        // (this test exercises the happy path; the tight-budget icdf/bit
+        // fallback branches are exercised implicitly by any caller running
+        // near the end of a packet, not covered here).
+        let len = 200usize;
+
+        let mut means = [0f32; 2 * NB_EBANDS];
+        for m in means.iter_mut() {
+            *m = lcg_next(&mut seed);
+        }
+
+        // Encode: intra frame (no cross-frame prediction), starting state
+        // matches the decoder's own initial condition (silence).
+        let mut enc_ebands = [-9.0f32; 2 * NB_EBANDS];
+        let mut error = [0f32; 2 * NB_EBANDS];
+        let mut enc = RangeEncoder::new();
+        quant_coarse_energy(
+            start,
+            end,
+            &means,
+            &mut enc_ebands,
+            &mut error,
+            true,
+            len,
+            &mut enc,
+            c,
+            lm,
+        );
+
+        let fine_quant = [3i32; NB_EBANDS];
+        quant_fine_energy(
+            start,
+            end,
+            &mut enc_ebands,
+            &mut error,
+            &fine_quant,
+            &mut enc,
+            c,
+        );
+
+        let fine_priority = [0i32; NB_EBANDS];
+        quant_energy_finalise(
+            start,
+            end,
+            &mut enc_ebands,
+            &error,
+            &fine_quant,
+            &fine_priority,
+            (c * 4) as i32,
+            &mut enc,
+            c,
+        );
+
+        let frame = enc.done();
+
+        // Decode the same bits from the same initial state.
+        let mut dec_ebands = [-9.0f32; 2 * NB_EBANDS];
+        let mut dec = RangeDecoder::new(&frame);
+        unquant_coarse_energy(start, end, &mut dec_ebands, true, len, &mut dec, c, lm).unwrap();
+        unquant_fine_energy(start, end, &mut dec_ebands, &fine_quant, &mut dec, c).unwrap();
+        unquant_energy_finalise(
+            start,
+            end,
+            &mut dec_ebands,
+            &fine_quant,
+            &fine_priority,
+            (c * 4) as i32,
+            &mut dec,
+            c,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enc_ebands, dec_ebands,
+            "encoder and decoder energy state diverged"
+        );
+
+        // The reconstructed energies should also be a reasonable
+        // approximation of the original targets (coarse+fine+finalise
+        // resolution is well under 1.0 in this log-energy domain).
+        for (idx, (&target, &got)) in means.iter().zip(dec_ebands.iter()).enumerate() {
+            let err = (target - got).abs();
+            assert!(err < 1.0, "idx={idx} target={target} got={got} err={err}");
+        }
+    }
 }

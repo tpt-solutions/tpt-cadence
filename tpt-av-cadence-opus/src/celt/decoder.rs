@@ -58,9 +58,9 @@ const PLC_SEARCH_LEN: usize = DECODE_BUFFER_SIZE - PLC_PITCH_LAG_MAX; // 1328
 const PLC_MAX_PITCH: usize = PLC_PITCH_LAG_MAX - PLC_PITCH_LAG_MIN; // 620
 
 /// `TRIM_ICDF` (celt.h).
-static TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
+pub(crate) static TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
 /// `SPREAD_ICDF` (celt.h).
-static SPREAD_ICDF_TBL: [u8; 4] = [25, 23, 2, 0];
+pub(crate) static SPREAD_ICDF_TBL: [u8; 4] = [25, 23, 2, 0];
 /// `TAPSET_ICDF` (celt.h).
 static TAPSET_ICDF: [u8; 3] = [2, 1, 0];
 

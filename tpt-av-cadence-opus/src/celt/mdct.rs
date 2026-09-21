@@ -170,110 +170,125 @@ pub(crate) fn mdct_backward(
     }
 }
 
+/// Forward MDCT and windowing/fold (analysis transform for the encoder).
+///
+/// Implements `clt_mdct_forward_c(l, in, out, window, overlap, shift,
+/// stride, arch)`: the exact mirror of [`mdct_backward`] above, ported the
+/// same way from libopus 1.5.2 `celt/mdct.c`.
+///
+/// - `inp`: `overlap + N2` time-domain samples (the current block plus the
+///   previous block's tail, matching the encoder's sliding input buffer).
+/// - `out`: `N2` spectral lines written for this sub-block.
+/// - `scratch`: `n4` complex slots for the in-place FFT (allocation-free).
+///
+/// Verified against the analytic MDCT definition and round-tripped through
+/// [`mdct_backward`] in `tests` below (SNR > 60 dB either way).
+///
+/// Not yet wired into a top-level encoder (see `todo.md`); currently
+/// exercised only by the test suite, matching [`mdct_backward`]'s own
+/// pre-integration state.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn mdct_forward(
+    inp: &[f32],
+    out: &mut [f32],
+    window: &[f32],
+    overlap: usize,
+    shift: usize,
+    stride: usize,
+    scratch: &mut [Cpx],
+) {
+    let mut n = MdctLookup::n();
+    let mut trig_base = 0usize;
+    for _ in 0..shift {
+        n >>= 1;
+        trig_base += n;
+    }
+    let n2 = n >> 1;
+    let n4 = n >> 2;
+    let trig = MdctLookup::trig();
+    let sta = fft_state(n4);
+    let scale = sta.scale;
+
+    let bitrev: &[i16] = match n4 {
+        60 => &FFT_BITREV60,
+        120 => &FFT_BITREV120,
+        240 => &FFT_BITREV240,
+        480 => &FFT_BITREV480,
+        _ => unreachable!("CELT MDCT only uses 60/120/240/480-point FFTs"),
+    };
+
+    // Window, shuffle, fold.
+    let mut f = vec![0.0f32; n2];
+    let mut i = 0usize;
+    let mut xp1 = overlap / 2;
+    let mut xp2 = n2 - 1 + overlap / 2;
+    let mut wp1 = overlap / 2;
+    // The reference walks `window[overlap/2-1]` down by 2 each step; the
+    // last decrement lands one past the start but is never dereferenced.
+    let mut wp2 = (overlap / 2 - 1) as isize;
+    while i < (overlap + 3) >> 2 {
+        f[2 * i] = window[wp2.max(0) as usize] * inp[xp1 + n2] + window[wp1] * inp[xp2];
+        f[2 * i + 1] = window[wp1] * inp[xp1] - window[wp2.max(0) as usize] * inp[xp2 - n2];
+        xp1 += 2;
+        xp2 -= 2;
+        wp1 += 2;
+        wp2 -= 2;
+        i += 1;
+    }
+    let mut wp1 = 0usize;
+    let mut wp2 = overlap - 1;
+    while i < n4 - ((overlap + 3) >> 2) {
+        f[2 * i] = inp[xp2];
+        f[2 * i + 1] = inp[xp1];
+        xp1 += 2;
+        xp2 -= 2;
+        i += 1;
+    }
+    while i < n4 {
+        f[2 * i] = -window[wp1] * inp[xp1 - n2] + window[wp2] * inp[xp2];
+        f[2 * i + 1] = window[wp2] * inp[xp1] + window[wp1] * inp[xp2 + n2];
+        xp1 += 2;
+        xp2 -= 2;
+        wp1 += 2;
+        wp2 -= 2;
+        i += 1;
+    }
+
+    // Pre-rotation, scaled by the FFT's 1/nfft.
+    for j in 0..n4 {
+        let t0 = trig[trig_base + j];
+        let t1 = trig[trig_base + n4 + j];
+        let re = f[2 * j];
+        let im = f[2 * j + 1];
+        let yr = re * t0 - im * t1;
+        let yi = im * t0 + re * t1;
+        scratch[bitrev[j] as usize] = Cpx {
+            r: scale * yr,
+            i: scale * yi,
+        };
+    }
+    fft_impl(sta, &mut scratch[..n4]);
+
+    // Post-rotate.
+    {
+        let mut yp1 = 0usize;
+        // Walks down to -1 on the last iteration (never dereferenced,
+        // matching the reference's pointer arithmetic).
+        let mut yp2 = (stride * (n2 - 1)) as isize;
+        for j in 0..n4 {
+            let fi = scratch[j];
+            out[yp1] = fi.i * trig[trig_base + n4 + j] - fi.r * trig[trig_base + j];
+            out[yp2 as usize] = fi.r * trig[trig_base + n4 + j] + fi.i * trig[trig_base + j];
+            yp1 += 2 * stride;
+            yp2 -= 2 * stride as isize;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::celt::tables::WINDOW120;
-
-    /// Port of the reference `clt_mdct_forward_c` (test-only), mirroring the
-    /// backward port above so the pair can be checked for round-tripping.
-    #[allow(clippy::too_many_arguments)]
-    fn mdct_forward(
-        inp: &[f32],
-        out: &mut [f32],
-        window: &[f32],
-        overlap: usize,
-        shift: usize,
-        stride: usize,
-        scratch: &mut [Cpx],
-    ) {
-        let mut n = MdctLookup::n();
-        let mut trig_base = 0usize;
-        for _ in 0..shift {
-            n >>= 1;
-            trig_base += n;
-        }
-        let n2 = n >> 1;
-        let n4 = n >> 2;
-        let trig = MdctLookup::trig();
-        let sta = fft_state(n4);
-        let scale = sta.scale;
-
-        let bitrev: &[i16] = match n4 {
-            60 => &FFT_BITREV60,
-            120 => &FFT_BITREV120,
-            240 => &FFT_BITREV240,
-            480 => &FFT_BITREV480,
-            _ => unreachable!(),
-        };
-
-        // Window, shuffle, fold.
-        let mut f = vec![0.0f32; n2];
-        let mut i = 0usize;
-        let mut xp1 = overlap / 2;
-        let mut xp2 = n2 - 1 + overlap / 2;
-        let mut wp1 = overlap / 2;
-        // The reference walks `window[overlap/2-1]` down by 2 each step; the
-        // last decrement lands one past the start but is never dereferenced.
-        let mut wp2 = (overlap / 2 - 1) as isize;
-        while i < (overlap + 3) >> 2 {
-            f[2 * i] = window[wp2.max(0) as usize] * inp[xp1 + n2] + window[wp1] * inp[xp2];
-            f[2 * i + 1] = window[wp1] * inp[xp1] - window[wp2.max(0) as usize] * inp[xp2 - n2];
-            xp1 += 2;
-            xp2 -= 2;
-            wp1 += 2;
-            wp2 -= 2;
-            i += 1;
-        }
-        let mut wp1 = 0usize;
-        let mut wp2 = overlap - 1;
-        while i < n4 - ((overlap + 3) >> 2) {
-            f[2 * i] = inp[xp2];
-            f[2 * i + 1] = inp[xp1];
-            xp1 += 2;
-            xp2 -= 2;
-            i += 1;
-        }
-        while i < n4 {
-            f[2 * i] = -window[wp1] * inp[xp1 - n2] + window[wp2] * inp[xp2];
-            f[2 * i + 1] = window[wp2] * inp[xp1] + window[wp1] * inp[xp2 + n2];
-            xp1 += 2;
-            xp2 -= 2;
-            wp1 += 2;
-            wp2 -= 2;
-            i += 1;
-        }
-
-        // Pre-rotation, scaled by the FFT's 1/nfft.
-        for j in 0..n4 {
-            let t0 = trig[trig_base + j];
-            let t1 = trig[trig_base + n4 + j];
-            let re = f[2 * j];
-            let im = f[2 * j + 1];
-            let yr = re * t0 - im * t1;
-            let yi = im * t0 + re * t1;
-            scratch[bitrev[j] as usize] = Cpx {
-                r: scale * yr,
-                i: scale * yi,
-            };
-        }
-        fft_impl(sta, &mut scratch[..n4]);
-
-        // Post-rotate.
-        {
-            let mut yp1 = 0usize;
-            // Walks down to -1 on the last iteration (never dereferenced,
-            // matching the reference's pointer arithmetic).
-            let mut yp2 = (stride * (n2 - 1)) as isize;
-            for j in 0..n4 {
-                let fi = scratch[j];
-                out[yp1] = fi.i * trig[trig_base + n4 + j] - fi.r * trig[trig_base + j];
-                out[yp2 as usize] = fi.r * trig[trig_base + n4 + j] + fi.i * trig[trig_base + j];
-                yp1 += 2 * stride;
-                yp2 -= 2 * stride as isize;
-            }
-        }
-    }
 
     /// Signal-to-noise ratio (dB) of `out` against an analytic `reference`
     /// (f64 reference sums, matching the reference test's `check*()` helpers).

@@ -300,6 +300,52 @@ pub(crate) fn decode_pulses(
     Ok(cwrsi(n, k, i, y))
 }
 
+/// `icwrs`: the combinatorial rank of a pulse vector — the exact inverse of
+/// [`cwrsi`] above. Given `y[0..n]` (with `sum(|y[i]|) == k`), returns the
+/// index `i` such that `cwrsi(n, k, i, _) == y`.
+///
+/// Not a transcription of libopus's own `icwrs` (RFC 6716 makes only the
+/// decoder normative, so an encoder's internals have no reference to port
+/// from). Walks `y` back-to-front, accumulating how many earlier codewords
+/// (shorter last dimension, or same magnitude but a sign bit set) precede
+/// it in `cwrsi`'s enumeration order. Exhaustively verified against
+/// `cwrsi`/`decode_pulses` for every enumerable small `(n, k)` in `tests`
+/// below.
+fn icwrs(n: usize, y: &[i32]) -> u32 {
+    let mut i = u32::from(y[n - 1] < 0);
+    let mut k = y[n - 1].unsigned_abs() as usize;
+    let mut j = n - 1;
+    while j > 0 {
+        j -= 1;
+        i += pvq_u(n - j, k);
+        k += y[j].unsigned_abs() as usize;
+        if y[j] < 0 {
+            i += pvq_u(n - j, k + 1);
+        }
+    }
+    i
+}
+
+/// `encode_pulses`: encodes a pulse vector (`sum(|y[i]|) == k`) through the
+/// range encoder as its [`icwrs`] index, mirroring [`decode_pulses`].
+/// Returns the squared norm `sum(y[i]^2)` (matching `decode_pulses`'s
+/// return value, needed by the caller for PVQ gain renormalization).
+///
+/// Not yet called from a top-level encoder (see `todo.md`); round-tripped
+/// against `decode_pulses` through the real range coder in `tests` below.
+#[allow(dead_code)]
+pub(crate) fn encode_pulses(
+    y: &[i32],
+    n: usize,
+    k: usize,
+    enc: &mut crate::range::RangeEncoder,
+) -> f32 {
+    let v = pvq_v(n, k);
+    let i = icwrs(n, y);
+    enc.encode_uint(i, v);
+    y[..n].iter().map(|&v| (v * v) as f32).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +388,7 @@ mod tests {
                     let sq: i32 = y[..n].iter().map(|&v| v * v).sum();
                     assert_eq!(yy, sq as f32);
                     assert_eq!(
-                        u64::from(encode_index(n, &y[..n])),
+                        u64::from(icwrs(n, &y[..n])),
                         i,
                         "n={n} k={k} y={:?}",
                         &y[..n]
@@ -350,22 +396,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// `icwrs`: forward mapping (pulse vector -> index), for round trips.
-    fn encode_index(n: usize, y: &[i32]) -> u32 {
-        let mut i = (y[n - 1] < 0) as u32;
-        let mut k = y[n - 1].unsigned_abs() as usize;
-        let mut j = n - 1;
-        while j > 0 {
-            j -= 1;
-            i += pvq_u(n - j, k);
-            k += y[j].unsigned_abs() as usize;
-            if y[j] < 0 {
-                i += pvq_u(n - j, k + 1);
-            }
-        }
-        i
     }
 
     /// Random large (N, K) round trips through the actual range coder.
@@ -396,6 +426,46 @@ mod tests {
                 assert_eq!(abs_sum as u64, k as u64);
                 let sq: f32 = y[..n].iter().map(|&v| (v * v) as f32).sum();
                 assert_eq!(yy, sq);
+            }
+        }
+    }
+
+    /// `encode_pulses` round-tripped through the real range coder: take a
+    /// pulse vector produced by (trusted) `decode_pulses`, re-encode it,
+    /// and check `decode_pulses` on the re-encoded bytes reproduces it
+    /// exactly — for `(n, k)` too large for exhaustive enumeration.
+    #[test]
+    fn encode_pulses_round_trips_through_range_coder() {
+        let mut seed = 0xFEEDFACEu64;
+        for &(n, k) in &[
+            (176usize, 3usize),
+            (88, 4),
+            (16, 12),
+            (8, 32),
+            (2, 120),
+            (12, 15),
+            (4, 96),
+            (6, 64),
+            (21, 7),
+        ] {
+            for _ in 0..20 {
+                let i0 = xorshift(&mut seed) % pvq_v(n, k) as u64;
+                let mut y = [0i32; 200];
+                let mut seed_enc = RangeEncoder::new();
+                seed_enc.encode_uint(i0 as u32, pvq_v(n, k));
+                let seed_frame = seed_enc.done();
+                let yy_expected =
+                    decode_pulses(&mut y, n, k, &mut RangeDecoder::new(&seed_frame)).unwrap();
+
+                let mut enc = RangeEncoder::new();
+                let yy_got = encode_pulses(&y[..n], n, k, &mut enc);
+                assert_eq!(yy_got, yy_expected, "n={n} k={k} y={:?}", &y[..n]);
+                let frame = enc.done();
+
+                let mut dec1 = RangeDecoder::new(&frame);
+                let mut y2 = [0i32; 200];
+                decode_pulses(&mut y2, n, k, &mut dec1).unwrap();
+                assert_eq!(&y2[..n], &y[..n], "n={n} k={k} original={:?}", &y[..n]);
             }
         }
     }

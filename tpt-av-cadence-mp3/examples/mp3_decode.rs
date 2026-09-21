@@ -1,0 +1,34 @@
+//! Decodes an MP3 file to raw interleaved f32 on stdout:
+//! `cargo run -p tpt-av-cadence-mp3 --example mp3_decode -- song.mp3 > out.f32`
+
+use std::fs::File;
+use std::io::Write;
+
+use tpt_av_cadence_core::FormatReader;
+use tpt_av_cadence_mp3::Mp3Reader;
+
+fn main() {
+    let path = std::env::args().nth(1).expect("usage: decode <song.mp3>");
+    let file = File::open(&path).expect("open input");
+    let mut reader = Mp3Reader::open(Box::new(file)).expect("open mp3 stream");
+    let channels = reader.info().channels as usize;
+    eprintln!(
+        "mp3: {} Hz, {} ch, total_frames {:?}",
+        reader.info().sample_rate,
+        channels,
+        reader.info().total_frames
+    );
+    let mut out = std::io::stdout();
+    let mut buf = vec![0.0f32; 8192 * channels];
+    loop {
+        let frames = reader.decoder().decode(&mut buf).expect("decode");
+        if frames == 0 {
+            break;
+        }
+        let bytes: Vec<u8> = buf[..frames * channels]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        out.write_all(&bytes).expect("write");
+    }
+}

@@ -23,7 +23,7 @@ use super::math::celt_udiv;
 use super::tables::{
     BAND_ALLOCATION, CACHE_BITS50, CACHE_CAPS50, CACHE_INDEX50, EBAND5MS, LOGN400,
 };
-use crate::range::RangeDecoder;
+use crate::range::{RangeDecoder, RangeEncoder};
 
 pub(crate) const NB_EBANDS: usize = 21;
 #[allow(dead_code)]
@@ -362,12 +362,258 @@ fn interp_bits2pulses(
     })
 }
 
-/// `clt_compute_allocation`: computes the per-band pulse allocation.
+/// Encode-side counterpart of [`interp_bits2pulses`]. Everything here is
+/// deterministic given the same inputs *except* the three points where the
+/// decoder consults the bitstream (per-band skip bit, intensity index,
+/// dual-stereo bit) — those aren't normative encoder behavior (RFC 6716
+/// only specifies the decoder), so this uses the simplest defensible
+/// policy for a first working encoder: never skip a band while there's a
+/// real skip decision to make (matches `dec.decode_bit_logp(1)? == true`
+/// unconditionally), and never use intensity/dual-stereo coupling
+/// (`intensity == start`, `dual_stereo == false`). Skipping bands *can*
+/// still happen mechanically when a band's bit budget doesn't clear
+/// `thresh[j]` at all (no bit is spent in that case either direction, so
+/// encoder and decoder agree automatically). A smarter policy (actually
+/// choosing to trade off bands/intensity coupling for quality) is future
+/// work — see `todo.md`.
 ///
-/// Returns the per-band pulses (PVQ bits), fine-energy bits, and fine
-/// priorities plus the interpolation results.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compute_allocation(
+/// Verified bit-for-bit against [`interp_bits2pulses`] (same `pulses`,
+/// `ebits`, `fine_priority`, and [`Allocation`] fields) in `tests` below.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn interp_bits2pulses_encode(
+    start: usize,
+    end: usize,
+    skip_start: i32,
+    bits1: &[i32],
+    bits2: &[i32],
+    thresh: &[i32],
+    cap: &[i32],
+    mut total: i32,
+    skip_rsv: i32,
+    intensity_rsv: i32,
+    dual_stereo_rsv: i32,
+    bits: &mut [i32],
+    ebits: &mut [i32],
+    fine_priority: &mut [i32],
+    c: usize,
+    lm: i32,
+    enc: &mut RangeEncoder,
+) -> Allocation {
+    let c_i = c as i32;
+    let alloc_floor = c_i << BITRES;
+    let stereo = c > 1;
+    let logm = lm << BITRES;
+
+    // Bisection over the interpolation fraction (identical to the decoder
+    // — no bitstream I/O).
+    let mut lo = 0i32;
+    let mut hi = 1 << 6; // ALLOC_STEPS
+    for _ in 0..6 {
+        let mid = (lo + hi) >> 1;
+        let mut psum = 0i32;
+        let mut done = false;
+        let mut j = end;
+        while j > start {
+            j -= 1;
+            let tmp = bits1[j] + (mid * bits2[j] >> 6);
+            if tmp >= thresh[j] || done {
+                done = true;
+                psum += tmp.min(cap[j]);
+            } else if tmp >= alloc_floor {
+                psum += alloc_floor;
+            }
+        }
+        if psum > total {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let mut psum = 0i32;
+    let mut done = false;
+    let mut j = end;
+    while j > start {
+        j -= 1;
+        let mut tmp = bits1[j] + (lo * bits2[j] >> 6);
+        if tmp < thresh[j] && !done {
+            tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
+        } else {
+            done = true;
+        }
+        tmp = tmp.min(cap[j]);
+        bits[j] = tmp;
+        psum += tmp;
+    }
+
+    // Decide which bands to skip, working backwards from the end.
+    let mut coded_bands = end;
+    let mut intensity_rsv = intensity_rsv;
+    let mut dual_stereo_rsv = dual_stereo_rsv;
+
+    loop {
+        let j = coded_bands - 1;
+        // Never skip the first band, nor a band boosted by dynalloc.
+        if (j as i32) <= skip_start {
+            // Give the bit we reserved to end skipping back.
+            total += skip_rsv;
+            break;
+        }
+        let left = total - psum;
+        let percoeff = celt_udiv(
+            left as u32,
+            (EBAND5MS[coded_bands] - EBAND5MS[start]) as u32,
+        ) as i32;
+        let left = left - (EBAND5MS[coded_bands] - EBAND5MS[start]) as i32 * percoeff;
+        let rem = (left - (EBAND5MS[j] - EBAND5MS[start]) as i32).max(0);
+        let band_width = EBAND5MS[coded_bands] - EBAND5MS[j];
+        let band_bits = bits[j] + percoeff * band_width as i32 + rem;
+        // Only code a skip decision above the threshold for this band.
+        if band_bits >= thresh[j].max(alloc_floor + (1 << BITRES)) {
+            // Policy: always stop skipping here (see doc comment above).
+            enc.encode_bit_logp(true, 1);
+            break;
+        }
+        // Reclaim the bits originally allocated to this band.
+        psum -= bits[j] + intensity_rsv;
+        if intensity_rsv > 0 {
+            intensity_rsv = LOG2_FRAC_TABLE[j - start];
+        }
+        psum += intensity_rsv;
+        if band_bits >= alloc_floor {
+            // Enough for a fine energy bit per channel.
+            psum += alloc_floor;
+            bits[j] = alloc_floor;
+        } else {
+            bits[j] = 0;
+        }
+        coded_bands -= 1;
+    }
+    debug_assert!(coded_bands > start);
+
+    // Code the intensity and dual stereo parameters. Policy: no
+    // intensity/dual-stereo coupling (see doc comment above).
+    let intensity: usize = if intensity_rsv > 0 {
+        enc.encode_uint(0, (coded_bands + 1 - start) as u32);
+        start
+    } else {
+        0
+    };
+    if intensity <= start {
+        total += dual_stereo_rsv;
+        dual_stereo_rsv = 0;
+    }
+    let dual_stereo = false;
+    if dual_stereo_rsv > 0 {
+        enc.encode_bit_logp(false, 1);
+    }
+
+    // Allocate the remaining bits.
+    let mut left = total - psum;
+    let percoeff = celt_udiv(
+        left as u32,
+        (EBAND5MS[coded_bands] - EBAND5MS[start]) as u32,
+    ) as i32;
+    left -= (EBAND5MS[coded_bands] - EBAND5MS[start]) as i32 * percoeff;
+    for j in start..coded_bands {
+        bits[j] += percoeff * (EBAND5MS[j + 1] - EBAND5MS[j]) as i32;
+    }
+    for j in start..coded_bands {
+        let tmp = left.min((EBAND5MS[j + 1] - EBAND5MS[j]) as i32);
+        bits[j] += tmp;
+        left -= tmp;
+    }
+
+    // Fine energy assignment with rebalancing.
+    let mut balance = 0i32;
+    let mut excess;
+    for j in start..coded_bands {
+        debug_assert!(bits[j] >= 0);
+        let n0 = (EBAND5MS[j + 1] - EBAND5MS[j]) as i32;
+        let n = n0 << lm;
+        let bit = bits[j] + balance;
+
+        if n > 1 {
+            excess = (bit - cap[j]).max(0);
+            bits[j] = bit - excess;
+
+            // Compensate for the extra DoF in stereo.
+            let den = c_i * n + i32::from(c == 2 && n > 2 && !dual_stereo && j < intensity);
+
+            let nclogn = den * (LOGN400[j] as i32 + logm);
+
+            // Offset for the number of fine bits.
+            let mut offset = (nclogn >> 1) - den * FINE_OFFSET;
+
+            // N=2 is the only point that doesn't match the curve.
+            if n == 2 {
+                offset += den << BITRES >> 2;
+            }
+            // Changed offset for the 2nd/3rd fine energy bit.
+            if bits[j] + offset < den * 2 << BITRES {
+                offset += nclogn >> 2;
+            } else if bits[j] + offset < den * 3 << BITRES {
+                offset += nclogn >> 3;
+            }
+
+            // Divide with rounding.
+            ebits[j] = (bits[j] + offset + (den << (BITRES - 1))).max(0);
+            ebits[j] = celt_udiv(ebits[j] as u32, den as u32) as i32 >> BITRES;
+
+            // Make sure not to bust.
+            if c_i * ebits[j] > bits[j] >> BITRES {
+                ebits[j] = bits[j] >> (u32::from(stereo) + BITRES as u32);
+            }
+
+            // More than that is useless.
+            ebits[j] = ebits[j].min(MAX_FINE_BITS);
+
+            // Candidate for the final fine energy pass?
+            fine_priority[j] = i32::from(ebits[j] * (den << BITRES) >= bits[j] + offset);
+
+            // Remove the allocated fine bits; the rest are assigned to PVQ.
+            bits[j] -= c_i * ebits[j] << BITRES;
+        } else {
+            // For N=1, all bits go to fine energy except a sign bit.
+            excess = 0i32.max(bit - (c_i << BITRES));
+            bits[j] = bit - excess;
+            ebits[j] = 0;
+            fine_priority[j] = 1;
+        }
+
+        // Fine energy can't take advantage of quant_all_bands()'s
+        // re-balancing, so do it here.
+        if excess > 0 {
+            let extra_fine =
+                (excess >> (u32::from(stereo) + BITRES as u32)).min(MAX_FINE_BITS - ebits[j]);
+            ebits[j] += extra_fine;
+            let extra_bits = extra_fine * c_i << BITRES;
+            fine_priority[j] = i32::from(extra_bits >= excess - balance);
+            excess -= extra_bits;
+        }
+        balance = excess;
+    }
+    // The skipped bands use all their bits for fine energy.
+    for j in coded_bands..end {
+        ebits[j] = bits[j] >> (u32::from(stereo) + BITRES as u32);
+        debug_assert_eq!((c_i * ebits[j]) << BITRES, bits[j]);
+        bits[j] = 0;
+        fine_priority[j] = i32::from(ebits[j] < 1);
+    }
+
+    Allocation {
+        coded_bands,
+        balance,
+        intensity,
+        dual_stereo,
+    }
+}
+
+/// Shared, deterministic setup for [`compute_allocation`] and
+/// [`compute_allocation_encode`]: everything up to (but not including)
+/// [`interp_bits2pulses`]'s skip/intensity/dual-stereo bitstream I/O. Reads
+/// no bits and writes none, so encoder and decoder call it identically.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn compute_bits1_bits2(
     start: usize,
     end: usize,
     offsets: &[i32],
@@ -376,8 +622,16 @@ pub(crate) fn compute_allocation(
     total_bits: i32,
     lm: i32,
     c: usize,
-    dec: &mut RangeDecoder,
-) -> crate::Result<AllocationResult> {
+) -> (
+    i32,              // total (after skip/intensity/dual-stereo reservations)
+    i32,              // skip_start
+    i32,              // skip_rsv
+    i32,              // intensity_rsv
+    i32,              // dual_stereo_rsv
+    [i32; NB_EBANDS], // bits1
+    [i32; NB_EBANDS], // bits2
+    [i32; NB_EBANDS], // thresh
+) {
     let mut total = total_bits.max(0);
     let skip_start = start as i32;
     // Reserve a bit to signal the end of manually skipped bands.
@@ -493,6 +747,37 @@ pub(crate) fn compute_allocation(
         bits2[j] = bits2j;
     }
 
+    (
+        total,
+        skip_start,
+        skip_rsv,
+        intensity_rsv,
+        dual_stereo_rsv,
+        bits1,
+        bits2,
+        thresh,
+    )
+}
+
+/// `clt_compute_allocation`: computes the per-band pulse allocation.
+///
+/// Returns the per-band pulses (PVQ bits), fine-energy bits, and fine
+/// priorities plus the interpolation results.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_allocation(
+    start: usize,
+    end: usize,
+    offsets: &[i32],
+    cap: &[i32],
+    alloc_trim: i32,
+    total_bits: i32,
+    lm: i32,
+    c: usize,
+    dec: &mut RangeDecoder,
+) -> crate::Result<AllocationResult> {
+    let (total, skip_start, skip_rsv, intensity_rsv, dual_stereo_rsv, bits1, bits2, thresh) =
+        compute_bits1_bits2(start, end, offsets, cap, alloc_trim, total_bits, lm, c);
+
     let mut pulses = [0i32; NB_EBANDS];
     let mut ebits = [0i32; NB_EBANDS];
     let mut fine_priority = [0i32; NB_EBANDS];
@@ -521,6 +806,55 @@ pub(crate) fn compute_allocation(
         ebits,
         fine_priority,
     })
+}
+
+/// Encode-side counterpart of [`compute_allocation`]. See
+/// [`interp_bits2pulses_encode`] for the encoder-policy notes (skip/
+/// intensity/dual-stereo bits aren't normative — RFC 6716 only specifies
+/// the decoder).
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn compute_allocation_encode(
+    start: usize,
+    end: usize,
+    offsets: &[i32],
+    cap: &[i32],
+    alloc_trim: i32,
+    total_bits: i32,
+    lm: i32,
+    c: usize,
+    enc: &mut RangeEncoder,
+) -> AllocationResult {
+    let (total, skip_start, skip_rsv, intensity_rsv, dual_stereo_rsv, bits1, bits2, thresh) =
+        compute_bits1_bits2(start, end, offsets, cap, alloc_trim, total_bits, lm, c);
+
+    let mut pulses = [0i32; NB_EBANDS];
+    let mut ebits = [0i32; NB_EBANDS];
+    let mut fine_priority = [0i32; NB_EBANDS];
+    let alloc = interp_bits2pulses_encode(
+        start,
+        end,
+        skip_start,
+        &bits1,
+        &bits2,
+        &thresh,
+        cap,
+        total,
+        skip_rsv,
+        intensity_rsv,
+        dual_stereo_rsv,
+        &mut pulses,
+        &mut ebits,
+        &mut fine_priority,
+        c,
+        lm,
+        enc,
+    );
+    AllocationResult {
+        alloc,
+        pulses,
+        ebits,
+        fine_priority,
+    }
 }
 
 /// `init_caps` (celt.c): the maximum useful bits per band at this LM/C.
@@ -578,6 +912,67 @@ mod tests {
                 let caps = init_caps(lm, c);
                 for (band, &cv) in caps.iter().enumerate() {
                     assert!(cv >= 0, "band={band} lm={lm} c={c}");
+                }
+            }
+        }
+    }
+
+    /// `compute_allocation_encode` must produce bits that
+    /// `compute_allocation` (the trusted, RFC-conformance-tested decoder
+    /// path) decodes back to the exact same allocation the encoder
+    /// computed — same pulses/ebits/fine_priority per band, same
+    /// coded_bands/balance/intensity/dual_stereo.
+    #[test]
+    fn compute_allocation_encode_round_trips_through_decoder() {
+        use crate::range::RangeEncoder;
+
+        for &c in &[1usize, 2usize] {
+            for lm in 0..4i32 {
+                for &total_bits in &[400i32, 1600, 6400, 16000] {
+                    let offsets = [0i32; NB_EBANDS];
+                    let cap = init_caps(lm as usize, c);
+                    let alloc_trim = 5i32;
+
+                    let mut enc = RangeEncoder::new();
+                    let enc_result = compute_allocation_encode(
+                        0, NB_EBANDS, &offsets, &cap, alloc_trim, total_bits, lm, c, &mut enc,
+                    );
+                    let frame = enc.done();
+
+                    let mut dec = RangeDecoder::new(&frame);
+                    let dec_result = compute_allocation(
+                        0, NB_EBANDS, &offsets, &cap, alloc_trim, total_bits, lm, c, &mut dec,
+                    )
+                    .unwrap();
+
+                    assert_eq!(
+                        enc_result.pulses, dec_result.pulses,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
+                    assert_eq!(
+                        enc_result.ebits, dec_result.ebits,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
+                    assert_eq!(
+                        enc_result.fine_priority, dec_result.fine_priority,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
+                    assert_eq!(
+                        enc_result.alloc.coded_bands, dec_result.alloc.coded_bands,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
+                    assert_eq!(
+                        enc_result.alloc.balance, dec_result.alloc.balance,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
+                    assert_eq!(
+                        enc_result.alloc.intensity, dec_result.alloc.intensity,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
+                    assert_eq!(
+                        enc_result.alloc.dual_stereo, dec_result.alloc.dual_stereo,
+                        "c={c} lm={lm} total_bits={total_bits}"
+                    );
                 }
             }
         }

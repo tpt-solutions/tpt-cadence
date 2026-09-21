@@ -29,6 +29,7 @@ pub mod bands;
 pub mod celt_lpc;
 pub mod cwrs;
 pub mod decoder;
+pub mod encoder;
 pub mod fft;
 pub mod laplace;
 pub mod math;

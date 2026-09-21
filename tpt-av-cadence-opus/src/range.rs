@@ -445,6 +445,18 @@ impl RangeEncoder {
     pub fn tell(&self) -> u32 {
         self.nbits_total - ilog(self.rng)
     }
+
+    /// `ec_tell_frac`: bit usage in 1/8-bit units, mirroring
+    /// [`RangeDecoder::tell_frac`].
+    pub fn tell_frac(&self) -> u32 {
+        static CORRECTION: [u32; 8] = [35733, 38967, 42495, 46340, 50535, 55109, 60097, 65535];
+        let nbits = self.nbits_total << 3;
+        let l = ilog(self.rng);
+        let r = self.rng >> (l - 16);
+        let mut b = (r >> 12) - 8;
+        b += u32::from(r > CORRECTION[b as usize]);
+        nbits - ((l << 3) + b)
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +488,32 @@ mod tests {
             assert!(fs < 4);
             dec.update(fs, fs + 1, 4);
             assert_eq!(fs, sym);
+        }
+    }
+
+    /// `RangeEncoder::tell_frac` must track `RangeDecoder::tell_frac`
+    /// step-by-step on the same bitstream (needed by any encode-side code
+    /// mirroring the decoder's bit-budget accounting, e.g. `compute_theta`).
+    #[test]
+    fn tell_frac_matches_decoder_at_every_step() {
+        let mut rng_state = 42u64;
+        let mut enc = RangeEncoder::new();
+        let mut symbols = Vec::new();
+        let mut enc_tells = Vec::new();
+        for _ in 0..100 {
+            let sym = (xorshift(&mut rng_state) % 4) as u32;
+            enc.encode(sym, sym + 1, 4);
+            symbols.push(sym);
+            enc_tells.push(enc.tell_frac());
+        }
+        let frame = enc.done();
+
+        let mut dec = RangeDecoder::new(&frame);
+        for (i, &sym) in symbols.iter().enumerate() {
+            let fs = dec.decode(4).unwrap();
+            dec.update(fs, fs + 1, 4);
+            assert_eq!(fs, sym);
+            assert_eq!(dec.tell_frac(), enc_tells[i], "step {i}");
         }
     }
 

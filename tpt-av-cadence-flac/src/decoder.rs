@@ -215,13 +215,8 @@ impl FlacDecoder {
                     }
                     continue;
                 }
-                Err(e) => {
+                Err(_) => {
                     // Bad sync/CRC: resume scanning after this candidate.
-                    eprintln!(
-                        "[dbg] header rejected at file_off {}: {}",
-                        self.audio_start + sync as u64,
-                        e
-                    );
                     self.window_pos = sync + 1;
                     continue;
                 }
@@ -257,13 +252,6 @@ impl FlacDecoder {
                     header.block_size as usize,
                     channel_bps,
                 ) {
-                    eprintln!(
-                        "[dbg] subframe fail file_off {} ch {} bps {}: {}",
-                        self.audio_start + sync as u64,
-                        c,
-                        channel_bps,
-                        e
-                    );
                     failed_channel = Some((c, e));
                     break;
                 }
@@ -316,24 +304,11 @@ impl FlacDecoder {
             ]);
             if stream::crc16(frame_bytes) != stored_crc {
                 // Corruption: resynchronize after this candidate.
-                eprintln!(
-                    "[dbg] CRC16 mismatch file_off {} frame_len {}",
-                    self.audio_start + sync as u64,
-                    frame_len
-                );
                 self.window_pos = sync + 1;
                 continue;
             }
 
             // Success: commit.
-            eprintln!(
-                "[acc] file_off {} num {} bs {} mode {:?} len {}",
-                self.audio_start + sync as u64,
-                header.number,
-                header.block_size,
-                header.stereo_mode,
-                frame_len + 2
-            );
             if let Some(mode) = header.stereo_mode {
                 self.decorrelate(mode, header.block_size as usize);
             }
