@@ -1055,27 +1055,44 @@ below):
      port only had the CELT-side transition; testvector10's once-per-
      second hybrid packets started with 2.5 ms of silence (31 dB →
      105.6 dB SNR vs libopus after the fix).
-- REMAINING (accepted float-fidelity gap): vectors 07/08/09 sit at
-  37-56 dB SNR vs live libopus. Per-stage traces confirm the entropy
-  decode AND the band/synthesis/postfilter domains are frequently
-  bit-identical; the residual enters as 1-2 ULP float differences (the
-  reference's MSVC build uses runtime-dispatched SSE kernels —
-  `comb_filter_const_sse`, `celt_inner_prod_sse` — plus CRT `exp()`
-  rounding in `celt_exp2`, whose accumulation/rounding order differs
-  from the Rust port) that the deemphasis IIR then spreads into a
-  ~1e-5 absolute noise floor, measurable only on near-silent passages.
-  The two deterministic SIMD orders HAVE been ported
-  (`comb_filter_const` lane association + its inert `n % 4` tail skip,
-  and `celt_inner_prod`'s 4-lane `(s0+s2)+(s1+s3)` fold in
-  `renormalise_vector`), and the `prev[]` energy-prediction update was
-  corrected to the reference's left-associated
-  `prev = prev + q - beta*q`. Matching the CRT `exp()` bit-for-bit is
-  impossible by construction (platform CRT) and cannot beat the
-  `.dec`-drift argument: even libopus 1.5.2 only reaches 83 dB against
-  the official `.dec` files. `final_range` (100% everywhere) remains
-  the conformance contract. Debug stage traces remain available in
-  `celt/decoder.rs` behind `CELT_C_PCM_DEBUG` (+ optional
-  `CELT_C_DEBUG_FRAME=<n>`), mirroring the oracle build.
+- RESOLVED (session 2026-09-21): the "accepted float-fidelity gap" on
+  vectors 07/08/09 (37-56 dB SNR vs live libopus) was NOT float-ULP/SIMD
+  noise — it was a real, findable bug, found by rebuilding the libopus
+  1.5.2 oracle from scratch (the prior oracle's temp dir was gone; this
+  session installed the VC++/CMake/Ninja workload via the VS installer,
+  since the BuildTools install here had only the base shell) and
+  stage-hash-diffing per-frame `X`/`syn`/`postpf`/`pcm` and, once that
+  narrowed it to a `cm` (collapse-mask) corruption in one specific band,
+  a per-call-site trace of `quant_band`'s recombine/time-divide bit
+  bookkeeping. First falsified hypothesis: disabling libopus's SIMD
+  kernels entirely (`-DOPUS_DISABLE_INTRINSICS=ON`) reproduced the exact
+  same 37-56 dB gap byte-for-byte, ruling out the documented
+  SSE-rounding-order theory outright (and 37-56 dB is far too large an
+  error to be ULP noise regardless — that argument was wrong on its
+  face). **Root cause**: `quant_band` (`celt/bands.rs`)'s post-recursion
+  `cm` mask used the pre-time-divide-undo `b0` (`let b_final = b0 <<
+  recombine`) instead of the loop-mutated `b_blocks` the undo loop left
+  behind. The reference (`celt/bands.c`) reuses one `B` variable across
+  both the time-divide-undo loop and the final `B<<=recombine`, so it
+  naturally sees the post-undo value; the port's shadowed `b_blocks` in
+  the undo loop never fed back into `b_final`. After 3 rounds of
+  time-divide (common on transient content within an otherwise
+  non-transient long frame, via a very negative per-band `tf_res`), the
+  mask went from the correct 1 bit wide to a stale 8 bits wide, leaking
+  spurious high bits of `cm` into the fold-mask (`fill`) computation for
+  *later* bands — corrupting their noise/fold decisions and hence their
+  decoded spectrum, despite `final_range` staying 100% bit-exact
+  throughout (this bookkeeping never touches the entropy coder). Fixed
+  by masking with the loop's own `b_blocks` post-loop value. Result:
+  01 73.4→106.7 dB, 07 49.4→85.2 dB, 08 37.5→101.8 dB, 09 55.8→101.8 dB,
+  10 105.7→105.7 dB (unchanged), 11 99.0→108.4 dB vs live oracle; 05/06/12
+  (hybrid/SILK-heavy vectors) unchanged, consistent with the bug being
+  CELT-only. All 172 crate unit tests + full RFC 6716 conformance green;
+  strict Clippy and `cargo fmt` clean. The oracle build is NOT committed
+  (lives under `C:\Users\phill\AppData\Local\Temp\claude\opus_src\`,
+  rebuildable per the recipe in the CELT root-cause section above; CMake/
+  Ninja obtained via `pip install cmake ninja` rather than the VS CMake
+  component this time, since that component wasn't present either).
 - When comparing any Opus PCM output against the bundled `.dec` files,
   prefer the live-oracle comparison: set `OPUS_ORACLE_PCM_DIR` to a
   directory of `testvectorNN.pcm` files produced by
@@ -1141,8 +1158,8 @@ bit-exact PCM). What closed it:
    the gate is met exactly without them. The deterministic SIMD orders
    that matter are already ported (`comb_filter_const` lane order in
    `celt/pitch.rs`, `celt_inner_prod` fold in `celt/vq.rs`), and the
-   residual 07/08/09 gap remains the accepted float-ULP class documented
-   under Phase 3.
+   residual 07/08/09 gap was later found (2026-09-21, see Phase 3) to be
+   a real `quant_band` collapse-mask bookkeeping bug, not float-ULP noise.
 3. **Clippy**: the concurrent session's `compute_theta` triangular-pdf
    region was restructured to if-expression initializations
    (`needless_late_init` ×2) and the mono fold arm drops its redundant

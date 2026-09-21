@@ -812,7 +812,13 @@ fn quant_band(
         cm = BIT_DEINTERLEAVE[cm as usize];
         haar1(x, n0 >> k, 1 << k);
     }
-    let b_final = b0 << recombine;
+    // `b_blocks` here is left by the time-divide-undo loop above (the
+    // reference reuses its own `B` variable across both loops, so its final
+    // `B<<=recombine` naturally sees the post-undo value). Using the
+    // pre-undo `b0` instead masked `cm` far too wide after any time-divide
+    // (e.g. 8 bits instead of 1 after 3 rounds), leaking stale high bits
+    // of `cm` into later folding decisions for bands quantized this frame.
+    let b_final = b_blocks << recombine;
 
     // Scale output for later folding.
     if let Some(lb) = lowband_out {
