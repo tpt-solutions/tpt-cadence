@@ -1102,6 +1102,39 @@ below):
   opus-codec.org). The conformance test prints a per-vector "SNR vs
   oracle" column when the directory is set.
 
+### Opus — remaining open tasks (tracked explicitly)
+
+- [x] Re-run the full RFC 6716 conformance suite with `OPUS_ORACLE_PCM_DIR`
+  set (2026-09-21, oracle/test-vector dirs from the prior session still on
+  disk at `%TEMP%\claude\opus_testvectors\opus_testvectors` and
+  `%TEMP%\claude\opus_oracle_pcm`): **all 12 vectors still hit 100%
+  `final_range` match** (the real, version-independent bit-exactness
+  contract) and the suite passes. SNR vs oracle: 01 106.7, 05 92.0,
+  06 91.3, 07 85.2, 08 101.8, 09 101.8, 10 105.7, 11 108.4, 12 110.2 dB;
+  02-04 bit-exact (inf dB). Vector 07 sits under a naive 90 dB reading but
+  the test's actual gate is `final_range` + a generous sanity floor (see
+  `tests/conformance.rs` doc comment: even libopus 1.5.2 itself only
+  reaches ~83 dB against the 2012 reference `.dec` files), so this is not
+  a failing gate — no further CELT bug-hunting is required to stay green.
+  Sample-level check on testvector07's two worst packets (its lowest,
+  24.3/49.8 dB) confirms this is cosmetic, not a bug: max |diff| is only
+  3 int16 units against the oracle, occurring during a near-silent onset
+  (signal magnitude single digits to ~50 out of 32768) — the low dB
+  reading is denominator-starvation (tiny `pkt_sd` energy), not a
+  reconstruction error. No further CELT work is warranted here; the
+  stage-hash-diff method against the still-present libopus 1.5.2 oracle
+  build (`%TEMP%\claude\opus_src\build\opus_demo.exe`) remains available
+  if a future session wants to chase the last few LSBs anyway.
+- [x] Confirm `tpt-av-cadence-aac` currently compiles as part of the
+  workspace — verified 2026-09-21 with `cargo build --workspace`: builds
+  clean, no errors. The ~44-error state noted after the hybrid-fold-
+  refactor commit was resolved by the later SBR/AAC-test-suite commit.
+- [x] Clean up or gitignore AAC investigation scratch artifacts
+  (`tpt-av-cadence-aac/blocks.bin`, `my_stripped.f32`, `spans.txt`,
+  `stripped.adts`, `stripped_core.f32`) — deleted 2026-09-21 (unreferenced
+  by any test/build); the `.gitignore` update excluding this class of file
+  is committed alongside.
+
 ## Phase 4 — Legacy & Open Source
 
 - [x] Implement `tpt-av-cadence-mp3` (Huffman decoding, polyphase filterbank, joint stereo) — complete: ten-stream FFmpeg PCM conformance at 118.7–119.4 dB SNR / <=1e-5 peak, structural/replay/robustness/CRC suites, allocation-free `decode()` verified by test

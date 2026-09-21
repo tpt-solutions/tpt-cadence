@@ -12,3 +12,7 @@ Thumbs.db
 *_post.bin
 tools/*.f32
 tools/rust_*.bin
+tpt-av-cadence-aac/*.bin
+tpt-av-cadence-aac/*.f32
+tpt-av-cadence-aac/*.adts
+tpt-av-cadence-aac/spans.txt
