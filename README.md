@@ -5,8 +5,11 @@
 **A pure-Rust, zero-dependency audio codec suite. Memory-safe, real-time capable, and permissively licensed (MIT OR Apache-2.0).**
 
 **Status:** Early-stage / Pre-1.0 — WAV, AIFF, FLAC, and raw PCM are implemented and
-bit-exact conformance-tested; AAC-LC and MP3 pass FFmpeg-reference conformance
-(>100 dB SNR); Opus and Vorbis are under active development.
+bit-exact conformance-tested (decode and encode); AAC-LC and MP3 pass
+FFmpeg-reference conformance (>100 dB SNR) for decode, and both also have
+encoders (MP3's is bitstream-valid but not yet fidelity-competitive); Opus
+has a decoder plus an in-progress CELT encoder foundation, and Vorbis
+decode is conformance-tested with no encoder yet.
 **Ecosystem:** [TPT Solutions Open Source](https://opensource.tptsolutions.co.nz/)
 
 `tpt-cadence` is the **audio codec layer** of the TPT AV Stack. It provides pure-Rust,
@@ -39,14 +42,14 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | Crate | Format | Status |
 | :--- | :--- | :--- |
 | [`tpt-av-cadence-core`](tpt-av-cadence-core) | `Decoder` trait, `StreamInfo`, shared types | ✅ Core API |
-| [`tpt-av-cadence-pcm`](tpt-av-cadence-pcm) | Headerless raw PCM — int 8/16/24/32 + float 32/64, both byte orders | ✅ Stable |
-| [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable |
-| [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable |
-| [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable |
-| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact; `Decoder`/`FormatReader` impls |
+| [`tpt-av-cadence-pcm`](tpt-av-cadence-pcm) | Headerless raw PCM — int 8/16/24/32 + float 32/64, both byte orders | ✅ Stable — decode + encode, bit-exact |
+| [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable — decode + encode, bit-exact |
+| [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable — decode + encode, bit-exact |
+| [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable — decode + encode (fixed predictors only), bit-exact |
+| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact; `Decoder`/`FormatReader` impls. 🚧 `CeltEncoder` foundation (mono/fullband/non-transient/CBR/20 ms) not yet a full `Encoder` |
 | [`tpt-av-cadence-ogg`](tpt-av-cadence-ogg) | Ogg page/packet container (RFC 3533) shared by Vorbis and Opus | ✅ In use |
-| [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg) |
-| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams) |
+| [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg), decode-only |
+| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams). ⚠️ Encoder produces valid bitstreams (FFmpeg-decodable) but poor audio fidelity — analysis-filter mismatch, see `todo.md` |
 | [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures) |
 | [`tpt-av-cadence-test-utils`](tpt-av-cadence-test-utils) | Conformance harness — FFmpeg comparison, fuzz helpers, MD5 | ✅ Internal (dev-only) |
 
@@ -99,15 +102,25 @@ stderr; most write raw PCM to stdout — redirect it to a file:
 (`s8`, `s16le`/`s16be`, `s24le`/`s24be`, `s32le`/`s32be`, `f32le`/`f32be`,
 `f64le`/`f64be`) since headerless PCM carries no self-describing metadata.
 
-Encoders exist today for the three uncompressed formats (WAV, AIFF, PCM);
-there are no compressed-format encoders yet (FLAC/MP3/AAC/Opus/Vorbis are
-decode-only):
+Encoders exist today for the three uncompressed formats (WAV, AIFF, PCM),
+plus FLAC (lossless) and a bitstream-valid but not yet quality-competitive
+MP3 encoder; AAC and Vorbis are decode-only, and Opus has an encoder
+foundation (`CeltEncoder`: mono, fullband, non-transient, CBR, 20 ms frames
+only) that isn't wired up to a full `Encoder` impl yet:
 
 | Format | Crate | Run it |
 | :--- | :--- | :--- |
 | WAV | [`tpt-av-cadence-wav`](tpt-av-cadence-wav/examples/wav_encode.rs) | `cargo run -p tpt-av-cadence-wav --example wav_encode -- tone.wav` |
 | AIFF-C | [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff/examples/aiff_encode.rs) | `cargo run -p tpt-av-cadence-aiff --example aiff_encode -- tone.aiff` |
 | Raw PCM (headerless) | [`tpt-av-cadence-pcm`](tpt-av-cadence-pcm/examples/pcm_encode.rs) | `cargo run -p tpt-av-cadence-pcm --example pcm_encode -- tone.raw` |
+| FLAC | [`tpt-av-cadence-flac`](tpt-av-cadence-flac/examples/flac_encode.rs) | `cargo run -p tpt-av-cadence-flac --example flac_encode -- tone.flac` |
+| MP3 | [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3/examples/mp3_encode.rs) | `cargo run -p tpt-av-cadence-mp3 --example mp3_encode -- tone.mp3` |
+
+MP3's encoder produces valid, independently FFmpeg-decodable bitstreams,
+but its analysis filterbank is a generic approximation rather than the
+matched ISO reference prototype, so decoded audio fidelity is currently
+poor — see `todo.md`'s "MP3 encoder" notes before relying on it for
+anything but bitstream-shape testing.
 
 ### Decode any supported format to PCM
 

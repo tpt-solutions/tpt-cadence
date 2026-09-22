@@ -31,29 +31,36 @@
 //!   scalefactor-band tables for all three MPEG-1 sample rates sum to
 //!   exactly 576), which also means `preflag`/`scalefac_scale` are
 //!   irrelevant (always written `false`/`0`).
-//! - **Subband splitting uses the ISO reference's actual 512-tap polyphase
-//!   analysis filter** (`tables::ANALYSIS_WINDOW`, folded and matrixed in
-//!   `analyze_block_polyphase`), the same published constant table
+//! - **Subband splitting uses the ISO reference's published 512-tap
+//!   polyphase analysis filter** (`tables::ANALYSIS_WINDOW`, folded and
+//!   matrixed in `analyze_block_polyphase`), the same constant table
 //!   essentially every MP3 encoder embeds (LAME's `enwindow`, the ISO
-//!   reference's `Ci` table, `shine`'s `shine_enwindow`) — not a
-//!   numerically-extracted or generic substitute. Matching this exact
-//!   prototype (rather than merely matching its modulation frequency) is
-//!   what makes analysis and the decoder's fixed synthesis filter
-//!   (`crate::synth`) a properly matched analysis/synthesis pair for this
-//!   maximally-decimated cosine-modulated filterbank, which is required for
-//!   accurate (not just frequency-plausible) reconstruction. The per-band
-//!   36-point forward MDCT is the exact analytic adjoint of this crate's
-//!   decoder IMDCT (derived algebraically from `crate::imdct::imdct_gr` and
-//!   verified against it directly in this module's tests), and the encoder
-//!   also pre-compensates for the decoder's unconditional
-//!   `antialias`/`change_sign` post-processing steps — so every stage of
-//!   this pipeline is now a verified-exact or standard-matched inverse of
-//!   the decoder's corresponding stage.
+//!   reference's `Ci` table, `shine`'s `shine_enwindow`) — not a generic
+//!   substitute. The implementation was checked directly against the live
+//!   `shine` encoder source line by line (sample-fill order, fold formula,
+//!   offset update, matrixing formula all verified to match), so this is a
+//!   faithful port, not a guess. **However, this does NOT yet reconstruct
+//!   accurately against this crate's decoder** (`crate::synth`) — an
+//!   isolation test that bypasses the MDCT/quant/Huffman stages entirely
+//!   still shows poor correlation, and a direct probe of `crate::synth`'s
+//!   own per-band impulse response suggests its internal representation
+//!   (derived from a `minimp3`-style fast/folded synthesis algorithm, not a
+//!   plain per-tap FIR) may not correspond to the plain ISO/shine model the
+//!   way this implementation assumes. See `todo.md`'s "MP3 encoder
+//!   (2026-09-22, continued)" section for the full investigation, what was
+//!   ruled out, and the recommended next step. The per-band 36-point
+//!   forward MDCT (by contrast) IS verified exact: it's the analytic
+//!   adjoint of this crate's decoder IMDCT, derived algebraically from
+//!   `crate::imdct::imdct_gr` and checked against it directly in this
+//!   module's tests. The encoder also pre-compensates for the decoder's
+//!   unconditional `antialias`/`change_sign` post-processing steps.
 //!
-//! Despite the reduced ambition, output is fully spec-compliant Layer III:
-//! valid sync/header fields, valid side info, valid Huffman-coded spectral
-//! data, and it decodes cleanly both in this crate's own decoder and in
-//! FFmpeg (see `tests/ffmpeg_crosscheck.rs`).
+//! Despite the reduced ambition and the open analysis-filter fidelity gap,
+//! output is fully spec-compliant Layer III: valid sync/header fields,
+//! valid side info, valid Huffman-coded spectral data, and it decodes
+//! cleanly (i.e. without error, though not yet with good fidelity) both in
+//! this crate's own decoder and in FFmpeg (see
+//! `tests/ffmpeg_crosscheck.rs`).
 
 use std::io::Write;
 
@@ -1281,5 +1288,190 @@ mod tests {
         assert_eq!(pick_table_select(30), 24);
         assert_eq!(pick_table_select(31), 25);
         assert_eq!(pick_table_select(8206), 31);
+    }
+
+    /// Isolates `analyze_block_polyphase` from the MDCT/quantization/Huffman
+    /// stages entirely: feeds raw analysis-filter subband output straight
+    /// into `crate::synth::dct_ii` + `synth_granule` (skipping
+    /// `forward_mdct36`/`imdct_gr` altogether, since both of those are
+    /// independently verified elsewhere), and checks the round trip
+    /// reconstructs a sine tone with strong correlation. If this fails, the
+    /// bug is in `analyze_block_polyphase` (or its mismatch with
+    /// `crate::synth`) specifically, not in the MDCT/quant/Huffman chain.
+    #[test]
+    #[ignore = "confirms the known-open analysis/synthesis filterbank \
+                mismatch (see todo.md's MP3 encoder session log); kept as \
+                the isolated regression target for that fix, not a \
+                currently-passing guarantee"]
+    fn analysis_filter_alone_round_trips_through_synth() {
+        use crate::synth;
+
+        let sample_rate = 44_100.0f32;
+        let freq = 1000.0f32;
+        let n_granules = 40; // 40 * 576 = 23040 samples, plenty to settle.
+        let total_samples = n_granules * 576;
+
+        let x: Vec<f32> = (0..total_samples + HAN_SIZE)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate).sin() * 0.5)
+            .collect();
+
+        let mut hist = [0.0f32; HAN_SIZE];
+        let mut off = 0usize;
+        let mut qmf_state = [0.0f32; 960];
+        let mut lins = vec![0.0f32; 33 * 64];
+        let mut pcm_out = Vec::with_capacity(total_samples);
+
+        for g in 0..n_granules {
+            let mut grbuf = [0.0f32; 576];
+            for t in 0..18usize {
+                let base = g * 576 + t * 32;
+                let mut new_samples = [0.0f32; 32];
+                new_samples.copy_from_slice(&x[base..base + 32]);
+                let mut subbands = [0.0f32; 32];
+                analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut subbands);
+                for band in 0..32usize {
+                    grbuf[band * 18 + t] = subbands[band];
+                }
+            }
+            synth::dct_ii(&mut grbuf, 18);
+            let mut pcm = [0.0f32; 576];
+            synth::synth_granule(&mut qmf_state, &mut grbuf, 1, &mut pcm, &mut lins);
+            pcm_out.extend_from_slice(&pcm);
+        }
+
+        // Cross-correlate against the (delay-compensated) source to find the
+        // pipeline's total latency, then check the aligned correlation.
+        let skip = 2000; // let history/filter state settle before scoring
+        let mut best_corr = -1.0f64;
+        let mut best_delay = 0usize;
+        for delay in 0..1024usize {
+            if delay + skip + 4000 > pcm_out.len() || delay + skip + 4000 > x.len() {
+                continue;
+            }
+            let a = &pcm_out[skip..skip + 4000];
+            let b = &x[skip.saturating_sub(delay)..skip.saturating_sub(delay) + 4000];
+            let (mut num, mut da, mut db) = (0.0f64, 0.0f64, 0.0f64);
+            for (av, bv) in a.iter().zip(b.iter()) {
+                num += (*av as f64) * (*bv as f64);
+                da += (*av as f64) * (*av as f64);
+                db += (*bv as f64) * (*bv as f64);
+            }
+            let corr = num / (da.sqrt() * db.sqrt() + 1e-12);
+            if corr > best_corr {
+                best_corr = corr;
+                best_delay = delay;
+            }
+        }
+
+        assert!(
+            best_corr > 0.9,
+            "analysis-filter-only round trip doesn't correlate with source: \
+             best_corr={best_corr} at delay={best_delay}"
+        );
+    }
+
+    /// Probes `crate::synth`'s true per-band impulse response directly
+    /// (bypassing `analyze_block_polyphase` entirely): sets one subband's
+    /// one time-sample to 1.0, runs `dct_ii`+`synth_granule`, and reports
+    /// where the resulting PCM energy is concentrated. This tells us what
+    /// envelope the *decoder* actually expects for band 0, independent of
+    /// whatever analysis-side table/formula we transcribe.
+    #[test]
+    fn synth_single_band_impulse_response_diagnostic() {
+        use crate::synth;
+        let band = 0usize;
+        let n_granules = 4;
+        let mut qmf_state = [0.0f32; 960];
+        let mut lins = vec![0.0f32; 33 * 64];
+        let mut pcm_out = Vec::new();
+        for g in 0..n_granules {
+            let mut grbuf = [0.0f32; 576];
+            if g == 0 {
+                grbuf[band * 18] = 1.0; // t=0 of the chosen band
+            }
+            synth::dct_ii(&mut grbuf, 18);
+            let mut pcm = [0.0f32; 576];
+            synth::synth_granule(&mut qmf_state, &mut grbuf, 1, &mut pcm, &mut lins);
+            pcm_out.extend_from_slice(&pcm);
+        }
+        let nz: Vec<(usize, f32)> = pcm_out
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.abs() > 1e-6)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        eprintln!(
+            "band {band} t=0 impulse -> {} nonzero PCM samples",
+            nz.len()
+        );
+        if let (Some(&(first, _)), Some(&(last, _))) = (nz.first(), nz.last()) {
+            eprintln!("span: [{first}, {last}] (width {})", last - first + 1);
+        }
+        for (i, v) in nz.iter().take(20) {
+            eprintln!("  [{i}] = {v}");
+        }
+        eprintln!("  ...");
+        for (i, v) in nz
+            .iter()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            eprintln!("  [{i}] = {v}");
+        }
+    }
+
+    #[test]
+    fn analysis_filter_impulse_response_diagnostic() {
+        use crate::synth;
+
+        let n_granules = 10;
+        let total_samples = n_granules * 576;
+        let impulse_pos = 3000usize;
+        let mut x = vec![0.0f32; total_samples + HAN_SIZE];
+        x[impulse_pos] = 1.0;
+
+        let mut hist = [0.0f32; HAN_SIZE];
+        let mut off = 0usize;
+        let mut qmf_state = [0.0f32; 960];
+        let mut lins = vec![0.0f32; 33 * 64];
+        let mut pcm_out = Vec::with_capacity(total_samples);
+
+        for g in 0..n_granules {
+            let mut grbuf = [0.0f32; 576];
+            for t in 0..18usize {
+                let base = g * 576 + t * 32;
+                let mut new_samples = [0.0f32; 32];
+                new_samples.copy_from_slice(&x[base..base + 32]);
+                let mut subbands = [0.0f32; 32];
+                analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut subbands);
+                for band in 0..32usize {
+                    grbuf[band * 18 + t] = subbands[band];
+                }
+            }
+            synth::dct_ii(&mut grbuf, 18);
+            let mut pcm = [0.0f32; 576];
+            synth::synth_granule(&mut qmf_state, &mut grbuf, 1, &mut pcm, &mut lins);
+            pcm_out.extend_from_slice(&pcm);
+        }
+
+        let (mut peak_idx, mut peak_val) = (0usize, 0.0f32);
+        for (i, &v) in pcm_out.iter().enumerate() {
+            if v.abs() > peak_val.abs() {
+                peak_val = v;
+                peak_idx = i;
+            }
+        }
+        eprintln!(
+            "impulse at {impulse_pos}, peak {peak_val} at {peak_idx} (delay {})",
+            peak_idx as i64 - impulse_pos as i64
+        );
+        let lo = peak_idx.saturating_sub(20);
+        let hi = (peak_idx + 20).min(pcm_out.len());
+        for (i, v) in pcm_out.iter().enumerate().take(hi).skip(lo) {
+            eprintln!("  [{i}] (rel {}) = {v}", i as i64 - impulse_pos as i64);
+        }
     }
 }

@@ -43,7 +43,12 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 - MP3 encoder produces valid, independently-FFmpeg-decodable bitstreams but
   poor audio fidelity: its analysis filterbank is a generic substitute, not
   matched to the decoder's real fixed synthesis prototype (see `todo.md`'s
-  "MP3 encoder" session log for what was tried and the likely fix).
+  "MP3 encoder" session log for what was tried and the likely fix). A new
+  diagnostic test (`analysis_filter_alone_round_trips_through_synth`)
+  isolates `analyze_block_polyphase` from the MDCT/quantization/Huffman
+  stages entirely and confirms the mismatch is localized there (weak
+  correlation, ~0.24, feeding straight into the decoder's synthesis
+  filterbank) rather than anywhere downstream.
 - Encoders beyond the Opus CELT foundation, the WAV/AIFF/PCM writers, the
   FLAC encoder, and the MP3 encoder above (Vorbis, AAC) are not yet started;
   AAC encoding is on hold pending a patent-licensing decision.

@@ -1540,48 +1540,125 @@ the decoder backward" the way FLAC's fixed predictors can.
   encoder.
 
 **Known, unresolved limitation — audio fidelity is currently poor:**
-The subband analysis filter (`analyze_block_polyphase`, a Hann-windowed
-sinc lowpass folded across 4 stacked 64-sample phases) is a *generic*
-approximation, not the ISO reference's actual prototype filter, and this
-turned out to matter far more than expected. A maximally-decimated
-cosine-modulated filterbank (which is what MP3's 32-subband split is) only
-achieves near-perfect reconstruction when the analysis and synthesis
-prototypes are properly matched (the same filter, or time-reverses of each
-other) — matching the *modulation frequency* exactly (which this encoder
-does, using the ISO reference's own `cos((2k+1)*(i-16)*pi/64)` formula) is
-necessary but not sufficient. With a generic, unmatched prototype, decoded
-sine tones and noise show weak-to-no correlation with the source even
-though every other stage (Huffman, MDCT, antialias/change_sign
-compensation, CBR framing) is independently verified exact. This session
-tried three fixes, in order, before running out of time:
+The subband analysis filter (`analyze_block_polyphase`) was originally a
+generic Hann-windowed-sinc approximation (see the superseded three-fix
+account below); this was replaced in a follow-up session with a more
+principled attempt, described here, which narrowed the problem
+significantly but still did not close the gap.
+
+**Follow-up session (2026-09-22, continued): isolated the bug to the
+analysis filter specifically, verified the implementation against the
+actual reference source (not memory), still doesn't reconstruct.**
+
+1. **Isolation test** (`analysis_filter_alone_round_trips_through_synth`,
+   `#[ignore]`d, kept as the regression target): feeds
+   `analyze_block_polyphase`'s raw subband output directly into
+   `crate::synth::dct_ii`+`synth_granule`, skipping `forward_mdct36`/
+   `imdct_gr`/quantization/Huffman entirely (all independently verified
+   elsewhere — see above). This isolates the question to exactly two
+   functions: `analyze_block_polyphase` vs. `crate::synth`. Result: still
+   poor correlation (~0.24 for a 1 kHz tone, best delay ≈480-490 samples —
+   suspiciously close to the polyphase filterbank's well-known ≈481-sample
+   textbook delay, so the *timing* is roughly right but the *shape* is not).
+   Confirms the bug is in this pair specifically, not in the MDCT/quant/
+   Huffman chain (which the earlier session's own diagnosis already
+   suspected but hadn't isolated with a dedicated test).
+2. **Transcribed the real ISO/shine `Ci`/`enwindow` 512-tap table**
+   (`tables::ANALYSIS_WINDOW`) and re-implemented `analyze_block_polyphase`
+   to match the actual reference algorithm, rather than a generic window —
+   this is the "empirically extract the divide-out-modulation approach was
+   too fragile" alternative the previous session's account recommended
+   trying. Verified the *implementation itself* against the live `shine`
+   encoder source (`github.com/savonet/shine`, `src/lib/l3subband.c`,
+   fetched and read directly, not recalled from memory) line by line:
+   - Sample fill order: shine's `for(i=32;i--;) x[off+i]=*ptr++` writes the
+     32 new samples in *reverse* (x[off+31]=newest-read-first,
+     ..., x[off+0]=last-read) — tried both this reversed order and the
+     naive forward order; **made no measurable difference to the
+     correlation** (0.2435 either way on the isolation test with a pure
+     sine probe). This is a real but inconclusive experiment: a sine wave
+     is time-symmetric, so it cannot actually distinguish the two
+     orderings — a mistake in the experiment design, caught by re-running
+     with an impulse instead (see below), not by the sine result itself.
+   - Fold formula (`y[i] = sum_{m=0..7} x[off+i+64m] * window[i+64m]`):
+     matches shine's `s_value` accumulation exactly.
+   - Offset update (`off = (off+480) mod 512`): matches shine's
+     `off = (off+480) & (HAN_SIZE-1)` exactly.
+   - Matrixing (`out[k] = sum_i y[i] * cos((2k+1)*(i-16)*pi/64)`):
+     algebraically identical to shine's
+     `fl[i][j] = cos((2i+1)*(16-j)*pi/64)` (cosine is even, so `(i-16)` and
+     `(16-j)`-with-swapped-role give the same values).
+   So the transcribed implementation is a faithful port of shine's
+   algorithm, verified against real reference source — yet the isolated
+   round trip still doesn't reconstruct well.
+3. **Probed `crate::synth`'s own true per-band impulse response directly**
+   (`synth_single_band_impulse_response_diagnostic`, an unasserted
+   diagnostic test kept for whoever continues this): set one subband's one
+   time-sample to 1.0 with everything else zero, ran `dct_ii`+
+   `synth_granule` with no analysis filter involved at all, and inspected
+   where the resulting PCM energy lands. Result: a real, bounded, clean
+   impulse response spanning ~487 samples, but with its *dominant*
+   magnitude concentrated near the *end* of that span (index ~495-497 of a
+   [22,508] span) rather than symmetric/centered the way the transcribed
+   `ANALYSIS_WINDOW` table's shape is — suggesting `crate::synth`'s
+   internal representation (derived from a `minimp3`-style fast/folded
+   synthesis algorithm, not a plain per-tap FIR) may not correspond to the
+   plain ISO/shine model in the direction or normalization this session
+   assumed, even though the *matrixing formula itself* checks out
+   algebraically. This was not resolved further.
+
+**Honest status:** the analysis filter is now a verified-faithful port of
+a real reference algorithm (a strictly better foundation than the earlier
+generic-window attempt), and the bug has been narrowed to a specific,
+small, two-function isolation test — but the actual remaining defect is
+still unidentified. Per this project's established discipline (see the AAC
+SBR investigation and the CELT `final_range` history for the same
+pattern), no further guessing was done once the two most-likely hypotheses
+(sample-fill direction; formula transcription error) were checked and
+ruled out. **Next step for whoever picks this up:** don't trust the
+shine/ISO model's applicability to `crate::synth` on faith — instead,
+numerically construct the *exact* adjoint of `crate::synth`'s real,
+already-trusted transform (probe multiple bands/time-slots the way
+`synth_single_band_impulse_response_diagnostic` does for band 0, build up
+the full per-band impulse response set, and derive the analysis filter
+from *those measured responses* rather than from the separately-sourced
+ISO table) — the same strategy that worked for the forward MDCT
+(`Mdct36Basis`/`probe_l`) in this same encoder. The isolation test and both
+diagnostic tests (`analysis_filter_alone_round_trips_through_synth`,
+`synth_single_band_impulse_response_diagnostic`,
+`analysis_filter_impulse_response_diagnostic`) are kept in
+`src/encoder.rs`'s test module specifically to make this tractable without
+re-deriving the isolation harness from scratch.
+
+<details>
+<summary>Superseded: original three-fix account from the first session
+(generic Hann window era, kept for history)</summary>
+
+The subband analysis filter was originally a Hann-windowed sinc lowpass
+folded across 4 stacked 64-sample phases — a *generic* approximation, not
+the ISO reference's actual prototype filter. This session tried three
+fixes, in order, before running out of time:
 1. A longer, better-sidelobe (Blackman vs. Hann) prototype — made it
-   *worse* (energy concentration ratio dropped, not rose), which in
-   hindsight makes sense: a more selective but still-mismatched filter
-   doesn't help a matching problem.
+   *worse* (energy concentration ratio dropped, not rose).
 2. Empirically extracting the *real* prototype by probing the decoder's
    own `crate::synth::dct_ii`+`synth_granule` with a unit impulse and
-   dividing out the known modulation — theoretically the right fix (the
-   matched-pair guarantee is then exact, not approximate), and confirmed
-   the underlying idea is sound (`dct_ii` applied to a band-0-only input
-   does reduce to exactly one cosine term, as expected). But the recovered
-   filter, used directly, produced an *unbounded-growing* reconstruction —
-   worse than the generic filter's bounded-but-poor one.
+   dividing out the known modulation — theoretically sound, but the
+   recovered filter produced an *unbounded-growing* reconstruction.
 3. Interpolating across the division's zero-crossing instabilities instead
    of clamping through them — reduced but did not eliminate the growth.
-Given the time already spent, reverted to the generic (Hann, 4-phase)
-prototype, which is at least stable, and stopped rather than risk shipping
-something worse while chasing the extraction bug further. The two
-perceptual-fidelity tests that would catch this
+Reverted to the generic (Hann, 4-phase) prototype (stable but low-fidelity)
+rather than ship something worse. Superseded by the follow-up session
+above, which replaced the generic window with a verified-faithful port of
+the real reference algorithm — a real improvement in rigor, even though
+the fidelity gap itself is not yet closed.
+
+</details>
+
+The two perceptual-fidelity tests that would catch a real fix
 (`mono_sine_tone_decodes_with_concentrated_energy`,
 `stereo_white_noise_round_trips_recognizably` in
-`tests/encoder_roundtrip.rs`) are marked `#[ignore]` with an explanation
-rather than deleted or weakened to pass — they're the concrete target for
-whoever picks this up next. The likely correct fix is finishing the
-empirical-extraction approach (root-causing why the interpolated version
-still grows — plausibly the folding across 4 phases amplifying a
-still-slightly-biased per-phase estimate, worth checking with `PROTO_PHASES
-= 1` first to isolate folding from extraction) rather than tuning the
-generic filter further, per the diagnosis above.
+`tests/encoder_roundtrip.rs`) remain `#[ignore]`d with an explanation
+rather than deleted or weakened to pass.
 
 Also observed, not yet root-caused: FFmpeg's `mp3float` decoder logs
 non-fatal "overread, skip ..." warnings for some frames of low-bitrate
