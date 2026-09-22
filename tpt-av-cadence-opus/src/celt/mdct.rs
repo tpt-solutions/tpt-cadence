@@ -507,6 +507,95 @@ mod tests {
         );
     }
 
+    /// Same methodology as
+    /// [`forward_backward_multiframe_is_unity_gain_with_overlap_delay`], but
+    /// at `shift = 3` (`lm = 0`, i.e. `n2 = 120 == overlap` — the smallest
+    /// CELT frame size, where the entire frame is inside the MDCT overlap
+    /// region, unlike every other `lm`). Added while diagnosing a real
+    /// encoder-side bug found when generalizing `CeltEncoder` to variable
+    /// frame sizes (see `todo.md`): the `lm == 0` non-transient path drove
+    /// `mdct_forward` with `shift = 3, stride = 1` and the real `WINDOW120`
+    /// window for the first time (previously only exercised with a *flat*
+    /// window at this shift, in `forward_matches_analytic_mdct`/
+    /// `backward_matches_analytic_mdct`, or with `stride = 8` via the
+    /// transient short-block path) — this test isolates whether the
+    /// composed transform itself is at fault at this specific
+    /// `(shift, stride, window)` combination, independent of the encoder's
+    /// band/PVQ pipeline.
+    #[test]
+    fn forward_backward_multiframe_is_unity_gain_with_overlap_delay_lm0() {
+        let n2 = 120usize;
+        let overlap = 120usize;
+        let half = overlap / 2;
+        let shift = 3usize;
+        let nframes = 40;
+
+        let total = n2 * nframes;
+        let w = 0.5f64; // rad/sample; a few samples/cycle fits inside a 120-sample frame.
+        let sig: Vec<f32> = (0..total).map(|k| (w * k as f64).sin() as f32).collect();
+
+        let mut mdct_tail = vec![0.0f32; overlap];
+        let mut scratch = vec![Cpx::default(); n2]; // oversized is fine; forward/backward only use their own n4 prefix.
+        let mut freqs: Vec<Vec<f32>> = Vec::new();
+        for f in 0..nframes {
+            let frame = &sig[f * n2..(f + 1) * n2];
+            let mut mdct_in = vec![0.0f32; overlap + n2];
+            mdct_in[..overlap].copy_from_slice(&mdct_tail);
+            mdct_in[overlap..].copy_from_slice(frame);
+            let mut spec = vec![0.0f32; n2];
+            mdct_forward(&mdct_in, &mut spec, &WINDOW120, overlap, shift, 1, &mut scratch);
+            mdct_tail.copy_from_slice(&frame[n2 - overlap..]);
+            freqs.push(spec);
+        }
+
+        let mut buf = vec![0.0f32; half + n2];
+        let mut decoded: Vec<f32> = Vec::new();
+        for spec in &freqs {
+            let prev_tail: Vec<f32> = buf[n2..n2 + half].to_vec();
+            buf[..half].copy_from_slice(&prev_tail);
+            mdct_backward(spec, &mut buf, &WINDOW120, overlap, shift, 1, &mut scratch);
+            decoded.extend_from_slice(&buf[..n2]);
+        }
+
+        let fit = |data: &[f32], start: usize, len: usize| -> (f64, f64) {
+            let (mut sc, mut cc, mut ss, mut sd, mut cd) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for i in 0..len {
+                let t = (start + i) as f64;
+                let s = (w * t).sin();
+                let c = (w * t).cos();
+                let d = data[start + i] as f64;
+                sc += s * c;
+                ss += s * s;
+                cc += c * c;
+                sd += s * d;
+                cd += c * d;
+            }
+            let det = ss * cc - sc * sc;
+            let a = (sd * cc - cd * sc) / det;
+            let b = (ss * cd - sc * sd) / det;
+            let amp = (a * a + b * b).sqrt();
+            let phase = b.atan2(a);
+            (amp, phase)
+        };
+        let probe_start = n2 * 10;
+        let probe_len = n2 * 10;
+        let (amp_sig, phase_sig) = fit(&sig, probe_start, probe_len);
+        let (amp_dec, phase_dec) = fit(&decoded, probe_start, probe_len);
+        let gain = amp_dec / amp_sig;
+        let period = 2.0 * std::f64::consts::PI / w;
+        let raw_delay = (phase_sig - phase_dec) / w;
+        let delay_samples = raw_delay + period * ((overlap as f64 - raw_delay) / period).round();
+
+        assert!(
+            (gain - 1.0).abs() < 1e-2,
+            "lm=0 composed mdct_forward/mdct_backward gain {gain:.6} != 1.0"
+        );
+        assert!(
+            (delay_samples - overlap as f64).abs() < 1e-1,
+            "lm=0 composed mdct_forward/mdct_backward delay {delay_samples:.6} samples != OVERLAP ({overlap})"
+        );
+    }
+
     /// Forward then backward on a real windowed block: the composed transform
     /// must be finite and bounded (the fold spread is well within the frame).
     #[test]

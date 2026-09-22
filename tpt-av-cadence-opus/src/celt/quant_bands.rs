@@ -497,4 +497,89 @@ mod encode_tests {
             assert!(err < 1.0, "idx={idx} target={target} got={got} err={err}");
         }
     }
+
+    /// DEBUG: same as above but channel 1 is pinned at -9.0 (silence) for
+    /// every band, mirroring `CeltEncoder`'s hard-panned stereo test.
+    /// Isolates whether the coarse/fine/finalise energy round trip stays
+    /// bit-exact when one whole channel is silent.
+    #[test]
+    fn coarse_fine_finalise_round_trip_with_silent_channel() {
+        let c = 2usize;
+        let lm = 3usize;
+        let start = 0usize;
+        let end = NB_EBANDS;
+        let mut seed = 0xA11CE5EEDu64;
+        let len = 200usize;
+
+        let mut means = [0f32; 2 * NB_EBANDS];
+        for m in means[..NB_EBANDS].iter_mut() {
+            *m = lcg_next(&mut seed);
+        }
+        for m in means[NB_EBANDS..].iter_mut() {
+            *m = -9.0;
+        }
+
+        let mut enc_ebands = [-9.0f32; 2 * NB_EBANDS];
+        let mut error = [0f32; 2 * NB_EBANDS];
+        let mut enc = RangeEncoder::new();
+        quant_coarse_energy(
+            start,
+            end,
+            &means,
+            &mut enc_ebands,
+            &mut error,
+            true,
+            len,
+            &mut enc,
+            c,
+            lm,
+        );
+
+        let fine_quant = [3i32; NB_EBANDS];
+        quant_fine_energy(
+            start,
+            end,
+            &mut enc_ebands,
+            &mut error,
+            &fine_quant,
+            &mut enc,
+            c,
+        );
+
+        let fine_priority = [0i32; NB_EBANDS];
+        quant_energy_finalise(
+            start,
+            end,
+            &mut enc_ebands,
+            &error,
+            &fine_quant,
+            &fine_priority,
+            (c * 4) as i32,
+            &mut enc,
+            c,
+        );
+
+        let frame = enc.done();
+
+        let mut dec_ebands = [-9.0f32; 2 * NB_EBANDS];
+        let mut dec = RangeDecoder::new(&frame);
+        unquant_coarse_energy(start, end, &mut dec_ebands, true, len, &mut dec, c, lm).unwrap();
+        unquant_fine_energy(start, end, &mut dec_ebands, &fine_quant, &mut dec, c).unwrap();
+        unquant_energy_finalise(
+            start,
+            end,
+            &mut dec_ebands,
+            &fine_quant,
+            &fine_priority,
+            (c * 4) as i32,
+            &mut dec,
+            c,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enc_ebands, dec_ebands,
+            "encoder and decoder energy state diverged with a silent channel"
+        );
+    }
 }

@@ -3,7 +3,7 @@
 Opus (RFC 6716) decoder for the `tpt-cadence` audio codec suite, with an
 Ogg Opus (RFC 7845) container layer.
 
-**Status:** ✅ Conformance-tested. Implemented:
+**Status:** ✅ Conformance-tested. Implemented: 
 
 - Packet parser (TOC byte, frame framing) and the bit-exact range coder
 - Full CELT decoder and full SILK decoder

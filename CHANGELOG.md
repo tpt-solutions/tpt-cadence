@@ -9,11 +9,17 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 
 ### Added
 - Opus CELT encoder foundation: forward MDCT wired into a working
-  `CeltEncoder` (mono, fullband, non-transient, CBR, 20 ms frames only) with
-  a passing encode-then-decode round trip. This is the first landed piece of
-  the planned Opus encoder (the user-confirmed first encoder target); hybrid
-  SILK+CELT encoding, VBR, transient handling, and other frame sizes/channel
-  configs are not yet implemented.
+  `CeltEncoder` (mono or stereo, fullband, CBR, 20 ms frames only) with a
+  passing encode-then-decode round trip, now including real transient
+  detection, short-block MDCT/TF-resolution encoding, an anti-collapse
+  decision (verified to measurably reduce pre-echo on transient content vs.
+  the previous non-transient-only path), and stereo support (independent
+  per-channel band coding via `dual_stereo`, no mid/side or intensity-stereo
+  coupling yet — verified end-to-end, including that hard-panned left/right
+  content actually decodes distinguishably rather than collapsing to mono).
+  This is the first landed piece of the planned Opus encoder (the
+  user-confirmed first encoder target); hybrid SILK+CELT encoding, VBR, and
+  other frame sizes are not yet implemented.
 - WAV, AIFF, and headerless PCM writers (`WavEncoder`, `AiffEncoder`,
   `PcmEncoder`), matching each format's existing decoder in supported bit
   depths (8/16/24/32-bit PCM, 32/64-bit float) and channel counts, behind a
