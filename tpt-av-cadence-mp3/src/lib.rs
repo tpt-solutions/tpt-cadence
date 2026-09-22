@@ -38,6 +38,7 @@
 
 pub mod bitreader;
 pub mod decoder;
+pub mod encoder;
 mod header;
 pub mod huffman;
 pub mod imdct;
@@ -49,3 +50,4 @@ pub mod synth;
 mod tables;
 
 pub use decoder::{Mp3Decoder, Mp3Reader};
+pub use encoder::Mp3Encoder;

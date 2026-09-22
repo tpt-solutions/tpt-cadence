@@ -20,14 +20,22 @@ use super::tables::SBR_QMF_WINDOW_US;
 /// out[i]    =  scale·Σ_j in[j]·cos((2j+1)(127−2i)π/256)
 /// out[i+32] = −scale·Σ_j in[j]·cos((2j+1)(193+2i)π/256)
 pub struct Mdct64 {
-    table_lo: [[f64; 64]; 32], // cos for outputs 0..32
-    table_hi: [[f64; 64]; 32], // cos for outputs 32..64
+    // Boxed: each table is 16 KB (`[[f64; 64]; 32]`). `Sbr` embeds two
+    // `Mdct64`s by value (`mdct`, `mdct_ana`), so leaving these inline
+    // would put 64 KB of cosine tables directly in `Sbr`'s own size, which
+    // is itself boxed by its owner precisely to avoid stack-resident
+    // multi-KB scratch (see the AAC/SBR stack-overflow entry in todo.md).
+    // Boxing them here means `Mdct64::new()` only ever needs its own
+    // small local for a single table at a time to build it, not two
+    // 16 KB tables live in the same frame as everything else in `Sbr`.
+    table_lo: Box<[[f64; 64]; 32]>, // cos for outputs 0..32
+    table_hi: Box<[[f64; 64]; 32]>, // cos for outputs 32..64
 }
 
 impl Mdct64 {
     pub fn new() -> Self {
-        let mut table_lo = [[0.0f64; 64]; 32];
-        let mut table_hi = [[0.0f64; 64]; 32];
+        let mut table_lo = Box::new([[0.0f64; 64]; 32]);
+        let mut table_hi = Box::new([[0.0f64; 64]; 32]);
         for i in 0..32 {
             for j in 0..64 {
                 let phase = std::f64::consts::PI / 256.0;

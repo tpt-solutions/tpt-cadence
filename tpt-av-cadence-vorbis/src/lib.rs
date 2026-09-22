@@ -139,6 +139,11 @@ impl VorbisDecoder {
                     header::skip_comment(&raw[..len]).map_err(|e| stage_err("comment header", e))?
                 }
                 _ => {
+                    // `expected` walks the fixed literal array `[1, 3, 5]` in
+                    // order, so this `5` arm always runs after the `1` arm
+                    // has already set `id` (any failure there returns via
+                    // `?` before this point is reached).
+                    debug_assert!(id.is_some());
                     setup = Some(
                         header::parse_setup(&raw[..len], id.as_ref().unwrap())
                             .map_err(|e| stage_err("setup header", e))?,
@@ -146,6 +151,10 @@ impl VorbisDecoder {
                 }
             }
         }
+        // Every arm of the fixed `[1, 3, 5]` loop above either returns early
+        // via `?` or, for `1`/`5`, sets `id`/`setup`; reaching here means all
+        // three iterations completed, so both are populated.
+        debug_assert!(id.is_some() && setup.is_some());
         Ok((id.unwrap(), setup.unwrap()))
     }
 

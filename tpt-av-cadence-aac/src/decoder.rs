@@ -33,9 +33,8 @@ const FRAME_BUF_LEN: usize = 16 * 1024;
 /// Coefficients per short window.
 const BLOCK_LEN: usize = 128;
 
-// Element ids (id_syn_ele).
-// (LONG_START/LONG_STOP referenced by the windowing TODO; CCE/PCE rejected
-// at parse time.)
+// Element ids (id_syn_ele). CCE and PCE are both fully decoded (see
+// `decode_cce`/`decode_pce`), not rejected.
 
 const SCE: u32 = 0;
 const CPE: u32 = 1;
@@ -251,7 +250,18 @@ pub struct AacDecoder {
     /// Coupling channel elements decoded in the current block.
     cces: Vec<CouplingChannel>,
     /// SBR enhancement state (present once an SBR extension is seen).
-    sbr: Option<sbr::Sbr>,
+    ///
+    /// Boxed: `Sbr` embeds its own scratch (two `Mdct64` cosine tables plus
+    /// two `SbrChannel`s of `[[f32; 48]; N]` envelope/gain tables) and is
+    /// well over 100 KB by value. Left inline in `Option<sbr::Sbr>`, that
+    /// size becomes part of `AacDecoder` itself, so *every* stack frame
+    /// that holds an `AacDecoder` by value (constructors, and — because of
+    /// aggressive inlining — even `&mut self` methods whose callee tree
+    /// gets folded into one frame) pays for it, whether or not the stream
+    /// actually uses SBR. That was the dominant contributor to the
+    /// AAC/SBR stack-overflow issue (see todo.md), well above the
+    /// SBR-apply() locals it was originally attributed to.
+    sbr: Option<Box<sbr::Sbr>>,
     /// The channel range (first, count) the SBR FIL applied to.
     sbr_channels: Option<(usize, usize)>,
     /// Once true, all subsequent frames output 2048 samples/channel.
@@ -564,6 +574,10 @@ impl AacDecoder {
             self.work_buf = work;
             match result {
                 Ok(()) => {
+                    // Debug-only block dumper: gated behind an explicit
+                    // developer-set env var, never triggered by bitstream
+                    // content, so the unwraps below are outside the
+                    // real-time/no-panic contract for untrusted input.
                     if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
                         use std::io::Write;
                         let nbits = consumed;
@@ -855,7 +869,7 @@ impl AacDecoder {
                                 let sbr = self.sbr.get_or_insert_with(|| {
                                     // First SBR discovery: the output rate
                                     // doubles (implicit SBR signaling).
-                                    sbr::Sbr::new(id_type as usize)
+                                    Box::new(sbr::Sbr::new(id_type as usize))
                                 });
                                 if sbr.sample_rate == 0 {
                                     sbr.sample_rate = 2 * self.info.sample_rate as i32;
@@ -996,7 +1010,7 @@ impl AacDecoder {
                         },
                     ];
                     let id = if nch == 2 { 1 } else { 0 };
-                    let sbr = self.sbr.get_or_insert_with(|| sbr::Sbr::new(id));
+                    let sbr = self.sbr.get_or_insert_with(|| Box::new(sbr::Sbr::new(id)));
                     sbr.apply(id, &mut core, nch);
                     for (c, dst_ch) in (first..first + nch).enumerate() {
                         let dst = &mut self.channels_state[dst_ch].out;
@@ -1242,9 +1256,18 @@ impl AacDecoder {
     /// One coupling application to one target channel (reference
     /// `apply_dependent_coupling` / `apply_independent_coupling`).
     fn apply_coupling_method(&mut self, target_ch: usize, cce_idx: usize, index: usize, point: u8) {
+        // Malformed streams can declare more targets (via ch_select == 3
+        // "both channels" selections) than the fixed per-CCE gain storage
+        // holds; matching decode_cce's own overflow handling, extra
+        // applications are silently skipped rather than indexed out of
+        // bounds.
+        let gain_offset = match index.checked_mul(512) {
+            Some(off) if off < self.cces[cce_idx].gain.len() => off,
+            _ => return,
+        };
         if point == 3 {
             // Independent: add the CCE's time output scaled by gain[0].
-            let gain = self.cces[cce_idx].gain[index * 512];
+            let gain = self.cces[cce_idx].gain[gain_offset];
             let src: &[f32] = &self.cces[cce_idx].state.out;
             let dst = &mut self.channels_state[target_ch].out;
             for k in 0..1024 {
@@ -1262,7 +1285,11 @@ impl AacDecoder {
         let group_len: &[usize] = &self.cces[cce_idx].window.group_len;
         let offsets: &[u16] = self.cces[cce_idx].window.swb_offsets();
         let src: &[f32] = &self.cces[cce_idx].state.coeffs;
-        let gains: &[f32] = &self.cces[cce_idx].gain[index * 512..(index + 1) * 512];
+        let gain_end = gain_offset + 512;
+        if gain_end > self.cces[cce_idx].gain.len() {
+            return;
+        }
+        let gains: &[f32] = &self.cces[cce_idx].gain[gain_offset..gain_end];
         let dst = &mut self.channels_state[target_ch].coeffs;
         let mut idx = 0usize;
         for group_len_g in group_len.iter().take(num_groups) {

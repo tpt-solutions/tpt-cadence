@@ -641,9 +641,17 @@ impl OpusDecoder {
                     redundancy_bytes = if mode == OpusMode::Hybrid {
                         dec.decode_uint(256)? as usize + 2
                     } else {
-                        len - ((dec.tell() + 7) >> 3) as usize
+                        // `dec.tell()` can theoretically exceed `8 * len` for
+                        // a malformed stream; saturate instead of
+                        // underflowing so the sanity check below (which
+                        // expects this to be unreachable for valid
+                        // packets) can still catch it.
+                        len.saturating_sub(((dec.tell() + 7) >> 3) as usize)
                     };
-                    len -= redundancy_bytes;
+                    // Saturate: an attacker-chosen `redundancy_bytes` (the
+                    // hybrid branch above is bitstream-controlled and not
+                    // bounded by `len`) must not underflow `len`.
+                    len = len.saturating_sub(redundancy_bytes);
                     // Sanity check (never hits for valid packets).
                     if (len as u32) * 8 < dec.tell() {
                         len = 0;

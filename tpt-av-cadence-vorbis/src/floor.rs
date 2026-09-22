@@ -453,6 +453,12 @@ impl Floor1 {
             for j in 0..cdim {
                 let book = self.subclass_books[class * 8 + (cval & csub)];
                 cval >>= cbits;
+                // `offset` walks the same `partition_class`/`class_dimensions`
+                // sequence used to build `self.x` in `header::parse_setup`,
+                // which caps `x.len()` (== 2 + total dimensions read here) at
+                // 65; `y`/`y_final`/`flag` are sized 258, well above that
+                // bound, so `offset + j` never runs off the end.
+                debug_assert!(offset + j < y.len());
                 if book >= 0 {
                     y[offset + j] = books[book as usize].read_scalar(br)? as u16;
                 } else {
@@ -474,6 +480,13 @@ impl Floor1 {
             let low = self.low[i];
             let high = self.high[i];
             let dy = y_final[high] as i32 - y_final[low] as i32;
+            // `self.low`/`self.high` are precomputed once at setup (see
+            // `header::parse_setup`'s floor1 neighbor search) from an `x`
+            // list already validated to hold distinct values; the search
+            // there always picks `low` as the nearest lesser and `high` as
+            // the nearest greater neighbor of `x[i]`, so `x[high] > x[low]`
+            // always holds and this subtraction cannot underflow.
+            debug_assert!(self.x[high] > self.x[low]);
             let adx = (self.x[high] - self.x[low]) as i32;
             let ady = dy.abs();
             let err = ady * (self.x[i] as i32 - self.x[low] as i32);
@@ -483,6 +496,14 @@ impl Floor1 {
             } else {
                 y_final[low] as i32 + off
             };
+            // Spec 7.2.3 `render_point`: the prediction is clamped to the
+            // valid Y range *before* deriving `lowroom`/`highroom` below.
+            // `off` is derived from packet-controlled amplitude codewords
+            // and is otherwise unbounded, so skipping this clamp lets
+            // `predicted` land far outside `[0, range)`; `highroom` would
+            // then wrap through the `as u32` cast and the `* 2` below would
+            // overflow (a debug-build panic) on adversarial input.
+            let predicted = predicted.clamp(0, range as i32 - 1);
 
             let val = y[i] as u32;
             let highroom = (range as i32 - predicted) as u32;
@@ -544,6 +565,10 @@ impl Floor1 {
 /// `floor1_inverse_dB_table` values (spec 9.2.7 + 7.2.4 step 15).
 fn render_line(x0: usize, y0: usize, x1: usize, y1: usize, buf: &mut [f32]) {
     let dy = y1 as i64 - y0 as i64;
+    // Callers only ever advance `lx`/pass `n` forward along the ascending
+    // `self.sort` order (or `n` itself, the tail segment), so `x1 >= x0`
+    // always holds here and this subtraction cannot underflow.
+    debug_assert!(x1 >= x0);
     let adx = (x1 - x0) as i64;
     if adx == 0 {
         return;

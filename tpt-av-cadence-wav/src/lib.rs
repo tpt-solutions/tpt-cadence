@@ -28,6 +28,8 @@
 //! ```
 
 pub mod decoder;
+pub mod encoder;
 pub mod reader;
 
 pub use decoder::{WavDecoder, WavReader};
+pub use encoder::WavEncoder;

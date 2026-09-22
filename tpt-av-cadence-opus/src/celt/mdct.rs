@@ -401,6 +401,112 @@ mod tests {
         }
     }
 
+    /// Drives `mdct_forward` -> `mdct_backward` across several consecutive
+    /// frames using the exact same persistent tail bookkeeping the encoder
+    /// (`mdct_tail`) and decoder (`decode_mem` / `celt_synthesis`) use,
+    /// with no quantization in between, and proves the composed transform
+    /// is *exactly* unity-gain with a fixed `OVERLAP`-sample (120) group
+    /// delay and (up to float rounding) zero shape error.
+    ///
+    /// This was the key measurement that ruled out the MDCT pair itself as
+    /// the source of the `CeltEncoder` PCM-fidelity bug investigated this
+    /// session (see `todo.md`'s "Session log (2026-09-22)" entry): with
+    /// the delay accounted for, reconstruction is essentially perfect, so
+    /// the actual bug (found and fixed the same session) had to be
+    /// somewhere else — it turned out to be in the end-to-end test's own
+    /// decoder setup, not in `mdct.rs` or `encoder.rs` at all.
+    #[test]
+    fn forward_backward_multiframe_is_unity_gain_with_overlap_delay() {
+        let n2 = 960usize;
+        let overlap = 120usize;
+        let half = overlap / 2;
+        let nframes = 6;
+
+        // Input: a plain sine, long enough to cover all frames.
+        let total = n2 * nframes;
+        let w = 0.1f64; // rad/sample; arbitrary, mid-band.
+        let sig: Vec<f32> = (0..total).map(|k| (w * k as f64).sin() as f32).collect();
+
+        // --- Encoder side: forward MDCT with carried `mdct_tail` (mirrors
+        // `CeltEncoder::encode_frame`). ---
+        let mut mdct_tail = vec![0.0f32; overlap];
+        let mut scratch = vec![Cpx::default(); n2 / 2];
+        let mut freqs: Vec<Vec<f32>> = Vec::new();
+        for f in 0..nframes {
+            let frame = &sig[f * n2..(f + 1) * n2];
+            let mut mdct_in = vec![0.0f32; overlap + n2];
+            mdct_in[..overlap].copy_from_slice(&mdct_tail);
+            mdct_in[overlap..].copy_from_slice(frame);
+            let mut spec = vec![0.0f32; n2];
+            mdct_forward(&mdct_in, &mut spec, &WINDOW120, overlap, 0, 1, &mut scratch);
+            mdct_tail.copy_from_slice(&frame[n2 - overlap..]);
+            freqs.push(spec);
+        }
+
+        // --- Decoder side: backward MDCT with the decode_mem-style
+        // persistent tail (see decoder.rs::celt_synthesis / the
+        // DECODE_BUFFER_SIZE-n sliding-buffer scheme). ---
+        let mut buf = vec![0.0f32; half + n2];
+        let mut decoded: Vec<f32> = Vec::new();
+        for spec in &freqs {
+            // Shift the previous frame's un-mirrored tail into the head.
+            let prev_tail: Vec<f32> = buf[n2..n2 + half].to_vec();
+            buf[..half].copy_from_slice(&prev_tail);
+            mdct_backward(spec, &mut buf, &WINDOW120, overlap, 0, 1, &mut scratch);
+            decoded.extend_from_slice(&buf[..n2]);
+        }
+
+        // Sine/cosine least-squares fit at the known signal frequency,
+        // over a steady-state window (well past the tail-history warm-up
+        // and away from both frame edges), giving a sub-sample-precision
+        // gain and phase estimate without the ambiguity a raw
+        // integer-shift cross-correlation search would have near a half
+        // period of the probe tone.
+        let fit = |data: &[f32], start: usize, len: usize| -> (f64, f64) {
+            let (mut sc, mut cc, mut ss, mut sd, mut cd) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for i in 0..len {
+                let t = (start + i) as f64;
+                let s = (w * t).sin();
+                let c = (w * t).cos();
+                let d = data[start + i] as f64;
+                sc += s * c;
+                ss += s * s;
+                cc += c * c;
+                sd += s * d;
+                cd += c * d;
+            }
+            // Solve [ss sc; sc cc] [a;b] = [sd;cd] for d(t) = a*sin(wt)+b*cos(wt).
+            let det = ss * cc - sc * sc;
+            let a = (sd * cc - cd * sc) / det;
+            let b = (ss * cd - sc * sd) / det;
+            let amp = (a * a + b * b).sqrt();
+            let phase = b.atan2(a); // d(t) = amp*sin(wt + phase)
+            (amp, phase)
+        };
+        let probe_start = n2 * 3;
+        let probe_len = n2;
+        let (amp_sig, phase_sig) = fit(&sig, probe_start, probe_len);
+        let (amp_dec, phase_dec) = fit(&decoded, probe_start, probe_len);
+        let gain = amp_dec / amp_sig;
+        // A pure sinusoid can't distinguish a delay of D samples from one
+        // of D +/- k*period for any integer k (both produce the exact same
+        // waveform), so the raw phase-derived delay is only meaningful
+        // modulo the probe tone's period (2*pi/w). Fold it to the
+        // representative nearest `overlap` before comparing.
+        let period = 2.0 * std::f64::consts::PI / w;
+        let raw_delay = (phase_sig - phase_dec) / w;
+        let delay_samples = raw_delay + period * ((overlap as f64 - raw_delay) / period).round();
+
+        assert!(
+            (gain - 1.0).abs() < 1e-3,
+            "composed mdct_forward/mdct_backward gain {gain:.6} != 1.0"
+        );
+        assert!(
+            (delay_samples - overlap as f64).abs() < 1e-2,
+            "composed mdct_forward/mdct_backward delay {delay_samples:.6} samples != OVERLAP ({overlap})"
+        );
+    }
+
     /// Forward then backward on a real windowed block: the composed transform
     /// must be finite and bounded (the fold spread is well within the frame).
     #[test]

@@ -39,6 +39,6 @@ pub use decoder::{Decoder, FormatReader};
 pub use encoder::Encoder;
 pub use error::{CadenceError, Result};
 pub use format::{ChannelLayout, Format, SampleFormat};
-pub use sample::int_to_f32;
+pub use sample::{f32_to_int, int_to_f32};
 pub use source::{BufferedSource, ByteSource, Unseekable};
 pub use stream_info::StreamInfo;

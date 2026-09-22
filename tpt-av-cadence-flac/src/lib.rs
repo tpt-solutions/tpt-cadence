@@ -33,10 +33,12 @@
 //! ```
 
 pub mod decoder;
+pub mod encoder;
 pub mod lpc;
 pub mod rice;
 pub mod stream;
 pub mod subframe;
 
 pub use decoder::{FlacDecoder, FlacReader};
+pub use encoder::FlacEncoder;
 pub use stream::StreamInfo as FlacStreamInfo;

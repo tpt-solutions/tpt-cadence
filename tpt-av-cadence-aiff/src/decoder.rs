@@ -100,6 +100,9 @@ impl AiffDecoder {
             }
         }
 
+        // Safe: the `b"SSND"` arm above returns early with an error whenever
+        // `comm` is still `None`, so `found_ssnd` can only become true once
+        // `comm` is `Some`.
         let comm = comm.expect("found_ssnd implies comm was parsed");
         if comm.channels == 0 {
             return Err(CadenceError::CorruptData(

@@ -34,11 +34,11 @@
 //! # }
 //! ```
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use tpt_av_cadence_core::{
-    int_to_f32, BufferedSource, ByteSource, CadenceError, Decoder, Format, SampleFormat,
-    StreamInfo, Unseekable,
+    f32_to_int, int_to_f32, BufferedSource, ByteSource, CadenceError, Decoder, Encoder, Format,
+    SampleFormat, StreamInfo, Unseekable,
 };
 
 /// Byte order of samples in a headerless PCM stream.
@@ -260,6 +260,89 @@ impl PcmReader {
     }
 }
 
+/// Writer for headerless raw PCM: no container or metadata at all, just
+/// sample-format conversion and interleaved byte writes.
+///
+/// All allocation happens in [`PcmEncoder::new`] (there is none — this
+/// format has no header to buffer); [`Encoder::encode`]/[`Encoder::finish`]
+/// only ever write caller-derived bytes.
+pub struct PcmEncoder<W: Write> {
+    sink: W,
+    format: PcmFormat,
+}
+
+impl<W: Write> PcmEncoder<W> {
+    /// Opens a headerless PCM sink for writing.
+    pub fn new(sink: W, format: PcmFormat) -> Result<Self, CadenceError> {
+        format.validate()?;
+        Ok(PcmEncoder { sink, format })
+    }
+
+    fn write_sample(&mut self, sample: f32) -> Result<(), CadenceError> {
+        let depth = self.format.sample_format.bit_depth();
+        let le = self.format.byte_order == ByteOrder::Little;
+        match self.format.sample_format {
+            SampleFormat::Int8 => {
+                self.sink.write_all(&[f32_to_int(sample, 8) as i8 as u8])?;
+            }
+            SampleFormat::Int16 => {
+                let v = f32_to_int(sample, depth) as i16;
+                self.sink
+                    .write_all(&if le { v.to_le_bytes() } else { v.to_be_bytes() })?;
+            }
+            SampleFormat::Int24 => {
+                let v = f32_to_int(sample, depth) as i32;
+                let be = v.to_be_bytes(); // [sign-ext, hi, mid, lo]
+                if le {
+                    self.sink.write_all(&[be[3], be[2], be[1]])?;
+                } else {
+                    self.sink.write_all(&be[1..])?;
+                }
+            }
+            SampleFormat::Int32 => {
+                let v = f32_to_int(sample, depth) as i32;
+                self.sink
+                    .write_all(&if le { v.to_le_bytes() } else { v.to_be_bytes() })?;
+            }
+            SampleFormat::Float32 => {
+                self.sink.write_all(&if le {
+                    sample.to_le_bytes()
+                } else {
+                    sample.to_be_bytes()
+                })?;
+            }
+            SampleFormat::Float64 => {
+                let v = sample as f64;
+                self.sink
+                    .write_all(&if le { v.to_le_bytes() } else { v.to_be_bytes() })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write + Send> Encoder for PcmEncoder<W> {
+    fn encode(&mut self, samples: &[f32]) -> Result<usize, CadenceError> {
+        let channels = self.format.channels as usize;
+        if samples.len() % channels != 0 {
+            return Err(CadenceError::InvalidFormat(format!(
+                "sample count {} is not a multiple of the channel count {}",
+                samples.len(),
+                channels
+            )));
+        }
+        for &sample in samples {
+            self.write_sample(sample)?;
+        }
+        Ok(samples.len() / channels)
+    }
+
+    fn finish(&mut self) -> Result<(), CadenceError> {
+        self.sink.flush()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +476,65 @@ mod tests {
             sample_rate: 8_000,
         };
         assert!(PcmDecoder::from_source(Box::new(Cursor::new(Vec::new())), fmt).is_err());
+    }
+
+    fn encode_then_decode(fmt: PcmFormat, frames: &[f32]) -> Vec<f32> {
+        let mut buf = Vec::new();
+        let mut enc = PcmEncoder::new(&mut buf, fmt).unwrap();
+        enc.encode(frames).unwrap();
+        Encoder::finish(&mut enc).unwrap();
+        let dec = PcmDecoder::from_source(Box::new(Cursor::new(buf)), fmt).unwrap();
+        decode_all(dec, frames.len())
+    }
+
+    #[test]
+    fn int16_little_endian_round_trips_bit_exact() {
+        let fmt = PcmFormat {
+            sample_format: SampleFormat::Int16,
+            byte_order: ByteOrder::Little,
+            channels: 2,
+            sample_rate: 44_100,
+        };
+        let frames = [0.0, 0.5, -0.5, -1.0, 32767.0 / 32768.0, -0.25];
+        assert_eq!(encode_then_decode(fmt, &frames), frames);
+    }
+
+    #[test]
+    fn int24_big_endian_round_trips_bit_exact() {
+        let fmt = PcmFormat {
+            sample_format: SampleFormat::Int24,
+            byte_order: ByteOrder::Big,
+            channels: 1,
+            sample_rate: 48_000,
+        };
+        let frames = [0.5, -0.5, 0.25, -0.75];
+        let got = encode_then_decode(fmt, &frames);
+        for (a, b) in got.iter().zip(frames.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn float32_big_endian_round_trips_bit_exact() {
+        let fmt = PcmFormat {
+            sample_format: SampleFormat::Float32,
+            byte_order: ByteOrder::Big,
+            channels: 1,
+            sample_rate: 48_000,
+        };
+        let frames = [0.25, -0.75, 0.123_456];
+        assert_eq!(encode_then_decode(fmt, &frames), frames);
+    }
+
+    #[test]
+    fn non_multiple_of_channels_is_error() {
+        let fmt = PcmFormat {
+            sample_format: SampleFormat::Int16,
+            byte_order: ByteOrder::Little,
+            channels: 2,
+            sample_rate: 8_000,
+        };
+        let mut enc = PcmEncoder::new(Vec::new(), fmt).unwrap();
+        assert!(enc.encode(&[0.0, 0.1, 0.2]).is_err());
     }
 }

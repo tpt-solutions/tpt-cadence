@@ -115,6 +115,9 @@ impl WavDecoder {
             }
         }
 
+        // Safe: the `b"data"` arm above returns early with an error whenever
+        // `fmt` is still `None`, so `found_data` can only become true once
+        // `fmt` is `Some`.
         let fmt = fmt.expect("found_data implies fmt was parsed");
         let tag = fmt.effective_format_tag();
         let (sample_format, unsigned_8bit) = match (tag, fmt.bits_per_sample) {

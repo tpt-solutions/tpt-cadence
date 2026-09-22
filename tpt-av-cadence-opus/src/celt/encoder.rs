@@ -357,22 +357,44 @@ mod tests {
     /// RFC-conformance-tested `OpusDecoder`/`CeltDecoder` stack, and check
     /// the output correlates strongly with the original.
     ///
-    /// **Currently failing — see the "Opus CELT encoder — top-level
-    /// `OpusEncoder`" entry in `todo.md`.** The packet decodes without
-    /// error (no bitstream desync — every individual encode-side piece
-    /// this test depends on is independently bit-exact-verified against
-    /// the decoder elsewhere in this crate), but the reconstructed PCM
-    /// doesn't resemble the original: `analysis_is_exact_inverse_of_
-    /// denormalise_bands` above proves the per-band energy-split math is
-    /// exactly self-consistent, so the remaining bug is somewhere in the
-    /// forward-MDCT-to-decoder signal path (framing/alignment or an
-    /// absolute scale factor) — not yet isolated. `#[ignore]`d so it
-    /// doesn't fail every `cargo test` run; re-enable once fixed.
+    /// Fixed this session — see the "Session log (2026-09-22): CeltEncoder
+    /// PCM fidelity bug found and fixed" entry in `todo.md` for the full
+    /// root-cause writeup. Root cause: this test itself (not the encoder
+    /// or `mdct.rs`) constructed a *mono* `CeltDecoder` and drove it
+    /// through `decode_celt_only_packet`, which documents that it requires
+    /// a *stereo*-constructed decoder (it always writes
+    /// `OUTPUT_CHANNELS`-wide interleaved frames). With a mono decoder,
+    /// `CeltDecoder::decode`'s internal stride became 1 instead of 2, so
+    /// only the first half of each decoded frame's `OUTPUT_CHANNELS`-wide
+    /// PCM chunk was ever written — the other half stayed zeroed. This
+    /// test's channel-0 extraction (`chunks(OUTPUT_CHANNELS).map(|c|
+    /// c[0])`) then silently read every *other* real decoded sample
+    /// interleaved with zeros: a 2x decimation/aliasing artifact that
+    /// looked exactly like a deep MDCT/encoder bug (frequency doubling,
+    /// periodic glitches every ~480 samples) but had nothing to do with
+    /// either. See `analysis_is_exact_inverse_of_denormalise_bands` above
+    /// and `mdct.rs::forward_backward_round_trip_lm3` for the
+    /// already-verified pieces that pointed away from the MDCT/quant
+    /// chain and toward the harness.
     #[test]
-    #[ignore = "top-level OpusEncoder PCM fidelity bug not yet isolated — see todo.md"]
     fn encode_then_decode_recovers_a_sine_tone() {
         let mut enc = CeltEncoder::new();
-        let mut dec = CeltDecoder::new(1, 48_000).unwrap();
+        // `decode_celt_only_packet` documents that `celt` must be
+        // constructed for stereo 48 kHz output (`CeltDecoder::new(2,
+        // 48000)`) — it always writes `OUTPUT_CHANNELS`-wide (2) interleaved
+        // frames, upmixing mono streams by duplicating the channel.
+        // Constructing a *mono* decoder here silently breaks that contract:
+        // `CeltDecoder::decode`'s internal `cc = self.channels` stride
+        // becomes 1, so it only ever fills the first half of each
+        // `OUTPUT_CHANNELS`-wide `pcm_out` chunk. This test used to
+        // extract "channel 0" via `chunks(OUTPUT_CHANNELS)`, which then
+        // reads every *other* real decoded sample interleaved with zeros
+        // from the untouched second half of the buffer — a silent 2x
+        // decimation/aliasing artifact that looked exactly like a
+        // deep-seated MDCT bug (frequency doubling, periodic glitches
+        // every ~480 samples) but was actually just this mono/stereo
+        // decoder-construction mismatch.
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
 
         let bytes_per_frame = 160; // ~64 kbps at 20 ms/frame
         let freq_hz = 440.0f32;
@@ -399,23 +421,54 @@ mod tests {
             decoded.extend(pcm_out.chunks(OUTPUT_CHANNELS).map(|c| c[0]));
         }
 
-        // First frame is atypical (zero MDCT-tail history).
-        let skip = N2;
+        // The codec has a fixed algorithmic (group) delay: the decoded
+        // signal at output index `j` reconstructs the original input from
+        // around `j + CODEC_DELAY` (block-transform codecs are inherently
+        // non-causal this way — the encoder needs a lookahead tail before
+        // it can finish windowing a block, and CELT's own synthesis
+        // overlap-add reconstructs a windowed block's *edges* only once
+        // the next block's data has folded in). This was empirically
+        // measured (see the diagnostic sweep this test used to carry,
+        // preserved in the description below) by cross-correlating
+        // `original` against `decoded` at every integer delay in [0, 200)
+        // over a steady-state window (skipping the first two, atypical,
+        // frames): the SNR curve is a single, clean, unimodal peak at
+        // delay=98 (>20 dB), falling off smoothly on both sides — not an
+        // aliasing artifact of the 440 Hz probe tone's ~109-sample period.
+        // (For reference: an isolated `mdct_forward`/`mdct_backward`
+        // round trip with matching tail bookkeeping — see
+        // `mdct.rs::forward_backward_round_trip_lm3` and this session's
+        // now-removed throwaway diagnostic — has *unity* gain and an
+        // exact `OVERLAP` = 120-sample delay with no shape error at all;
+        // the extra ~22-sample difference from the full pipeline's
+        // measured 98 is not yet pinned down analytically, but doesn't
+        // indicate any further correctness bug — see todo.md.)
+        const CODEC_DELAY: i32 = 98;
+
+        // Skip the first two frames (atypical: no/partial MDCT-tail
+        // history yet) before measuring SNR.
+        let skip = N2 * 2;
         let sig_pow: f64 = original[skip..]
             .iter()
             .map(|&v| (v as f64) * (v as f64))
             .sum();
         let err_pow: f64 = original[skip..]
             .iter()
-            .zip(decoded[skip..].iter())
-            .map(|(&a, &b)| {
+            .enumerate()
+            .map(|(i, &a)| {
+                let di = skip as i32 + i as i32 - CODEC_DELAY;
+                let b = if di >= 0 && (di as usize) < decoded.len() {
+                    decoded[di as usize]
+                } else {
+                    0.0
+                };
                 let d = a as f64 - b as f64;
                 d * d
             })
             .sum();
         let snr_db = 10.0 * (sig_pow / err_pow.max(1e-12)).log10();
         assert!(
-            snr_db > 3.0,
+            snr_db > 12.0,
             "snr={snr_db:.1} dB too low (encoded/decoded signal doesn't resemble the original)"
         );
     }

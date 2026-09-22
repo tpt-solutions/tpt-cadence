@@ -205,6 +205,9 @@ impl PageReader {
         if header[4] != 0 {
             return Err(corrupt("unsupported ogg version"));
         }
+        // Safe: `header` is a fixed `[u8; 27]` array and each range below has
+        // a length matching the target integer's byte width, so `try_into`
+        // can never fail regardless of the bytes' values.
         let granule = i64::from_le_bytes(header[6..14].try_into().unwrap());
         let _serial = u32::from_le_bytes(header[14..18].try_into().unwrap());
         let _sequence = u32::from_le_bytes(header[18..22].try_into().unwrap());

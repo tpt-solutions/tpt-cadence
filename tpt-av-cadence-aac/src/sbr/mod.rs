@@ -160,6 +160,15 @@ pub struct Sbr {
     pub mdct: qmf::Mdct64,
     pub mdct_ana: qmf::Mdct64,
     pub qmf_filter_scratch: [[f32; 64]; 2],
+    /// `apply()` scratch: analysis QMF windowing buffer. Struct-resident so
+    /// the ~1.25 KB array isn't a per-call stack local (see todo.md
+    /// "AAC/SBR decode uses enough stack..." entry).
+    pub qmf_analysis_z: Box<[f32; 320]>,
+    /// `apply()` scratch for `hf_assemble`'s output (`Y[time slot][band]`,
+    /// ~19 KB). `Option` lets `apply()` move it out (zero-alloc `take`) to
+    /// sidestep the double-`&mut self` borrow of calling `self.hf_assemble`
+    /// with a buffer that lives inside `self`, then move it back after.
+    pub y1_scratch: Option<Box<[[QmfPair; 64]; 38]>>,
 }
 
 /// `ff_exp2fi`: exact power of two.
@@ -212,6 +221,8 @@ impl Sbr {
             mdct: qmf::Mdct64::new(),
             mdct_ana: qmf::Mdct64::new(),
             qmf_filter_scratch: [[0.0; 64]; 2],
+            qmf_analysis_z: Box::new([0.0; 320]),
+            y1_scratch: Some(Box::new([[(0.0, 0.0); 64]; 38])),
         };
         sbr.turnoff();
         sbr.data[0].synthesis_filterbank_samples_offset = SBR_SYNTHESIS_BUF_SIZE - (1280 - 128);
@@ -783,16 +794,29 @@ impl Sbr {
             self.ready_for_dequant = false;
         }
         for ch in 0..nch {
-            let mut input = [0.0f32; 1024];
-            input.copy_from_slice(&core_out[ch][..1024]);
-            let mut w = [[(0.0, 0.0); 32]; 32];
-            let mut z = [0.0f32; 320];
+            // `input`, `w` and `z` are no longer per-call stack locals: `w`
+            // is written straight into its eventual home
+            // (`self.data[ch].w[ypos]`, already struct-resident) and `z` is
+            // a struct-resident scratch buffer (`qmf_analysis_z`) — both
+            // qmf_analysis and qmf_synthesis are free functions, so there is
+            // no self-borrow conflict in passing disjoint self fields
+            // straight through. `input` needs no local copy at all: it was
+            // only ever read from `core_out[ch]`, which qmf_analysis can
+            // borrow directly.
             let ypos = self.data[ch].ypos;
             {
-                let hist = &mut self.data[ch].analysis_filterbank_samples;
-                qmf::qmf_analysis(&self.mdct_ana, &input, hist, &mut z, &mut w, ypos);
+                let mdct_ana = &self.mdct_ana;
+                let z = &mut *self.qmf_analysis_z;
+                let d = &mut self.data[ch];
+                qmf::qmf_analysis(
+                    mdct_ana,
+                    &core_out[ch][..1024],
+                    &mut d.analysis_filterbank_samples,
+                    z,
+                    &mut d.w[ypos],
+                    ypos,
+                );
             }
-            self.data[ch].w[ypos] = w;
 
             {
                 let (w_cur, w_prev) = {
@@ -815,10 +839,20 @@ impl Sbr {
                         self.env_estimate(ch);
                         let e_a2 = self.data[ch].e_a;
                         self.gain_calc(ch, &e_a2);
-                        let mut y1 = [[(0.0, 0.0); 64]; 38];
+                        // `y1` (~19 KB) lives in `y1_scratch`, not on the
+                        // stack. It's moved out (a cheap pointer move, not a
+                        // copy of the buffer) so it's a plain local the
+                        // `self.hf_assemble(&mut self, ...)` call can borrow
+                        // without a double-borrow-of-self conflict, then
+                        // moved back so the allocation is never repeated.
+                        let mut y1 = self
+                            .y1_scratch
+                            .take()
+                            .expect("y1_scratch missing (apply() re-entrant?)");
                         let e_a3 = self.data[ch].e_a;
-                        self.hf_assemble(ch, &mut y1, &e_a3);
-                        self.data[ch].y[self.data[ch].ypos] = y1;
+                        self.hf_assemble(ch, &mut y1[..], &e_a3);
+                        self.data[ch].y[self.data[ch].ypos] = *y1;
+                        self.y1_scratch = Some(y1);
                     }
                 }
             }
@@ -827,19 +861,18 @@ impl Sbr {
         }
 
         for ch in 0..nch {
-            let mut out = [0.0f32; 2048];
-            {
-                let mdct = &self.mdct;
-                let d = &mut self.data[ch];
-                qmf::qmf_synthesis(
-                    mdct,
-                    &mut out,
-                    &self.x[ch],
-                    &mut d.synthesis_filterbank_samples,
-                    &mut d.synthesis_filterbank_samples_offset,
-                );
-            }
-            core_out[ch][..2048].copy_from_slice(&out);
+            // `out` likewise no longer needs a stack local: qmf_synthesis
+            // can write its 2048 samples straight into `core_out[ch]`,
+            // which is already sized for them.
+            let mdct = &self.mdct;
+            let d = &mut self.data[ch];
+            qmf::qmf_synthesis(
+                mdct,
+                &mut core_out[ch][..2048],
+                &self.x[ch],
+                &mut d.synthesis_filterbank_samples,
+                &mut d.synthesis_filterbank_samples_offset,
+            );
         }
     }
 }

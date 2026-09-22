@@ -28,7 +28,9 @@
 //! ```
 
 pub mod decoder;
+pub mod encoder;
 pub mod ext_float;
 pub mod reader;
 
 pub use decoder::{AiffDecoder, AiffReader};
+pub use encoder::AiffEncoder;
