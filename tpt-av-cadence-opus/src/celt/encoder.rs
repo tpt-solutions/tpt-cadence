@@ -470,13 +470,6 @@ impl CeltEncoder {
             channels,
             lm,
         );
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "ENC coarse old_band_e ch0={:?} ch1={:?}",
-                &old_band_e[..NB_EBANDS],
-                &old_band_e[NB_EBANDS..2 * NB_EBANDS]
-            );
-        }
 
         // tf_encode: "no change" for every band, mirroring `tf_decode`'s
         // exact bit-budget structure (including its per-band `logp` step:
@@ -550,13 +543,6 @@ impl CeltEncoder {
         }
 
         let mut bits = (total_bits_bytes << 3) - enc.tell_frac() as i32 - 1;
-        if std::env::var_os("STEREO_DEBUG").is_some() {
-            eprintln!(
-                "after coarse energy: tell_frac={} bits_for_alloc={bits} means={:?}",
-                enc.tell_frac(),
-                &means[..NB_EBANDS.min(means.len())]
-            );
-        }
         // Anti-collapse bit reservation: mirrors the decoder's own guard
         // exactly (`is_transient && lm >= 2 && bits >= (lm+2)<<3`). When
         // reserved, this encoder always signals it on (see the module doc
@@ -572,16 +558,6 @@ impl CeltEncoder {
             0, NB_EBANDS, &offsets, &cap, alloc_trim, bits, lm as i32, channels, &mut enc,
         );
 
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "ENC after alloc: tell={} coded_bands={} intensity={} dual_stereo={} balance={}",
-                enc.tell(),
-                alloc.alloc.coded_bands,
-                alloc.alloc.intensity,
-                alloc.alloc.dual_stereo,
-                alloc.alloc.balance
-            );
-        }
         quant_fine_energy(
             0,
             NB_EBANDS,
@@ -591,13 +567,6 @@ impl CeltEncoder {
             &mut enc,
             channels,
         );
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "ENC fine old_band_e ch0={:?} ebits={:?}",
-                &old_band_e[..NB_EBANDS],
-                &alloc.ebits
-            );
-        }
 
         let mut seed = 0u32;
         let mut collapse_masks = [0u8; 2 * NB_EBANDS];
@@ -709,37 +678,46 @@ impl CeltEncoder {
         // *only* byte-level difference between the two encoders' output
         // being that one extra padding byte (confirmed by decoding each
         // encoder's saved packets, and each other's, through the same
-        // unmodified decoder). The defensive end-of-buffer resize below
-        // remains as a genuine last resort for `tell()`'s (separately
-        // real, but much smaller — sub-byte) slack; it hasn't been
-        // observed to fire in this crate's test suite.
+        // unmodified decoder).
+        //
+        // `tell()`'s bit count is RFC 6716's well-known *estimate*
+        // (`ec_tell()`) of the range-coded prefix's eventual byte length,
+        // not a guarantee: `done()`'s actual carry-propagation/renormalization
+        // can still land a whole byte short of what `tell()` predicted (not
+        // just the sub-byte slack this loop was originally written to
+        // absorb) — reproduced with a real stereo encode where one channel
+        // stays bit-exact digital silence for many consecutive frames,
+        // where `done()` yielded 319 bytes against a 320-byte target. A
+        // prior version of this function padded that residual shortfall by
+        // resizing the returned byte vector directly, which — per the
+        // layout note above — appends zero bytes *after* the raw-bit
+        // suffix instead of before it, corrupting exactly the raw bits
+        // (fine energy, anti-collapse, etc.) on decode; confirmed via the
+        // `STEREO_DEBUG2` trace, where the decoder's reconstructed
+        // `old_band_e` for the loud channel diverged from the encoder's own
+        // on precisely the frame that undershot, then stayed diverged
+        // (persistent per-channel state) for every following frame,
+        // cratering that channel's SNR from ~20 dB to ~1 dB despite every
+        // per-band/per-call round trip already being individually
+        // bit-exact-tested. Fixed by verifying the actual output length
+        // (via a cheap `RangeEncoder` clone — `done()` consumes `self` and
+        // isn't idempotent) instead of trusting `tell()`'s estimate, and
+        // padding with additional raw-bit *bytes* — always landing before
+        // the raw-bit suffix, never after it — until the real length is
+        // confirmed sufficient.
         let target_bits = (bytes_per_frame * 8) as u32;
         while enc.tell() < target_bits {
             enc.write_raw_bits(0, 1);
         }
+        while enc.clone().done().len() < bytes_per_frame {
+            enc.write_raw_bits(0, 8);
+        }
 
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!("ENC old_band_e ch0={:?}", &old_band_e[..NB_EBANDS]);
-        }
-        let mut frame = enc.done();
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "ENC done(): frame.len()={} bytes_per_frame={bytes_per_frame}",
-                frame.len()
-            );
-        }
-        // Defensive fallback only: with the raw-bit top-up above, `frame`
-        // should already be `>= bytes_per_frame` bytes. If `tell()`'s
-        // (necessarily approximate — see its own doc comment)
-        // range-coded-bit estimate still undershoots by a fractional
-        // byte, padding the very end is safe *here* because at this point
-        // there is no raw-bit suffix left to displace (every remaining
-        // deficit was already closed as raw bits above, which `done()`
-        // has already placed correctly); this only rounds up to a whole
-        // byte.
-        if frame.len() < bytes_per_frame {
-            frame.resize(bytes_per_frame, 0);
-        }
+        let frame = enc.done();
+        debug_assert!(
+            frame.len() >= bytes_per_frame,
+            "CBR padding must guarantee the target byte count"
+        );
 
         // TOC byte: CELT-only, fullband, config 28+lm (28/29/30/31 for
         // 2.5/5/10/20 ms — see `packet.rs::Toc::frame_duration`'s "CELT:
@@ -1089,20 +1067,12 @@ mod tests {
     /// channels' spectra were accidentally aliased into the same buffer
     /// region).
     ///
-    /// **Known narrow limitation (not exercised by this test — see
-    /// `todo.md`'s stereo session-log entry for the full investigation):**
-    /// when an entire channel is *exact* bit-for-bit `0.0` for many
-    /// consecutive frames (every band's `energy_sq.sqrt() == 0.0` exactly,
-    /// not just very small), this encoder's simple greedy PVQ search
-    /// (`vq.rs::alg_quant`) produces a poor-quality reconstruction for the
-    /// *other* (real-content) channel too — the bitstream still decodes
-    /// without error and the silent channel stays correctly silent, but the
-    /// loud channel's fidelity measurably degrades in a way that isn't yet
-    /// root-caused. Real-world hard-panned audio (this test's scenario)
-    /// essentially never has bit-exact digital silence in the "empty"
-    /// channel (dither, analog noise floor, etc. all break the exact-zero
-    /// condition), so this is scoped as a narrow, documented follow-up
-    /// rather than a blocking bug.
+    /// This test deliberately keeps the "silent" channel at `-114 dBFS`
+    /// rather than bit-for-bit `0.0` — see
+    /// `encode_then_decode_stereo_with_exact_zero_right_channel_keeps_left_channel_fidelity`
+    /// below for the exact-zero case (a real CBR-padding bug used to
+    /// corrupt the loud channel's fidelity specifically under exact
+    /// digital silence; now fixed and regression-tested there).
     #[test]
     fn encode_then_decode_stereo_keeps_left_and_right_distinguishable() {
         let mut enc = CeltEncoder::new(2, LM);
@@ -1201,6 +1171,83 @@ mod tests {
         assert!(
             best_snr > 8.0,
             "best left-channel SNR across delays too low: {best_snr:.1} dB"
+        );
+    }
+
+    /// Regression test for a real CBR-padding bug (see the long comment in
+    /// `encode_frame_impl` above the padding loop): with one channel held
+    /// at bit-exact digital silence for many consecutive frames,
+    /// `RangeEncoder::tell()`'s bit-count estimate could satisfy the
+    /// padding loop's exit condition while `done()`'s actual byte output
+    /// still landed a whole byte short of `bytes_per_frame` (observed:
+    /// 319 vs. 320) — and the old fallback (`frame.resize(bytes_per_frame,
+    /// 0)`) padded that shortfall by appending zero bytes *after* the
+    /// range-coded output, which lands after the raw-bit suffix instead of
+    /// before it and corrupts exactly the raw bits (fine energy,
+    /// anti-collapse) on decode. Since a `BitReader`/`RangeDecoder` has no
+    /// way to detect this (it just decodes different, wrong values, no
+    /// error), the corruption silently propagated through the loud
+    /// channel's persistent per-frame energy-prediction state, driving its
+    /// SNR from ~20-25 dB down to ~1 dB. Unlike the "near-silent but not
+    /// bit-exact zero" scenario `encode_then_decode_stereo_keeps_left_and_right_distinguishable`
+    /// covers, this uses *exact* `0.0`, which is what actually triggers the
+    /// specific coarse/fine-energy bit costs that can undershoot `tell()`'s
+    /// estimate by a whole byte.
+    #[test]
+    fn encode_then_decode_stereo_with_exact_zero_right_channel_keeps_left_channel_fidelity() {
+        let mut enc = CeltEncoder::new(2, LM);
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
+        let bytes_per_frame = 320;
+        let freq_hz = 440.0f32;
+        let sample_rate = 48_000.0f32;
+        let mut phase = 0.0f32;
+        let mut original_left = Vec::new();
+        let mut decoded_left = Vec::new();
+        for _ in 0..8 {
+            let mut pcm_in = vec![0.0f32; N2 * 2];
+            for frame in pcm_in.chunks_mut(2) {
+                let s = 0.5 * phase.sin();
+                frame[0] = s;
+                frame[1] = 0.0; // bit-exact digital silence, not just quiet
+                original_left.push(s);
+                phase += 2.0 * std::f32::consts::PI * freq_hz / sample_rate;
+            }
+            let packet_bytes = enc.encode_frame(&pcm_in, bytes_per_frame);
+            let packet = parse_packet(&packet_bytes).unwrap();
+            let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &packet, &packet_bytes, &mut pcm_out).unwrap();
+            decoded_left.extend(pcm_out.chunks(OUTPUT_CHANNELS).map(|c| c[0]));
+        }
+        let skip = N2 * 2;
+        let mut best_snr = f64::NEG_INFINITY;
+        for delay in 0..150i32 {
+            let sig_pow: f64 = original_left[skip..]
+                .iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum();
+            let err_pow: f64 = original_left[skip..]
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| {
+                    let di = skip as i32 + i as i32 - delay;
+                    let b = if di >= 0 && (di as usize) < decoded_left.len() {
+                        decoded_left[di as usize]
+                    } else {
+                        0.0
+                    };
+                    let d = a as f64 - b as f64;
+                    d * d
+                })
+                .sum();
+            let snr = 10.0 * (sig_pow / err_pow.max(1e-12)).log10();
+            if snr > best_snr {
+                best_snr = snr;
+            }
+        }
+        assert!(
+            best_snr > 15.0,
+            "exact-zero-right-channel best left-channel SNR too low: {best_snr:.1} dB \
+             (was ~1.2 dB before the CBR-padding fix, ~25 dB after)"
         );
     }
 

@@ -494,13 +494,6 @@ impl CeltDecoder {
             c,
             lm,
         )?;
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "DEC coarse old_band_e ch0={:?} ch1={:?}",
-                &self.old_band_e[..NB_EBANDS],
-                &self.old_band_e[NB_EBANDS..2 * NB_EBANDS]
-            );
-        }
 
         tf_decode(
             start,
@@ -582,24 +575,7 @@ impl CeltDecoder {
 
         self.last_coded_bands = coded_bands;
 
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "DEC after alloc: tell={} coded_bands={} intensity={} dual_stereo={} balance={}",
-                dec.tell(),
-                coded_bands,
-                intensity,
-                dual_stereo,
-                balance
-            );
-        }
         unquant_fine_energy(start, end, &mut self.old_band_e, &self.fine_quant, dec, c)?;
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "DEC fine old_band_e ch0={:?} fine_quant={:?}",
-                &self.old_band_e[..NB_EBANDS],
-                &self.fine_quant
-            );
-        }
 
         // Shift the per-channel decode buffers left by N.
         for ci in 0..cc {
@@ -656,9 +632,6 @@ impl CeltDecoder {
             c,
         )?;
 
-        if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!("DEC old_band_e ch0={:?}", &self.old_band_e[..NB_EBANDS]);
-        }
         if anti_collapse_on {
             anti_collapse(
                 &mut self.x_spec,

@@ -78,7 +78,7 @@
       "conformance": "100% final_range match on all 12 official RFC 6716 test vectors; SILK-only vectors PCM bit-exact; residual PCM SNR gap on CELT/hybrid vectors is float-ULP-class, not an entropy desync",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "CeltEncoder covers mono-or-stereo, fullband, CBR, 20ms, with transient/TF handling; no SILK/hybrid encode, no full top-level OpusEncoder wired to the Encoder trait yet"
+      "notes": "CeltEncoder covers mono-or-stereo, fullband, CBR, all 4 frame sizes, with transient/TF handling; a real CBR-padding bug that could corrupt a stereo encode's loud channel under bit-exact digital silence on one channel was found and fixed 2026-09-23 (root cause: RangeEncoder::tell()'s bit estimate could satisfy the padding loop while done()'s actual byte output still landed a whole byte short; fixed by verifying actual output length via a RangeEncoder::clone() instead of trusting tell()); no M/S or intensity stereo coupling (encoder policy choice, not a bug — stereo bitrate efficiency lags libopus); no SILK/hybrid encode, no full top-level OpusEncoder wired to the Encoder trait yet"
     },
     {
       "crate": "tpt-av-cadence-aac",

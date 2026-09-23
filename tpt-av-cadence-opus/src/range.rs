@@ -255,6 +255,7 @@ impl<'a> RangeDecoder<'a> {
 /// separately (they fill the frame from its end) and are appended reversed
 /// during [`RangeEncoder::done`], producing streams that round-trip through
 /// [`RangeDecoder`].
+#[derive(Clone)]
 pub struct RangeEncoder {
     val: u32,
     rng: u32,

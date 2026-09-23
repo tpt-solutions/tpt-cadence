@@ -1661,8 +1661,6 @@ pub(crate) fn quant_all_bands(
                 (None, Some((o, _)), scratch) => (None, Some(&mut norm0[o..]), scratch),
                 (None, None, scratch) => (None, None, scratch),
             };
-            let dbg = std::env::var_os("STEREO_DEBUG2").is_some();
-            let pre_e: f32 = x_band.iter().map(|v| v * v).sum();
             x_cm = quant_band(
                 &mut ctx,
                 dec,
@@ -1679,10 +1677,6 @@ pub(crate) fn quant_all_bands(
                 htmp,
                 iy,
             )?;
-            if dbg {
-                let post_e: f32 = x_band.iter().map(|v| v * v).sum();
-                eprintln!("DEC band i={i} n={n} b={b} pre_e={pre_e} post_e={post_e} x_cm={x_cm}");
-            }
             let n1 = norm1.as_deref_mut().unwrap();
             let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
                 (Some(eff), Some((o, _)), scratch) if eff + n > o => {
@@ -1963,17 +1957,6 @@ pub(crate) fn quant_all_bands_encode(
                 (None, Some((o, _)), scratch) => (None, Some(&mut norm0[o..]), scratch),
                 (None, None, scratch) => (None, None, scratch),
             };
-            let dbg = std::env::var_os("STEREO_DEBUG2").is_some();
-            let pre_e: f32 = x_band.iter().map(|v| v * v).sum();
-            if dbg {
-                eprintln!(
-                    "band i={i} n={n} b={b} b_half={} pre_e={pre_e} remaining_bits={} \
-                     seed_before={}",
-                    b / 2,
-                    ctx.remaining_bits,
-                    ctx.seed
-                );
-            }
             x_cm = quant_band_encode(
                 &mut ctx,
                 enc,
@@ -1990,13 +1973,6 @@ pub(crate) fn quant_all_bands_encode(
                 htmp,
                 iy,
             );
-            if dbg {
-                let post_e: f32 = x_band.iter().map(|v| v * v).sum();
-                eprintln!(
-                    "band i={i} ch0 post_e={post_e} x_cm={x_cm} seed_after={}",
-                    ctx.seed
-                );
-            }
             let n1 = norm1.as_deref_mut().unwrap();
             let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
                 (Some(eff), Some((o, _)), scratch) if eff + n > o => {
