@@ -657,10 +657,7 @@ impl CeltDecoder {
         )?;
 
         if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "DEC old_band_e ch0={:?}",
-                &self.old_band_e[..NB_EBANDS]
-            );
+            eprintln!("DEC old_band_e ch0={:?}", &self.old_band_e[..NB_EBANDS]);
         }
         if anti_collapse_on {
             anti_collapse(

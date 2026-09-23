@@ -569,15 +569,7 @@ impl CeltEncoder {
         };
         bits -= anti_collapse_rsv;
         let alloc = compute_allocation_encode(
-            0,
-            NB_EBANDS,
-            &offsets,
-            &cap,
-            alloc_trim,
-            bits,
-            lm as i32,
-            channels,
-            &mut enc,
+            0, NB_EBANDS, &offsets, &cap, alloc_trim, bits, lm as i32, channels, &mut enc,
         );
 
         if std::env::var_os("STEREO_DEBUG2").is_some() {
@@ -692,27 +684,42 @@ impl CeltEncoder {
         // Padding through `write_raw_bits` instead keeps every zero bit
         // inside the *same* raw-bit suffix `done()` already positions
         // correctly, so no post-hoc byte surgery is needed.
-        // `tell()` is a *conservative* (can overcount) estimate for the
-        // range-coded prefix specifically (`done()`'s final flush is free
-        // to pick a shorter representative value within the still-open
-        // interval, so the prefix's real byte count can end up smaller
-        // than `tell()` implied) — but every raw bit this loop itself adds
-        // via `write_raw_bits` counts exactly, with no such slack. Padding
-        // only up to the bare `tell() >= target` threshold can therefore
-        // still leave `done()` a whole byte short. A small fixed cushion
-        // (one byte) absorbs that estimate's slack cheaply and reliably;
-        // the defensive end-of-buffer resize below still exists as a last
-        // resort but should no longer be needed in practice.
-        let target_bits = (bytes_per_frame * 8) as u32 + 8;
+        //
+        // Target exactly `bytes_per_frame * 8` here, with NO extra cushion
+        // beyond that. An earlier version of this loop padded to
+        // `bytes_per_frame*8 + 8` (an extra whole byte) to defensively
+        // absorb `tell()`'s estimate slack — but on a frame whose *natural*
+        // encoding already reaches or exceeds `bytes_per_frame` (common;
+        // `quant_energy_finalise` already targets exactly this budget and
+        // frequently lands a little over), that cushion is spurious: this
+        // loop's own `enc.tell() < target_bits` guard means it only ever
+        // fires when genuinely short, so an unconditional "+8" doesn't
+        // change *whether* it pads, only adds one unnecessary extra byte
+        // when it does. That extra byte turned out not to be the harmless
+        // padding it looked like: appending it after `quant_energy_finalise`
+        // shifts the packet's raw-bit-suffix/range-coded-prefix boundary by
+        // a byte, which perturbs the low bits of nearby quantized values
+        // (observed: a ~1-2% change in fine-energy correction) enough to
+        // occasionally flip a threshold-sensitive decoder decision (e.g.
+        // postfilter pitch/gain), corrupting that frame's decoder-side
+        // memory and compounding into every subsequent frame. Root-caused
+        // by bisecting a real regression: `CeltEncoder::new(1,
+        // 3).encode_frame` on a steady 440 Hz tone decoded at ~20-25 dB SNR
+        // before the "+8" cushion was added and ~0.4 dB after, with the
+        // *only* byte-level difference between the two encoders' output
+        // being that one extra padding byte (confirmed by decoding each
+        // encoder's saved packets, and each other's, through the same
+        // unmodified decoder). The defensive end-of-buffer resize below
+        // remains as a genuine last resort for `tell()`'s (separately
+        // real, but much smaller — sub-byte) slack; it hasn't been
+        // observed to fire in this crate's test suite.
+        let target_bits = (bytes_per_frame * 8) as u32;
         while enc.tell() < target_bits {
             enc.write_raw_bits(0, 1);
         }
 
         if std::env::var_os("STEREO_DEBUG2").is_some() {
-            eprintln!(
-                "ENC old_band_e ch0={:?}",
-                &old_band_e[..NB_EBANDS]
-            );
+            eprintln!("ENC old_band_e ch0={:?}", &old_band_e[..NB_EBANDS]);
         }
         let mut frame = enc.done();
         if std::env::var_os("STEREO_DEBUG2").is_some() {
@@ -1226,6 +1233,11 @@ mod tests {
         ];
 
         for &channels in &[1usize, 2usize] {
+            // `lm` is used as a value throughout this loop (frame-size
+            // shift amount, `CeltEncoder::new` argument), not just as an
+            // index — `expected_duration[lm]` is incidental, so
+            // `.enumerate()` wouldn't actually simplify anything here.
+            #[allow(clippy::needless_range_loop)]
             for lm in 0..=3usize {
                 let n2 = SHORT_MDCT_SIZE << lm;
                 let mut enc = CeltEncoder::new(channels, lm);
@@ -1438,7 +1450,9 @@ mod tests {
                 .sum::<f64>()
                 / (decoded_left.len() - skip) as f64)
                 .sqrt();
-            eprintln!("{label}: best_snr={best_snr:.2} dB orig_rms={orig_rms:.4} dec_rms={dec_rms:.4}");
+            eprintln!(
+                "{label}: best_snr={best_snr:.2} dB orig_rms={orig_rms:.4} dec_rms={dec_rms:.4}"
+            );
         }
     }
 }

@@ -543,7 +543,15 @@ mod tests {
             mdct_in[..overlap].copy_from_slice(&mdct_tail);
             mdct_in[overlap..].copy_from_slice(frame);
             let mut spec = vec![0.0f32; n2];
-            mdct_forward(&mdct_in, &mut spec, &WINDOW120, overlap, shift, 1, &mut scratch);
+            mdct_forward(
+                &mdct_in,
+                &mut spec,
+                &WINDOW120,
+                overlap,
+                shift,
+                1,
+                &mut scratch,
+            );
             mdct_tail.copy_from_slice(&frame[n2 - overlap..]);
             freqs.push(spec);
         }

@@ -1342,47 +1342,63 @@ crate unit tests + full RFC 6716 conformance green, strict Clippy and
 workspace-green claim — it currently does not compile (mid-flight edits,
 ~44 errors) and belongs to the AAC workstream.
 
-### Regression found while adding benchmarks (2026-09-23) — NOT fixed, needs attention
+### CELT encoder CBR-padding regression — found AND FIXED (2026-09-23)
 
-While wiring up `criterion` benches (see the "Benchmark tracking" entry below), `cargo test -p
-tpt-av-cadence-opus --lib` was run as a sanity check before touching any `src/` code and found
-**2 of 193 lib tests failing at HEAD** (commit `dee0fcd`, "Add CELT encoder transient detection,
-stereo support, and variable frame sizes"), reproducibly (not a flake — re-ran 3x, same result,
-debug and bench/release profiles both fail identically):
+**Found** while wiring up `criterion` benches (see "Benchmark tracking" below): `cargo test -p
+tpt-av-cadence-opus --lib` at HEAD (`dee0fcd`, "Add CELT encoder transient detection, stereo
+support, and variable frame sizes") had **2 of 193 lib tests failing**, reproducibly, contradicting
+that same session's own log claim of 190/190 passing:
+`celt::encoder::tests::encode_then_decode_recovers_a_sine_tone` (SNR 0.4 dB — essentially
+uncorrelated output, not a marginal miss) and
+`encode_then_decode_a_transient_onset_detects_transient_and_reduces_pre_echo`.
 
-- `celt::encoder::tests::encode_then_decode_recovers_a_sine_tone` — panics with `snr=0.4 dB too
-  low (encoded/decoded signal doesn't resemble the original)`, i.e. essentially uncorrelated
-  output, not a marginal threshold miss.
-- `celt::encoder::tests::encode_then_decode_a_transient_onset_detects_transient_and_reduces_pre_echo`
-  — also fails.
+**Root-caused by bisection**, not by code reading (a full line-by-line audit of every mono/
+non-transient code path touched by that session's stereo/transient-support diff — `compute_theta_encode`,
+`quant_band_encode`, `quant_all_bands_encode`, `interp_bits2pulses_encode`, the `tf_encode`/
+`tf_select` header bits — found every one of them reduces to byte-for-byte identical behavior in
+the `b_blocks==1, tf_change==0, stereo==false` case this test exercises; none of that was the bug).
+`git worktree add` against the last-known-good commit (`59ec509`) plus a throwaway hex-dump test
+confirmed the encoder's own output was correct there, then a byte-level diff of 8 frames' packets
+between old and new encoders showed **every packet differed by exactly one inserted `0x00` byte**,
+otherwise bit-identical. Decoding the *old* encoder's saved packets and the *new* encoder's saved
+packets (each fixed, pre-recorded — no live encoder involved) through the same unmodified,
+stateful `CeltDecoder` showed the old set decoding cleanly for all 8 frames while the new set
+decoded cleanly through frame ~3 and then diverged catastrophically (sign-flipped, wrong-amplitude
+output) from frame 4 onward — pinpointing a *decoder-state-compounding* bug triggered by an
+encoder-side perturbation, not a per-frame decode bug (single-frame, freshly-constructed-decoder
+decodes of the same two packets differed by only ~1-2%, not qualitatively).
 
-This directly contradicts that session's own log entry ("Session log (2026-09-22, continued):
-stereo support" below), which reports `cargo test -p tpt-av-cadence-opus --lib`: **190/190 pass**
-after the stereo-support changes landed. Since HEAD is exactly that session's commit and no `src/`
-changes were made this session (only `Cargo.toml`/bench files were touched, isolated to
-`benches/celt_round_trip.rs` — a separate compilation unit that doesn't exercise this code path's
-correctness, only that it runs without panicking), either: (a) the committed state doesn't match
-what that session actually tested before writing the log (e.g. a final fixup after the last test
-run wasn't re-verified), or (b) there's an environment-dependent difference (this was run on Linux
-in a cloud container; prior sessions' logs are Windows/MSVC-flavored) that changes float behavior
-enough to flip a marginal SNR check into a hard failure — but 0.4 dB vs. the prior session's
-reported >20 dB steady-state is not a marginal flip, so (a) is more likely. **Not investigated
-further this session** (out of scope for the benchmarking work in progress, and reproducing/
-root-causing a CELT encoder DSP bug is a substantial task per this project's own established
-practice — see the CELT `final_range` and SBR sections above). Whoever picks this up next should
-start by bisecting `git log -- tpt-av-cadence-opus/src/celt/encoder.rs` to find the exact commit
-where these two tests still passed, then diff forward.
+**The one-byte diff** traced to `encode_frame_impl`'s CBR end-of-frame padding
+(`tpt-av-cadence-opus/src/celt/encoder.rs`): that session had added an extra "+8 bits" (one whole
+byte) safety cushion on top of the real `bytes_per_frame*8` target, reasoning that `tell()`'s
+estimate could otherwise leave `done()` a fractional byte short. But the padding loop already only
+fires when `enc.tell() < target_bits` — so on a frame whose natural encoding already reaches or
+exceeds `bytes_per_frame` (the common case; `quant_energy_finalise` targets exactly that budget and
+often lands slightly over), the "+8" doesn't change *whether* padding happens, it just always adds
+one unneeded extra byte whenever padding *does* fire. That extra byte, spliced in right after
+`quant_energy_finalise`'s real raw-bit writes and before `enc.done()`, shifted the packet's
+raw-bit-suffix/range-coded-prefix boundary enough to perturb the low bits of nearby quantized
+values (~1-2% change measured in fine-energy correction) — usually harmless, but occasionally
+enough to flip a threshold-sensitive decoder decision (postfilter pitch/gain being the leading
+suspect, though not conclusively isolated further), corrupting that frame's decoder-side memory in
+a way that compounds into every subsequent frame via the decoder's own recursive filters.
 
-Also found not clean at HEAD (verified with `git stash -u` to confirm neither is caused by this
-session's changes): `cargo clippy -p tpt-av-cadence-opus --all-targets -- -D warnings` fails —
-`encoder.rs:1229`'s `for lm in 0..=3usize` trips `clippy::needless_range_loop` indexing
-`expected_duration`, and `tests/snr_debug.rs`'s unused `OVERLAP` const trips `dead_code` (that
-test file is leftover debug-instrumentation scaffolding per its name, not something this session
-added). This directly contradicts the same session log's claim of a clean `cargo clippy
---workspace --all-targets -- -D warnings`. `cargo fmt --all -- --check` also has unrelated
-pre-existing diffs in `bands.rs`, `decoder.rs`, `encoder.rs`, and `snr_debug.rs` (mostly leftover
-`STEREO_DEBUG2`-gated `eprintln!`s that the log said were removed, plus reflow). None of this was
-fixed this session (out of scope for benchmark work; flagging so it isn't lost).
+**Fix**: `tpt-av-cadence-opus/src/celt/encoder.rs` — removed the "+8" cushion, so the padding loop
+targets exactly `bytes_per_frame * 8` (matching the pre-refactor behavior). The pre-existing
+defensive end-of-buffer `resize` below it remains as a genuine last resort for `tell()`'s
+(separately real, much smaller, sub-byte) slack.
+
+**Verification**: both previously-failing tests pass; full `cargo test -p tpt-av-cadence-opus
+--release` — 193/193 lib tests + every integration suite green; full `cargo test --workspace
+--release` — zero failures anywhere. Also cleaned up, while verifying this fix didn't need to touch
+anything else, two small pre-existing-at-HEAD quality issues found via `git stash -u` (confirmed
+not caused by this session): `cargo clippy -p tpt-av-cadence-opus --all-targets -- -D warnings`
+failed on `encoder.rs`'s `for lm in 0..=3usize` (`needless_range_loop`, fixed with a documented
+`#[allow]` since `lm` is used as a value throughout the loop, not just an index) and on
+`tests/snr_debug.rs`'s unused `OVERLAP` const (that whole file was leftover ad-hoc debug
+scaffolding, redundant with the crate's real tests — deleted rather than patched). `cargo fmt --all
+-- --check` is now clean workspace-wide (was previously failing on leftover `STEREO_DEBUG2`
+`eprintln!` formatting in `bands.rs`/`decoder.rs`/`encoder.rs`/the now-deleted `snr_debug.rs`).
 
 ## Cross-Cutting (ongoing, applies to every phase)
 

@@ -1,6 +1,6 @@
 # Conformance dashboard
 
-Generated 2026-09-23 06:01 UTC by `tools/conformance_dashboard.py`. Numbers are scraped from each
+Generated 2026-09-23 06:48 UTC by `tools/conformance_dashboard.py`. Numbers are scraped from each
 crate's own conformance test output (see that crate's `tests/conformance.rs`) — this
 script doesn't measure anything independently, it just aggregates what's already printed.
 
@@ -34,11 +34,11 @@ _No per-stream SNR lines emitted by this crate's default test run — either it'
 
 | Stream | SNR (dB) |
 | :--- | ---: |
+| PCE stream tone.aac | 123.77 |
 | tone.aac | 123.77 |
 | raw config stream | 123.77 |
-| PCE stream tone.aac | 123.77 |
-| test.aac | 123.39 |
 | PCE stream test.aac | 123.39 |
+| test.aac | 123.39 |
 
 ## Ogg Vorbis I (FFmpeg-oracle SNR)
 

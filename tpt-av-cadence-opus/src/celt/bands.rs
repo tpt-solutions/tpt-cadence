@@ -1681,9 +1681,7 @@ pub(crate) fn quant_all_bands(
             )?;
             if dbg {
                 let post_e: f32 = x_band.iter().map(|v| v * v).sum();
-                eprintln!(
-                    "DEC band i={i} n={n} b={b} pre_e={pre_e} post_e={post_e} x_cm={x_cm}"
-                );
+                eprintln!("DEC band i={i} n={n} b={b} pre_e={pre_e} post_e={post_e} x_cm={x_cm}");
             }
             let n1 = norm1.as_deref_mut().unwrap();
             let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
