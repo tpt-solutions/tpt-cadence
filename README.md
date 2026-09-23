@@ -180,6 +180,18 @@ with the format supplied out-of-band, as in `pcm_decode` above. A
 `tpt-av-cadence-cli`'s full implementation cover the same ground); one may
 be added later if there's demand for a scaffolded starter project.
 
+### WASM
+
+Every decoder crate builds for `wasm32-unknown-unknown` with zero code
+changes (verified in CI) — each one operates on an in-memory
+`Box<dyn Read + Send>` source rather than the filesystem, so nothing about
+the actual decode path is platform-specific.
+[`tpt-av-cadence-wasm-demo`](tpt-av-cadence-wasm-demo) is a minimal
+`wasm-bindgen` wrapper (WAV only, as a proof of the pattern) with a
+Node.js test proving real decoded output through an actual wasm runtime,
+not just a successful compile — see that crate's `src/lib.rs` for the
+build/bind steps and `test.js` for the harness.
+
 ## Comparison to other Rust audio crates
 
 An honest comparison, not a sales pitch — some of these projects are more

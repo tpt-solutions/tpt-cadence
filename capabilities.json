@@ -134,6 +134,17 @@
       "realtime_safe": false,
       "fuzzed": false,
       "notes": "Sniffs .ogg content (OpusHead vs \\x01vorbis) since extension alone doesn't disambiguate; ships a minimal hand-rolled 16-bit PCM WAV writer for transcode output"
+    },
+    {
+      "crate": "tpt-av-cadence-wasm-demo",
+      "formats": ["wav"],
+      "role": "wasm32-unknown-unknown feasibility spike — wasm-bindgen wrapper decoding WAV to f32",
+      "decode": "stable",
+      "encode": "n/a",
+      "conformance": "n/a (verified via a Node.js runtime smoke test, not a conformance suite)",
+      "realtime_safe": false,
+      "fuzzed": false,
+      "notes": "publish = false, not part of the crate suite proper. Proves every decoder crate builds and runs correctly under wasm32-unknown-unknown with zero code changes; only WAV is wired up here, wiring the rest is mechanical repetition"
     }
   ]
 }

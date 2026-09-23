@@ -1,6 +1,9 @@
 target/
 Cargo.lock
 
+# Generated wasm-bindgen JS glue (regenerate per tpt-av-cadence-wasm-demo's doc comment)
+tpt-av-cadence-wasm-demo/pkg/
+
 # Editors / OS
 .vscode/
 .idea/

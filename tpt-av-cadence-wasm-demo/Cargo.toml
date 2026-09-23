@@ -1,0 +1,17 @@
+[package]
+name = "tpt-av-cadence-wasm-demo"
+description = "WASM build feasibility spike: decodes WAV bytes to f32 PCM via wasm-bindgen. Not a general-purpose API — a proof that the decoder crates compile and run correctly under wasm32-unknown-unknown, per todo.md's 'WASM build feasibility spike' entry."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tpt-av-cadence-core = { workspace = true }
+tpt-av-cadence-wav = { path = "../tpt-av-cadence-wav" }
+wasm-bindgen = "0.2"

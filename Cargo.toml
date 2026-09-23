@@ -13,6 +13,7 @@ members = [
     "tpt-av-cadence-vorbis",
     "tpt-av-cadence-test-utils",
     "tpt-av-cadence-cli",
+    "tpt-av-cadence-wasm-demo",
 ]
 exclude = ["fuzz"]
 
