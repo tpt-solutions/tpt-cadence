@@ -161,7 +161,6 @@ fn bits_per_sample_code(bps: u16) -> u16 {
 
 /// Writes a positive number in FLAC's UTF-8-like coding (1–7 bytes).
 pub fn push_utf8_number(w: &mut BitWriter, value: u64) {
-    assert!(value > 0 || true);
     if value < 0x80 {
         w.push(value, 8);
         return;

@@ -17,3 +17,8 @@ log = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "celt_round_trip"
+harness = false

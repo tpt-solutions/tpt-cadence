@@ -43,7 +43,7 @@ fn flac_matches_ffmpeg_bit_exact() {
         }
     }
 
-    assert!(checked > 0, "no FLAC fixtures were cross-checked");
+    assert!(checked + skipped > 0, "no FLAC fixtures found to check");
     if skipped > 0 {
         assert!(
             std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_none(),

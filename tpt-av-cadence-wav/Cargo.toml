@@ -19,3 +19,8 @@ log = { workspace = true }
 proptest = { workspace = true }
 tpt-av-cadence-test-utils = { workspace = true }
 tpt-av-test-fuzz = { path = "../../tpt-av-test/tpt-av-test-fuzz" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "decode"
+harness = false

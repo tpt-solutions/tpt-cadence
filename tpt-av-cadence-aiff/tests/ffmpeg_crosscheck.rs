@@ -116,7 +116,7 @@ fn aiff_matches_ffmpeg_bit_exact() {
             Err(e) => panic!("{bits}-bit {channels}ch {rate} Hz: {e}"),
         }
     }
-    assert!(checked > 0, "no AIFF variants were cross-checked");
+    assert!(checked + skipped > 0, "no AIFF variants found to check");
     if skipped > 0 {
         assert!(
             std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_none(),

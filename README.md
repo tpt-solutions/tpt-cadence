@@ -1,6 +1,7 @@
 # tpt-cadence
 
 [![CI](https://github.com/tpt-solutions/tpt-cadence/actions/workflows/ci.yml/badge.svg)](https://github.com/tpt-solutions/tpt-cadence/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/tpt-solutions/tpt-cadence/branch/master/graph/badge.svg)](https://codecov.io/gh/tpt-solutions/tpt-cadence)
 
 **A pure-Rust, zero-dependency audio codec suite. Memory-safe, real-time capable, and permissively licensed (MIT OR Apache-2.0).**
 
@@ -52,6 +53,13 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams). ⚠️ Encoder produces valid bitstreams (FFmpeg-decodable) but poor audio fidelity — analysis-filter mismatch, see `todo.md` |
 | [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures) |
 | [`tpt-av-cadence-test-utils`](tpt-av-cadence-test-utils) | Conformance harness — FFmpeg comparison, fuzz helpers, MD5 | ✅ Internal (dev-only) |
+
+See [`capabilities.json`](capabilities.json) for a machine-readable version of this table
+(per-crate format list, decode/encode/conformance status, real-time-safety and fuzz flags), and
+[`CONFORMANCE.md`](CONFORMANCE.md) for a generated dashboard of the actual per-stream SNR/pass-fail
+numbers each crate's conformance suite reports (regenerate with `python3
+tools/conformance_dashboard.py`; CI regenerates it on every push to `master` and uploads it as a
+build artifact — FFmpeg must be on `PATH` for the FFmpeg-oracle rows to populate).
 
 ## Quickstart
 

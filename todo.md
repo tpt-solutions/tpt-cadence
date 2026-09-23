@@ -1342,6 +1342,48 @@ crate unit tests + full RFC 6716 conformance green, strict Clippy and
 workspace-green claim — it currently does not compile (mid-flight edits,
 ~44 errors) and belongs to the AAC workstream.
 
+### Regression found while adding benchmarks (2026-09-23) — NOT fixed, needs attention
+
+While wiring up `criterion` benches (see the "Benchmark tracking" entry below), `cargo test -p
+tpt-av-cadence-opus --lib` was run as a sanity check before touching any `src/` code and found
+**2 of 193 lib tests failing at HEAD** (commit `dee0fcd`, "Add CELT encoder transient detection,
+stereo support, and variable frame sizes"), reproducibly (not a flake — re-ran 3x, same result,
+debug and bench/release profiles both fail identically):
+
+- `celt::encoder::tests::encode_then_decode_recovers_a_sine_tone` — panics with `snr=0.4 dB too
+  low (encoded/decoded signal doesn't resemble the original)`, i.e. essentially uncorrelated
+  output, not a marginal threshold miss.
+- `celt::encoder::tests::encode_then_decode_a_transient_onset_detects_transient_and_reduces_pre_echo`
+  — also fails.
+
+This directly contradicts that session's own log entry ("Session log (2026-09-22, continued):
+stereo support" below), which reports `cargo test -p tpt-av-cadence-opus --lib`: **190/190 pass**
+after the stereo-support changes landed. Since HEAD is exactly that session's commit and no `src/`
+changes were made this session (only `Cargo.toml`/bench files were touched, isolated to
+`benches/celt_round_trip.rs` — a separate compilation unit that doesn't exercise this code path's
+correctness, only that it runs without panicking), either: (a) the committed state doesn't match
+what that session actually tested before writing the log (e.g. a final fixup after the last test
+run wasn't re-verified), or (b) there's an environment-dependent difference (this was run on Linux
+in a cloud container; prior sessions' logs are Windows/MSVC-flavored) that changes float behavior
+enough to flip a marginal SNR check into a hard failure — but 0.4 dB vs. the prior session's
+reported >20 dB steady-state is not a marginal flip, so (a) is more likely. **Not investigated
+further this session** (out of scope for the benchmarking work in progress, and reproducing/
+root-causing a CELT encoder DSP bug is a substantial task per this project's own established
+practice — see the CELT `final_range` and SBR sections above). Whoever picks this up next should
+start by bisecting `git log -- tpt-av-cadence-opus/src/celt/encoder.rs` to find the exact commit
+where these two tests still passed, then diff forward.
+
+Also found not clean at HEAD (verified with `git stash -u` to confirm neither is caused by this
+session's changes): `cargo clippy -p tpt-av-cadence-opus --all-targets -- -D warnings` fails —
+`encoder.rs:1229`'s `for lm in 0..=3usize` trips `clippy::needless_range_loop` indexing
+`expected_duration`, and `tests/snr_debug.rs`'s unused `OVERLAP` const trips `dead_code` (that
+test file is leftover debug-instrumentation scaffolding per its name, not something this session
+added). This directly contradicts the same session log's claim of a clean `cargo clippy
+--workspace --all-targets -- -D warnings`. `cargo fmt --all -- --check` also has unrelated
+pre-existing diffs in `bands.rs`, `decoder.rs`, `encoder.rs`, and `snr_debug.rs` (mostly leftover
+`STEREO_DEBUG2`-gated `eprintln!`s that the log said were removed, plus reflow). None of this was
+fixed this session (out of scope for benchmark work; flagging so it isn't lost).
+
 ## Cross-Cutting (ongoing, applies to every phase)
 
 - [x] Enforce real-time safety contract per decoder (alloc-free/lock-free/panic-free `decode()`; all allocation confined to `init()`/`open()`) — WAV/AIFF/FLAC/PCM audited; MP3 verified by test (`tests/rt_safety.rs`, counting allocator, zero allocations on successful decodes across all ten fixtures; error-path formatting remains the accepted exception); Vorbis/Opus/AAC decoders preallocate all scratch at open and return `Result` everywhere
@@ -1395,16 +1437,39 @@ Verification: full workspace `cargo test --workspace` (every crate, 0 failed), `
 - [ ] Revisit CONTRIBUTING.md's no-PRs policy — at minimum consider carving out example/doc PRs
 
 ### Automation / CI (from review §3)
-- [ ] Benchmark tracking (`criterion` + `benches/` + perf regression detection in CI)
+- [x] Benchmark tracking (`criterion` + `benches/` + perf regression detection in CI) — added `criterion` (default-features off, `cargo_bench_support` only — passes `cargo deny check licenses` clean) as a workspace dev-dependency, plus one `benches/decode.rs` per decoder crate (`wav`/`flac`/`mp3`/`aac`/`vorbis`, decoding a bundled conformance fixture or, for WAV, a synthetic fixture built with the crate's own encoder since WAV has no compressed bundled data) and `tpt-av-cadence-opus/benches/celt_round_trip.rs` (no bundled Opus fixture exists — the official RFC vectors are env-var-sourced, not checked in — so this benches a real `CeltEncoder`/`CeltDecoder` round trip on a synthetic tone instead). New `bench` CI job: compile-checks every bench on every push/PR (`cargo bench --workspace --no-run`), and on push-to-master/manual-dispatch actually runs each `[[bench]]` target by name (per-target, not `--workspace`, because `cargo bench --workspace` also invokes each crate's plain lib-unittest binary, whose default libtest harness doesn't understand criterion's `--output-format bencher` flag) and uploads the bencher-format output as a build artifact keyed by commit SHA. This is "tracking" in the sense of "every master-branch run's numbers are downloadable and diffable by hand" — no `gh-pages`/`github-action-benchmark`-style automatic regression detection is wired up yet (a real next step if this needs to become automatic). **While verifying this, discovered and fixed a real, unrelated CI bug**: `.github/workflows/ci.yml`'s `build-and-test`/`lint` jobs only ever checked out `tpt-cadence` itself, but `tpt-av-cadence-test-utils` depends on `tpt-av-test-reference` via a relative path (`../../tpt-av-test/tpt-av-test-reference`) that assumes the sibling `tpt-solutions/tpt-av-test` repo is checked out one directory above — meaning `cargo build --workspace` would have failed at the manifest-load stage on every CI run for every job that builds the workspace, unconditionally (confirmed by reproducing the exact same failure locally before adding the sibling checkout step, and confirming the fix resolves it). Added a second `actions/checkout` step (targeting `tpt-solutions/tpt-av-test`, `path: ../tpt-av-test`) to `build-and-test`, `lint`, and the new `bench` job.
 - [ ] Release automation (version bump/tag/changelog, e.g. `cargo-release` or `release-plz`) — deferred since crates.io publishing is explicitly out of scope for now
-- [ ] Coverage reporting (`cargo-llvm-cov` or `cargo-tarpaulin`) + badge
+- [x] Coverage reporting (`cargo-llvm-cov` or `cargo-tarpaulin`) + badge — added a `coverage` CI job (`cargo llvm-cov --workspace --lcov`, verified working locally against the real workspace, including the sibling `tpt-av-test` checkout fix noted above) that uploads to Codecov via `codecov/codecov-action` (tokenless upload, since this is a public repo — `fail_ci_if_error: false` so a Codecov-side outage never reds out the rest of CI) and also uploads the raw `lcov.info` as a build artifact. Added the Codecov badge to `README.md`. Note: the badge will show "unknown" until the *next* push to `master` actually runs the job and Codecov auto-onboards the repo on first upload — this can't be verified end-to-end from this session since it requires a real push event and Codecov account state outside this sandbox.
 
 ### Innovation candidates (from review §4)
 - [x] Unified CLI tool (auto-detect format, decode/inspect/transcode-to-WAV) — `tpt-av-cadence-cli` (`cadence` binary), `info`/`decode` subcommands, extension-based detection with content-sniffing for Ogg (Vorbis vs Opus); ships a minimal hand-rolled 16-bit PCM WAV writer since no encoder crate exists yet
 - [ ] WASM build feasibility spike (`wasm32-unknown-unknown` + minimal JS demo)
 - [ ] Per-format Cargo feature flags (opt into only needed codecs, smaller binary size)
-- [ ] Machine-readable per-crate capability matrix (e.g. `capabilities.json`)
-- [ ] Conformance dashboard generated from the existing SNR/bit-exactness test harness output
+- [x] Machine-readable per-crate capability matrix (e.g. `capabilities.json`) — added at repo root, hand-maintained (mirrors README's crate/format tables and this file's status prose); one entry per crate with format list, decode/encode/conformance status strings, real-time-safety and fuzz flags, and free-text notes
+- [x] Conformance dashboard generated from the existing SNR/bit-exactness test harness output —
+  `tools/conformance_dashboard.py` runs each decoder crate's conformance test suite with
+  `--nocapture`, scrapes the `SNR=... dB` lines those tests already print (no new measurement
+  logic — see `tpt-av-cadence-aac/tests/conformance.rs`'s `eprintln!` calls etc. for the source of
+  truth) plus each suite's overall pass/fail/ignored counts, and writes it all to `CONFORMANCE.md`
+  at the repo root (linked from `README.md`). New `conformance-dashboard` CI job regenerates it on
+  push-to-`master`/manual-dispatch and uploads it as a build artifact (`ubuntu-latest` ships
+  FFmpeg preinstalled, so the FFmpeg-oracle SNR rows for MP3/AAC/Vorbis populate there even though
+  they don't in an FFmpeg-less environment). **Found and fixed two real, pre-existing test bugs
+  while building this** (verified via `git stash -u` that neither is caused by this session's own
+  changes): `tpt-av-cadence-flac/tests/ffmpeg_crosscheck.rs` and
+  `tpt-av-cadence-aiff/tests/ffmpeg_crosscheck.rs` both asserted `checked > 0` unconditionally
+  after their per-fixture loop, which — contrary to both files' own doc comments and the
+  cross-cutting "Bit-exact validation harness" line above ("skips without FFmpeg") — meant the
+  test *failed* rather than skipped whenever FFmpeg was entirely absent from `PATH` (every fixture
+  individually and correctly resolves to `ConformanceError::ReferenceUnavailable` and increments
+  `skipped`, but `checked` then stays 0 and the final `assert!` fires anyway). Confirmed
+  reproducible in this session's sandbox (no FFmpeg installed) and fixed by changing the guard to
+  `checked + skipped > 0` (fails only if there was nothing to check at all, e.g. an empty fixture
+  directory) in both files — `CADENCE_REQUIRE_FFMPEG=1` still correctly fails in the all-skipped
+  case (verified). Also removed a dead `assert!(value > 0 || true)` (a tautology — clearly a
+  leftover from disabling a real assertion during debugging and never restored) from
+  `tpt-av-cadence-flac/tests/encoder.rs::push_utf8_number`, found via `cargo clippy`'s
+  `overly_complex_bool_expr` lint while verifying these fixes didn't introduce new warnings.
 
 ### Encoders (from review §2 — patent/royalty-screened; user-confirmed order)
 - [ ] **Opus encoder** (user-confirmed first target — hybrid SILK/CELT encoding, bitrate control, psychoacoustic tuning; reuses existing range coder/CELT/SILK decode infrastructure). **In progress** — CELT encoder now supports mono *or stereo*, fullband, CBR, 20 ms frames (independent-per-channel stereo, no M/S or intensity coupling). See "Opus CELT encoder — foundation (2026-09-21)" below for the mono foundation and "Session log (2026-09-22, continued): stereo support" for the stereo work.

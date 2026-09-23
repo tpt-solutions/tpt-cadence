@@ -23,6 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # tpt-av-cadence-test-utils depends on tpt-av-test-reference via a
+      # relative path (`../../tpt-av-test/...`), so the sibling repo must be
+      # checked out one level above this one for any build/test/bench to
+      # resolve its manifest.
+      - name: Checkout tpt-av-test (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: tpt-solutions/tpt-av-test
+          path: ../tpt-av-test
+
       - name: Install Rust (${{ matrix.rust }})
         uses: dtolnay/rust-toolchain@master
         with:
@@ -38,6 +48,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout tpt-av-test (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: tpt-solutions/tpt-av-test
+          path: ../tpt-av-test
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -60,6 +76,120 @@ jobs:
 
       - name: cargo-deny license audit
         run: cargo deny check licenses
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout tpt-av-test (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: tpt-solutions/tpt-av-test
+          path: ../tpt-av-test
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+      - name: Upload lcov as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov-${{ github.sha }}
+          path: lcov.info
+
+  # Compile-checks every criterion bench on every push/PR (catches API drift
+  # immediately) and, on push to master or manual dispatch only, actually
+  # runs them and uploads the result as a build artifact for historical
+  # comparison — there's no `gh-pages`/history-tracking wired up yet (see
+  # todo.md's "Benchmark tracking" entry), so today "tracking" means "every
+  # master-branch run's numbers are downloadable and diffable by hand".
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout tpt-av-test (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: tpt-solutions/tpt-av-test
+          path: ../tpt-av-test
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Compile-check all benches
+        run: cargo bench --workspace --no-run
+
+      - name: Run benches
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        # `cargo bench --workspace` also invokes each crate's plain lib
+        # unittest binary (not just its `[[bench]]` target), and that
+        # binary's default libtest harness doesn't understand criterion's
+        # `--output-format` flag — so each `[[bench]]` target is run
+        # explicitly by name instead of blanket `--workspace`.
+        run: |
+          set -e
+          : > bench-output.txt
+          cargo bench -p tpt-av-cadence-wav --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-flac --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-mp3 --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-aac --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-vorbis --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-opus --bench celt_round_trip -- --output-format bencher | tee -a bench-output.txt
+
+      - name: Upload bench results
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: bench-output.txt
+
+  # Generates the human-readable conformance dashboard (tools/conformance_dashboard.py)
+  # from the same conformance-test output the crates already print, and uploads it
+  # as a build artifact. Not run on every push/PR (it re-runs each crate's whole
+  # conformance suite in release mode, which is redundant with `build-and-test`) —
+  # push-to-master and manual dispatch only. `ubuntu-latest` ships FFmpeg
+  # preinstalled, so the FFmpeg-oracle SNR numbers (MP3/AAC/Vorbis) populate here
+  # even though they don't in an environment without FFmpeg on PATH.
+  conformance-dashboard:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout tpt-av-test (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: tpt-solutions/tpt-av-test
+          path: ../tpt-av-test
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Generate conformance dashboard
+        run: python3 tools/conformance_dashboard.py --output CONFORMANCE.md
+
+      - name: Upload dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-dashboard-${{ github.sha }}
+          path: CONFORMANCE.md
 
   # Nightly (scheduled) fuzz sweep. Also runs on manual dispatch, but not on
   # every push/PR — each target gets a fixed time budget rather than gating

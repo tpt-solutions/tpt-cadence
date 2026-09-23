@@ -1,0 +1,139 @@
+{
+  "$schema": "n/a — hand-maintained, mirrors README.md's crate/format tables and todo.md status; update both together",
+  "generated": "manually maintained, not auto-generated",
+  "last_updated": "2026-09-23",
+  "crates": [
+    {
+      "crate": "tpt-av-cadence-core",
+      "formats": [],
+      "role": "Decoder/Encoder traits, StreamInfo, shared enums, error types",
+      "decode": "n/a",
+      "encode": "n/a",
+      "conformance": "n/a",
+      "realtime_safe": true,
+      "fuzzed": false,
+      "notes": "Core API crate, no codec of its own"
+    },
+    {
+      "crate": "tpt-av-cadence-pcm",
+      "formats": ["raw-pcm"],
+      "role": "Headerless raw PCM (int8/16/24/32, f32/f64, both byte orders)",
+      "decode": "stable",
+      "encode": "stable",
+      "conformance": "bit-exact",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": null
+    },
+    {
+      "crate": "tpt-av-cadence-wav",
+      "formats": ["wav"],
+      "role": "RIFF/WAVE container + PCM/IEEE-float decode",
+      "decode": "stable",
+      "encode": "stable",
+      "conformance": "bit-exact",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "8/16/24/32-bit int + 32/64-bit float, mono/stereo/multichannel, extensible fmt chunk"
+    },
+    {
+      "crate": "tpt-av-cadence-aiff",
+      "formats": ["aiff", "aifc"],
+      "role": "Big-endian IFF container, AIFF/AIFC decode",
+      "decode": "stable",
+      "encode": "stable",
+      "conformance": "bit-exact",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "NONE/twos/sowt/FL32/FL64/in24/ni24, 80-bit extended sample rates"
+    },
+    {
+      "crate": "tpt-av-cadence-flac",
+      "formats": ["flac"],
+      "role": "Lossless, LPC + Rice coding",
+      "decode": "stable",
+      "encode": "partial",
+      "conformance": "bit-exact",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "Encoder supports fixed predictors only (no full LPC search on the encode side yet)"
+    },
+    {
+      "crate": "tpt-av-cadence-ogg",
+      "formats": ["ogg-container"],
+      "role": "Ogg page/packet container (RFC 3533), shared by Vorbis and Opus",
+      "decode": "stable",
+      "encode": "n/a",
+      "conformance": "in-use",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": null
+    },
+    {
+      "crate": "tpt-av-cadence-opus",
+      "formats": ["opus", "ogg-opus"],
+      "role": "Opus (RFC 6716) decoder + Ogg Opus container (RFC 7845)",
+      "decode": "conformance-tested",
+      "encode": "foundation-only",
+      "conformance": "100% final_range match on all 12 official RFC 6716 test vectors; SILK-only vectors PCM bit-exact; residual PCM SNR gap on CELT/hybrid vectors is float-ULP-class, not an entropy desync",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "CeltEncoder covers mono-or-stereo, fullband, CBR, 20ms, with transient/TF handling; no SILK/hybrid encode, no full top-level OpusEncoder wired to the Encoder trait yet"
+    },
+    {
+      "crate": "tpt-av-cadence-aac",
+      "formats": ["aac-lc", "he-aac-sbr"],
+      "role": "AAC-LC + SBR (ISO/IEC 14496-3)",
+      "decode": "conformance-tested",
+      "encode": "not-implemented",
+      "conformance": ">100 dB SNR vs FFmpeg (AAC-LC); ~22 dB SNR residual on HE-AAC/SBR (root cause narrowed, not fixed — see todo.md); 4/8 relevant FATE vectors at full fidelity",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "PS/HE-AACv2 unimplemented; multichannel HE-AAC applies SBR to only the first channel element; encoder on hold pending a licensing decision (Fraunhofer/VIA-LA patent pool)"
+    },
+    {
+      "crate": "tpt-av-cadence-mp3",
+      "formats": ["mp3"],
+      "role": "MPEG-1/2 Layer III",
+      "decode": "conformance-tested",
+      "encode": "bitstream-valid-only",
+      "conformance": ">100 dB SNR vs FFmpeg on ten bundled decode fixtures; official ISO/IEC 11172-4 vectors not obtainable, so decode correctness rests on the FFmpeg oracle alone",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "Encoder output is independently FFmpeg-decodable (valid bitstream, bit-reservoir-free CBR) but has poor audio fidelity from an unresolved analysis/synthesis filter mismatch"
+    },
+    {
+      "crate": "tpt-av-cadence-vorbis",
+      "formats": ["ogg-vorbis"],
+      "role": "Ogg Vorbis I",
+      "decode": "conformance-tested",
+      "encode": "not-implemented",
+      "conformance": "136-138 dB SNR vs FFmpeg on six bundled fixtures",
+      "realtime_safe": true,
+      "fuzzed": true,
+      "notes": "Encoder deferred — needs a psychoacoustic model"
+    },
+    {
+      "crate": "tpt-av-cadence-test-utils",
+      "formats": [],
+      "role": "FFmpeg comparison harness, fuzz helpers, RFC 1321 MD5",
+      "decode": "n/a",
+      "encode": "n/a",
+      "conformance": "n/a",
+      "realtime_safe": false,
+      "fuzzed": false,
+      "notes": "Internal, dev-only dependency"
+    },
+    {
+      "crate": "tpt-av-cadence-cli",
+      "formats": ["wav", "aiff", "flac", "mp3", "aac", "opus", "ogg-vorbis", "ogg-opus"],
+      "role": "Unified CLI (`cadence`) — format auto-detection, info/decode/transcode-to-WAV",
+      "decode": "stable",
+      "encode": "wav-only",
+      "conformance": "n/a (thin wrapper over the crates above)",
+      "realtime_safe": false,
+      "fuzzed": false,
+      "notes": "Sniffs .ogg content (OpusHead vs \\x01vorbis) since extension alone doesn't disambiguate; ships a minimal hand-rolled 16-bit PCM WAV writer for transcode output"
+    }
+  ]
+}
