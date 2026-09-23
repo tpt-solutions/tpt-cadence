@@ -71,9 +71,23 @@ impl<'a> BitReader<'a> {
         self.pos = (self.pos + 7) & !7;
     }
 
-    /// Restores an exact bit position (used to undo rounded-up reads).
+    /// Restores an exact bit position (used to undo rounded-up reads: e.g.
+    /// the FIL/SBR extension payload capture reads `payload_bits.div_ceil(8)`
+    /// whole bytes — deliberately rounding up past the payload's real
+    /// bit-exact length — then calls this to walk the logical position back
+    /// to `payload_start + payload_bits`). That rounded-up capture can
+    /// legitimately touch bits past the buffer's end when the payload sits
+    /// within the last byte of the frame with little padding after it
+    /// (common — real encoders don't pad extra bytes for this), which sets
+    /// `overread` via `read_bits`. Since `set_pos` is exactly the mechanism
+    /// that corrects a rounding overshoot back to a valid position, it must
+    /// re-derive `overread` from the *restored* position rather than leave
+    /// a stale `true` behind — otherwise a perfectly valid raw_data_block
+    /// gets rejected as corrupt purely because of how one element's payload
+    /// happened to be captured, not because anything was actually wrong.
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos;
+        self.overread = pos > self.bytes.len() * 8;
     }
 
     /// Skips `n` bits (used by declared-but-unsupported field lists).
@@ -122,5 +136,37 @@ mod tests {
         let mut br = BitReader::new(&[0xFF, 0x00]);
         assert_eq!(br.read_signed(8), -1);
         assert_eq!(br.read_signed(8), 0);
+    }
+
+    /// `set_pos` must clear a stale `overread` flag when it walks the
+    /// position back into bounds — this is exactly the FIL/SBR payload
+    /// capture pattern (`decoder.rs`'s `br.set_pos(payload_start +
+    /// payload_bits)`): it deliberately over-reads by rounding up to whole
+    /// bytes, which can legitimately touch bits past the buffer's end when
+    /// the payload sits within the buffer's last byte with little padding
+    /// after it, then corrects the logical position back to something
+    /// valid. Found via a real repro: a genuine libfdk-aac-encoded HE-AAC
+    /// stream whose 48th ADTS frame's SBR extension element left br.pos()
+    /// exactly 3 bits short of the frame's true end after the rounded-up
+    /// byte capture — a perfectly valid frame that this bug rejected as
+    /// corrupt.
+    #[test]
+    fn set_pos_clears_a_stale_overread_from_a_rounded_up_capture() {
+        // 16 bits total. Simulate reading 3 whole bytes (24 bits) to
+        // capture a value that's really only, say, 13 bits — the
+        // rounding-up read touches 8 bits past the 16-bit buffer, setting
+        // `overread`.
+        let mut br = BitReader::new(&[0xFF, 0xFF]);
+        br.read_bits(24);
+        assert!(br.overread());
+        // Restore the true logical position (13 bits, well within bounds).
+        br.set_pos(13);
+        assert!(
+            !br.overread(),
+            "set_pos must clear overread when the restored position is in bounds"
+        );
+        // set_pos to a position genuinely past the end must still flag it.
+        br.set_pos(17);
+        assert!(br.overread());
     }
 }

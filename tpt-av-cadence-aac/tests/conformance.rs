@@ -514,6 +514,44 @@ fn fate_he_aac_other_samples() {
     }
 }
 
+/// Regression for a real bitreader bug: `BitReader::set_pos` (used only by
+/// the FIL/SBR extension payload capture in `decoder.rs`, to walk the
+/// position back after deliberately over-reading up to a whole byte
+/// boundary) used to leave a stale `overread` flag set even when the
+/// restored position was perfectly valid. Whenever an SBR extension
+/// element's rounded-up byte capture happened to touch the true end of the
+/// frame buffer — which real encoders trigger routinely whenever the SBR
+/// payload is the last thing in a `raw_data_block` with little padding
+/// after it — every subsequent frame got rejected as "bitstream overread"
+/// even though nothing was actually wrong. Found by generating a real
+/// HE-AAC/SBR stream with `libfdk-aac` (this repo doesn't otherwise have an
+/// HE-AAC encoder available) from noise-like stereo content, which desyncs
+/// on ADTS frame 48 without the fix. See `tests/data/README.md` for how
+/// this fixture was produced.
+#[test]
+fn he_aac_sbr_stream_with_frame_end_aligned_fil_element_decodes_without_error() {
+    let path = data_dir().join("he_aac_sbr_overread_regression.aac");
+    let mut decoder = AacDecoder::from_source(Box::new(File::open(&path).unwrap())).unwrap();
+    let channels = decoder.info().channels as usize;
+    let mut buf = vec![0.0f32; 1024 * channels];
+    let mut total_frames = 0usize;
+    loop {
+        match decoder.decode(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total_frames += n,
+            Err(e) => panic!(
+                "decode failed after {total_frames} frames (should decode cleanly \
+                 end-to-end): {e}"
+            ),
+        }
+    }
+    // ~2.1 s at the doubled (post-SBR) 48 kHz output rate.
+    assert!(
+        total_frames > 90_000,
+        "decoded suspiciously little audio: {total_frames} frames"
+    );
+}
+
 /// Deterministic 1 s WAV with a distinct tone per channel (300 Hz in 200 Hz
 /// steps), so multichannel channel-order permutations are detectable.
 fn write_tone_wav(path: &Path, rate: u32, channels: u16) {

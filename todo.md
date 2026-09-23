@@ -283,6 +283,110 @@ direct-summation kernel with a real radix FFT matching `av_tx`'s
 algorithm (not just flipping the accumulator to `f32`), since operation
 *order* is what needs to match, not just precision.
 
+### Session update (2026-09-23): real FFmpeg oracle finally built; one real bug found and fixed; the MDCT-precision hypothesis above is now evidence-contradicted, not just unconfirmed
+
+This session ran in a Linux cloud container rather than the Windows machine
+prior sessions used, which changes the "next forensic step" above in one
+important way: building real FFmpeg from source is a plain `./configure &&
+make` here, not the MSYS2/mingw-w64/WSL lift the note above describes. Did
+exactly that: shallow-cloned `FFmpeg/FFmpeg` (tag `n7.1`) from GitHub (the
+network policy in this sandbox blocks `ffmpeg.org`/`fate-suite.ffmpeg.org`
+directly, but GitHub is reachable), configured a minimal build
+(`--disable-everything --enable-decoder=aac,pcm_s16le,pcm_f32le
+--enable-encoder=... --enable-demuxer=mov,wav,aac ...`), and built it in
+~22 seconds.
+
+**The official FATE HE-AAC sample is still unobtainable in this environment**
+(network policy), so this session built its own oracle-comparable fixture
+instead: apt's `libfdk-aac`/`fdkaac` refuse HE-AAC encode profiles (Debian/
+Ubuntu strip that patent-encumbered path from the packaged build), so
+`mstorsjo/fdk-aac` and `nu774/fdkaac` were built from source (both trivially
+reachable and buildable — `autoreconf && ./configure && make`), which
+encodes real SBR (`fdkaac -p 5`) with no such restriction. This means future
+sessions in a similar sandboxed environment are no longer blocked on
+obtaining the specific FATE fixture to make progress on this gap — any
+HE-AAC content can be generated on demand.
+
+**A real, previously-unknown bug was found and fixed this session** (not
+the fidelity gap itself, but found while chasing it): encoding
+pseudorandom stereo noise (`random.seed(42)`, needed because a pure tone
+doesn't stress SBR's envelope/noise bit allocation enough to reproduce this)
+to HE-AAC and decoding with this crate hit a hard decode failure —
+`corrupt data: bitstream overread while parsing raw_data_block` on ADTS
+frame 48, even though the same file decodes cleanly in real FFmpeg. Traced
+to `BitReader::set_pos` (`tpt-av-cadence-aac/src/bitreader.rs`), used only
+by the FIL/SBR extension payload capture in `decoder.rs`: that capture
+deliberately reads `payload_bits.div_ceil(8)` whole bytes (rounding up past
+the payload's real bit length) into a fixed buffer, then calls `set_pos` to
+walk the logical position back to `payload_start + payload_bits`. When the
+rounded-up capture happens to touch bits past the buffer's true end — which
+happens whenever an SBR extension is the last element in a frame with less
+than a full byte of trailing padding, something noise-like content triggers
+far more than a tone (denser envelope/noise payloads leave less slack) —
+`read_bits` sets a `overread` flag that `set_pos` never cleared, even though
+the position it restored was completely valid. Every frame after that one
+then failed too, since the flag is checked (correctly) at the top of every
+subsequent element-loop iteration. Fixed by having `set_pos` re-derive
+`overread` from the just-restored position (`pos > bytes.len() * 8`) instead
+of leaving the old value in place. Added a unit test reproducing the
+exact bit-accounting shape of the bug, plus an integration regression test
+against a bundled from-scratch fixture (`tests/data/
+he_aac_sbr_overread_regression.aac`, 42 KB, built via the from-source
+`fdkaac` above — see `tests/data/README.md`) asserting the stream decodes
+end-to-end without error. Verified: full `cargo test -p tpt-av-cadence-aac
+--release` and `cargo test --workspace --release` green; clippy/fmt clean.
+
+**On the fidelity gap itself**, with the overread bug out of the way,
+traced `hf_inverse_filter`'s actual C-vs-Rust inputs on this same noise
+fixture (matching env-var-gated `fprintf`/`eprintln!` checkpoints on both
+sides, reverted after use, same pattern as prior sessions) for a QMF band
+with real broadband energy (`k=1`). After correcting for a systematic
+2-call (1 stereo frame) offset between the two traces' call counters — the
+two decoders don't start counting `sbr_hf_inverse_filter` invocations from
+the same reference frame, a difference not yet root-caused but easy to
+compensate for by inspection (near-zero-magnitude priming values line up a
+constant 2 calls apart) — **the divergence has a sharp, structural boundary
+that contradicts the MDCT-precision hypothesis above**: `x_low[k][0..8]`
+(populated from `w_prev`, the *previous* frame's QMF analysis, per
+`lf_gen`'s `T_HFGEN = 8` split) matches to ~4 significant figures between C
+and Rust — consistent with ordinary float rounding, not a bug — while
+`x_low[k][8..40]` (populated from `w_cur`, the *current* frame's QMF
+analysis) diverges by 10-140% *relative* error, values of the same rough
+order of magnitude but genuinely different, not a rounding-level effect.
+Since `hf_inverse_filter` only *reads* `x_low` (it doesn't compute any of
+it), this rules out `hf_inverse_filter` itself, its cancellation-prone
+`dk` division, and — most importantly — the 64-point inverse MDCT that
+lives inside it as the *origin* of the divergence (the previous session's
+leading hypothesis): whatever is wrong is upstream, in how the *current*
+frame's `w`/QMF-analysis buffer gets populated, or further upstream still
+in the core AAC-LC time-domain samples that feed that QMF analysis. This
+doesn't contradict *every* part of the old hypothesis (an MDCT-precision
+issue could still exist somewhere in the analysis-side transform, which is
+a separate 64-point transform from the one inside `hf_inverse_filter`'s
+callers) — but it does mean "the fix is almost certainly replacing
+`Mdct64`'s kernel with a real FFT" is no longer the best-supported next
+step; that specific claim from the previous session's hypothesis is now
+evidence-contradicted for the *synthesis*-side transform, at least.
+
+**Next step, now more concretely scoped than before**: with the oracle
+build no longer the bottleneck, extend the same instrumented-trace
+technique one stage further upstream — dump the core AAC-LC time-domain
+samples (post-IMDCT, pre-QMF-analysis) for the same frame on both sides
+and diff those; if they already differ, the bug is in core spectral
+decode (Huffman/scalefactor/IMDCT) and just happens to only become
+*visible* once SBR's HF generation amplifies it, which would also explain
+why this was never caught by the crate's own >100 dB AAC-LC-only
+conformance gate (a bug specific to certain Huffman codebook/scale-factor
+patterns that noise content exercises far more than the tones those tests
+use). If the core samples already match, the bug is specifically in the
+QMF analysis invocation's frame-to-frame buffer bookkeeping (`w[0]`/`w[1]`
+double-buffering, or the hop/overlap alignment between consecutive calls)
+rather than the QMF kernel itself (already independently verified against
+reference coefficients). Also worth root-causing on its own: the 2-call
+trace-alignment offset noted above, since an unexplained off-by-one in
+when SBR data starts applying is itself a plausible root cause worth
+ruling in or out before looking further upstream.
+
 Other remaining gaps (hardening, not blockers): the four multichannel
 FATE items' residual (al06/al07/al15/al22, 2-53 dB): frame-level
 forensics narrowed it to the coupling/intensity interaction in PCE
@@ -1411,7 +1515,7 @@ scaffolding, redundant with the crate's real tests — deleted rather than patch
 Full review notes: `C:\Users\phill\.claude\plans\review-platform-for-bugs-compiled-ullman.md`. Tracked here so items don't get lost back into prose.
 
 ### Known open correctness gaps (carried over from earlier sections, re-flagged for visibility)
-- [ ] AAC SBR fidelity gap: ~22 dB SNR residual vs reference (re-measured this session: 21.86 dB on `al_sbr_cm_48_2`). Every DSP/control-flow stage (dequant, hf_inverse_filter, chirp, hf_gen, mapping, env_estimate, gain_calc, hf_assemble, QMF analysis/synthesis, all sbrdsp kernels) line-by-line audited against live FFmpeg reference source this session and found to match exactly — ruling out a logic bug in any of those stages. Leading remaining candidate: the 64-point inverse MDCT's direct-summation (f64) implementation vs. the reference's actual FFT (`av_tx`) produces small (~1e-5 relative) `X_low` differences that compound through `hf_inverse_filter`'s cancellation-prone division and `bw_array`'s frame-to-frame exponential smoothing — plausible and mechanistically grounded, but NOT validated against a byte-exact C oracle trace, so not applied as a fix. See "Remaining SBR gap" above for the full account and the concrete next step (real FFmpeg build + instrumented trace diff).
+- [ ] AAC SBR fidelity gap: ~22 dB SNR residual vs reference (re-measured this session: 21.86 dB on `al_sbr_cm_48_2`; 17.7 dB on a self-generated HE-AAC noise fixture, same ballpark). See "Session update (2026-09-23): real FFmpeg oracle finally built..." above: this session finally got a byte-exact oracle trace (previously blocked on the Windows/MSYS2 build lift; trivial in this Linux sandbox) and found the leading hypothesis from the prior session (64-point synthesis MDCT precision inside `hf_inverse_filter`) is evidence-contradicted — the actual divergence is upstream of `hf_inverse_filter` entirely, specifically in the *current* frame's QMF-analyzed samples (`x_low[k][8..40]`, populated from `w_cur`) versus the *previous* frame's (`x_low[k][0..8]`, from `w_prev`, which matches almost exactly). Next step: diff core AAC-LC time-domain samples (pre-QMF-analysis) to localize further. **Found and fixed a real, unrelated bug while chasing this**: a `BitReader::set_pos` stale-`overread`-flag bug that hard-failed decode of any HE-AAC stream whose SBR extension payload capture rounded up to touch the frame buffer's true end (noise-like content triggers this far more than tones) — see `tpt-av-cadence-aac/src/bitreader.rs` and the new regression test/fixture.
 - [ ] PS / HE-AACv2 unimplemented (PS payload parsed but skipped; decodes as mono)
 - [ ] Multichannel HE-AAC (5.1/7.1): only the first channel element's SBR payload is applied (one SBR context instead of one per channel element)
 - [ ] AAC multichannel CCE/PCE fidelity: 4 FATE vectors (al06/al07/al15/al22) at 2-53 dB, coupling/PCE interaction bugs not root-caused
