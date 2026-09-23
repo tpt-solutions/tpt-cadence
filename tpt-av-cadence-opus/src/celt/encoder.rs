@@ -254,6 +254,16 @@ impl CeltEncoder {
     /// encoder's entire bitrate control for this milestone is this fixed
     /// per-frame byte budget (no VBR). Multi-frame-per-packet (framing
     /// codes 1-3) is out of scope — see the module doc comment.
+    ///
+    /// **Known bug, not yet fixed**: at most CBR byte budgets (every
+    /// budget except the two values this crate's own tests happen to use,
+    /// 160 bytes/frame mono and 320 stereo), the returned packet can
+    /// silently overshoot `bytes_per_frame` by a byte or two — see
+    /// `todo.md`'s "CELT CBR encoder can silently overshoot its byte
+    /// budget" writeup for the full investigation (now spanning several
+    /// sessions) and `tests/ogg_opus.rs::
+    /// celt_encoder_cbr_budget_other_than_the_two_tested_values_currently_corrupts_decode`
+    /// for the pinned reproduction.
     pub fn encode_frame(&mut self, pcm: &[f32], bytes_per_frame: usize) -> Vec<u8> {
         self.encode_frame_impl(pcm, bytes_per_frame, None)
     }

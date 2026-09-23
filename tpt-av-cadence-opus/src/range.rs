@@ -418,9 +418,20 @@ impl RangeEncoder {
         let two_b = 1u64 << b;
         let mut end = ((self.val as u64) + two_b - 1) & !(two_b - 1);
 
-        while end != 0 {
+        // `l` = number of significant bits in `end` (31 - b trailing
+        // zeros), rounded up to a whole number of bytes below. Reference
+        // `ec_enc_done` drives this loop by a bit counter, not by `end`
+        // becoming zero: a byte whose bits happen to all be zero (e.g. the
+        // low byte of a 9-significant-bit `end`) still must be emitted,
+        // since the decoder's `tell()`-derived budget already counted it.
+        // Terminating early on `end == 0` silently drops that trailing
+        // zero byte and under-produces relative to every other Opus
+        // decoder/encoder.
+        let mut l = 31i32 - b as i32;
+        while l > 0 {
             self.carry_out((end >> 23) as u32);
             end = (end << 8) & 0x7FFF_FFFF;
+            l -= 8;
         }
         if (self.rem != 0 && self.rem != -1) || self.ext > 0 {
             self.carry_out(0); // flush: 9 zero bits
