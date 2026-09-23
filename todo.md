@@ -1460,7 +1460,19 @@ Verification: full workspace `cargo test --workspace` (every crate, 0 failed), `
 ### Innovation candidates (from review §4)
 - [x] Unified CLI tool (auto-detect format, decode/inspect/transcode-to-WAV) — `tpt-av-cadence-cli` (`cadence` binary), `info`/`decode` subcommands, extension-based detection with content-sniffing for Ogg (Vorbis vs Opus); ships a minimal hand-rolled 16-bit PCM WAV writer since no encoder crate exists yet
 - [x] WASM build feasibility spike (`wasm32-unknown-unknown` + minimal JS demo) — **result: works with zero code changes.** Every decoder crate (`core`/`pcm`/`wav`/`aiff`/`flac`/`ogg`/`vorbis`/`opus`/`aac`/`mp3`) builds clean for `wasm32-unknown-unknown` as-is — no `std`-availability issues, no unsupported syscalls, since every decoder operates on an in-memory `Box<dyn Read + Send>` source (a `Cursor<Vec<u8>>` in the browser/Node case) rather than touching the filesystem/threads directly. Added `tpt-av-cadence-wasm-demo` (new workspace member, `publish = false`) exposing `decode_wav_to_f32`/`wav_sample_rate` via `wasm-bindgen`, plus `test.js`, a Node.js harness that builds a synthetic WAV, decodes it through the compiled `.wasm` + generated JS glue, and asserts the decoded samples are correct — this is a real, verified end-to-end run through an actual wasm runtime (Node's), not just "it compiles". New CI job (`wasm`) builds the demo for `wasm32-unknown-unknown`, generates bindings with `wasm-bindgen-cli` pinned to the resolved `wasm-bindgen` crate version (parsed from `Cargo.lock` post-build, since the CLI and crate versions must match exactly), and runs `test.js`. `cargo deny check licenses` stays clean with `wasm-bindgen`'s dependency tree added. Scope: only WAV is wired up in the demo (simplest format, proves the pattern); wiring the rest is mechanical repetition of the same shape, not a new feasibility question.
-- [ ] Per-format Cargo feature flags (opt into only needed codecs, smaller binary size)
+- [x] Per-format Cargo feature flags (opt into only needed codecs, smaller binary size) — added
+  to `tpt-av-cadence-cli` (the natural place: it's the crate that unconditionally pulled in every
+  format crate). Seven features (`wav`/`aiff`/`flac`/`mp3`/`aac`/`opus`/`vorbis`), each gating an
+  `optional = true` path dependency, all on by default (`cargo build -p tpt-av-cadence-cli` keeps
+  its historical "decode anything" behavior unchanged); `Kind`'s variants, `detect()`'s match arms,
+  `sniff_ogg` (compiled only when `opus` or `vorbis` — either can independently disable its half of
+  the Ogg sniff), and `open_reader()`'s match arms are all `#[cfg(feature = "...")]`-gated so a
+  disabled format's decoder crate isn't even a compiled dependency, not just unreachable at
+  runtime. Measured real effect: `--release` binary size drops from 1.38 MB (all formats) to
+  544 KB (`--no-default-features --features wav` only) — about 60% smaller for a single-format
+  build. New CI step builds a handful of representative single/dual/zero-format combinations
+  (not the full 2^7 matrix) to prove the gating actually compiles, not just that the Cargo.toml
+  syntax is valid.
 - [x] Machine-readable per-crate capability matrix (e.g. `capabilities.json`) — added at repo root, hand-maintained (mirrors README's crate/format tables and this file's status prose); one entry per crate with format list, decode/encode/conformance status strings, real-time-safety and fuzz flags, and free-text notes
 - [x] Conformance dashboard generated from the existing SNR/bit-exactness test harness output —
   `tools/conformance_dashboard.py` runs each decoder crate's conformance test suite with

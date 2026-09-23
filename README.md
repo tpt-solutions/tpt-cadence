@@ -137,7 +137,18 @@ For format auto-detection across the whole suite, the
 `cadence decode <file>`) is the canonical reference — see its
 [`src/main.rs`](tpt-av-cadence-cli/src/main.rs) for the full implementation,
 including sniffing an `.ogg` file's first page for `OpusHead` vs. `\x01vorbis`
-to tell Opus and Vorbis apart. The core of it distills to matching on file
+to tell Opus and Vorbis apart.
+
+`tpt-av-cadence-cli` gates each format behind its own Cargo feature
+(`wav`/`aiff`/`flac`/`mp3`/`aac`/`opus`/`vorbis`, all on by default) — a
+build that only needs one format can drop the rest as compiled
+dependencies entirely, not just at runtime:
+
+```sh
+cargo build -p tpt-av-cadence-cli --release --no-default-features --features wav,flac
+```
+
+The core of it distills to matching on file
 extension and opening the matching reader behind the shared `FormatReader`
 trait:
 

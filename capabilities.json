@@ -133,7 +133,7 @@
       "conformance": "n/a (thin wrapper over the crates above)",
       "realtime_safe": false,
       "fuzzed": false,
-      "notes": "Sniffs .ogg content (OpusHead vs \\x01vorbis) since extension alone doesn't disambiguate; ships a minimal hand-rolled 16-bit PCM WAV writer for transcode output"
+      "notes": "Sniffs .ogg content (OpusHead vs \\x01vorbis) since extension alone doesn't disambiguate; ships a minimal hand-rolled 16-bit PCM WAV writer for transcode output. Each format is behind its own Cargo feature (wav/aiff/flac/mp3/aac/opus/vorbis, all on by default) gating an optional dependency, so a single-format build drops the rest at compile time (measured: 1.38 MB release binary with all formats vs 544 KB with only wav)"
     },
     {
       "crate": "tpt-av-cadence-wasm-demo",

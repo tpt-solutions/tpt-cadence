@@ -44,6 +44,20 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      # Proves tpt-av-cadence-cli's per-format feature flags actually gate
+      # out the corresponding decoder crate (not just "the flag exists") —
+      # a handful of representative single-format and zero-format builds,
+      # not the full 2^7 combination matrix.
+      - name: Check per-format CLI feature combinations
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        run: |
+          cargo build -p tpt-av-cadence-cli --no-default-features --features wav
+          cargo build -p tpt-av-cadence-cli --no-default-features --features flac
+          cargo build -p tpt-av-cadence-cli --no-default-features --features opus
+          cargo build -p tpt-av-cadence-cli --no-default-features --features vorbis
+          cargo build -p tpt-av-cadence-cli --no-default-features --features wav,flac
+          cargo build -p tpt-av-cadence-cli --no-default-features
+
   lint:
     runs-on: ubuntu-latest
     steps:

@@ -74,14 +74,24 @@ fn parse_output_flag(rest: &[String]) -> Option<String> {
 }
 
 /// A detected input format, opened generically behind the shared
-/// [`FormatReader`]/[`Decoder`] traits.
+/// [`FormatReader`]/[`Decoder`] traits. Each variant is gated on the
+/// matching Cargo feature (see `Cargo.toml`'s `[features]`, all on by
+/// default) so a build with a format disabled doesn't even compile in the
+/// dependency that would decode it.
 enum Kind {
+    #[cfg(feature = "wav")]
     Wav,
+    #[cfg(feature = "aiff")]
     Aiff,
+    #[cfg(feature = "flac")]
     Flac,
+    #[cfg(feature = "mp3")]
     Mp3,
+    #[cfg(feature = "vorbis")]
     Vorbis,
+    #[cfg(feature = "opus")]
     Opus,
+    #[cfg(feature = "aac")]
     Aac,
 }
 
@@ -91,39 +101,81 @@ fn detect(path: &Path) -> Result<Kind, String> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
+    #[allow(unreachable_patterns)] // a disabled format's arm becomes unreachable, not an error
     match ext.as_str() {
+        #[cfg(feature = "wav")]
         "wav" | "wave" => Ok(Kind::Wav),
+        #[cfg(feature = "aiff")]
         "aif" | "aiff" | "aifc" => Ok(Kind::Aiff),
+        #[cfg(feature = "flac")]
         "flac" => Ok(Kind::Flac),
+        #[cfg(feature = "mp3")]
         "mp3" => Ok(Kind::Mp3),
+        #[cfg(feature = "aac")]
         "aac" | "adts" => Ok(Kind::Aac),
+        #[cfg(feature = "opus")]
         "opus" => Ok(Kind::Opus),
+        #[cfg(any(feature = "opus", feature = "vorbis"))]
         "ogg" | "oga" => sniff_ogg(path),
         other => Err(format!(
-            "can't auto-detect format from extension {other:?} (supported: wav, aif/aiff, flac, mp3, aac, opus, ogg)"
+            "can't auto-detect format from extension {other:?} (supported in this build: {})",
+            supported_extensions()
         )),
     }
 }
 
+fn supported_extensions() -> String {
+    let mut formats = Vec::new();
+    if cfg!(feature = "wav") {
+        formats.push("wav");
+    }
+    if cfg!(feature = "aiff") {
+        formats.push("aif/aiff");
+    }
+    if cfg!(feature = "flac") {
+        formats.push("flac");
+    }
+    if cfg!(feature = "mp3") {
+        formats.push("mp3");
+    }
+    if cfg!(feature = "aac") {
+        formats.push("aac");
+    }
+    if cfg!(feature = "opus") {
+        formats.push("opus");
+    }
+    if cfg!(any(feature = "opus", feature = "vorbis")) {
+        formats.push("ogg");
+    }
+    formats.join(", ")
+}
+
 /// Ogg can carry either Vorbis or Opus; peek the first page's identification
 /// packet for the `OpusHead` or `\x01vorbis` marker to tell them apart.
+/// Only compiled when at least one of the two is enabled (see `detect`'s
+/// `ogg`/`oga` arm).
+#[cfg(any(feature = "opus", feature = "vorbis"))]
 fn sniff_ogg(path: &Path) -> Result<Kind, String> {
     let mut buf = [0u8; 4096];
     let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let n = file.read(&mut buf).map_err(|e| e.to_string())?;
     let head = &buf[..n];
+    #[cfg(feature = "opus")]
     if contains(head, b"OpusHead") {
-        Ok(Kind::Opus)
-    } else if contains(head, b"vorbis") {
-        Ok(Kind::Vorbis)
-    } else {
-        Err(format!(
-            "{}: Ogg stream doesn't look like Vorbis or Opus (no identification packet found in the first {n} bytes)",
-            path.display()
-        ))
+        return Ok(Kind::Opus);
     }
+    #[cfg(feature = "vorbis")]
+    if contains(head, b"vorbis") {
+        return Ok(Kind::Vorbis);
+    }
+    Err(format!(
+        "{}: Ogg stream doesn't look like a supported codec in this build (no identification \
+         packet found in the first {n} bytes)",
+        path.display()
+    ))
 }
 
+#[cfg(any(feature = "opus", feature = "vorbis"))]
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -133,14 +185,21 @@ fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>, String> {
     let source: Box<dyn Read + Send> = Box::new(file);
     let map_err = |e: CadenceError| format!("{}: {e}", path.display());
     let reader: Box<dyn FormatReader> = match detect(path)? {
+        #[cfg(feature = "wav")]
         Kind::Wav => Box::new(tpt_av_cadence_wav::WavReader::open(source).map_err(map_err)?),
+        #[cfg(feature = "aiff")]
         Kind::Aiff => Box::new(tpt_av_cadence_aiff::AiffReader::open(source).map_err(map_err)?),
+        #[cfg(feature = "flac")]
         Kind::Flac => Box::new(tpt_av_cadence_flac::FlacReader::open(source).map_err(map_err)?),
+        #[cfg(feature = "mp3")]
         Kind::Mp3 => Box::new(tpt_av_cadence_mp3::Mp3Reader::open(source).map_err(map_err)?),
+        #[cfg(feature = "vorbis")]
         Kind::Vorbis => {
             Box::new(tpt_av_cadence_vorbis::VorbisFormatReader::open(source).map_err(map_err)?)
         }
+        #[cfg(feature = "opus")]
         Kind::Opus => Box::new(tpt_av_cadence_opus::OggOpusReader::open(source).map_err(map_err)?),
+        #[cfg(feature = "aac")]
         Kind::Aac => Box::new(tpt_av_cadence_aac::AacReader::open(source).map_err(map_err)?),
     };
     Ok(reader)

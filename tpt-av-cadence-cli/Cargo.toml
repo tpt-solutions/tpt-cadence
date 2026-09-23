@@ -15,13 +15,29 @@ publish = false
 name = "cadence"
 path = "src/main.rs"
 
+[features]
+# Every format is on by default, matching the CLI's historical behavior
+# (auto-detect and decode anything the suite supports). Building with
+# `--no-default-features --features wav,flac` (for example) pulls in only
+# those decoder crates, shrinking the binary for callers who know ahead of
+# time which formats they need — see `todo.md`'s "Per-format Cargo feature
+# flags" entry.
+default = ["wav", "aiff", "flac", "mp3", "aac", "opus", "vorbis"]
+wav = ["dep:tpt-av-cadence-wav"]
+aiff = ["dep:tpt-av-cadence-aiff"]
+flac = ["dep:tpt-av-cadence-flac"]
+mp3 = ["dep:tpt-av-cadence-mp3"]
+aac = ["dep:tpt-av-cadence-aac"]
+opus = ["dep:tpt-av-cadence-opus"]
+vorbis = ["dep:tpt-av-cadence-vorbis"]
+
 [dependencies]
 tpt-av-cadence-core = { workspace = true }
 tpt-av-cadence-pcm = { path = "../tpt-av-cadence-pcm" }
-tpt-av-cadence-wav = { path = "../tpt-av-cadence-wav" }
-tpt-av-cadence-aiff = { path = "../tpt-av-cadence-aiff" }
-tpt-av-cadence-flac = { path = "../tpt-av-cadence-flac" }
-tpt-av-cadence-opus = { path = "../tpt-av-cadence-opus" }
-tpt-av-cadence-aac = { path = "../tpt-av-cadence-aac" }
-tpt-av-cadence-mp3 = { path = "../tpt-av-cadence-mp3" }
-tpt-av-cadence-vorbis = { path = "../tpt-av-cadence-vorbis" }
+tpt-av-cadence-wav = { path = "../tpt-av-cadence-wav", optional = true }
+tpt-av-cadence-aiff = { path = "../tpt-av-cadence-aiff", optional = true }
+tpt-av-cadence-flac = { path = "../tpt-av-cadence-flac", optional = true }
+tpt-av-cadence-opus = { path = "../tpt-av-cadence-opus", optional = true }
+tpt-av-cadence-aac = { path = "../tpt-av-cadence-aac", optional = true }
+tpt-av-cadence-mp3 = { path = "../tpt-av-cadence-mp3", optional = true }
+tpt-av-cadence-vorbis = { path = "../tpt-av-cadence-vorbis", optional = true }
