@@ -261,11 +261,27 @@ pub struct AacDecoder {
     /// actually uses SBR. That was the dominant contributor to the
     /// AAC/SBR stack-overflow issue (see todo.md), well above the
     /// SBR-apply() locals it was originally attributed to.
-    sbr: Option<Box<sbr::Sbr>>,
-    /// The channel range (first, count) the SBR FIL applied to.
-    sbr_channels: Option<(usize, usize)>,
-    /// Once true, all subsequent frames output 2048 samples/channel.
+    /// Per-channel-element SBR state, indexed by the element's first
+    /// channel. Each SCE/CPE that ever carries an SBR extension gets its
+    /// own persistent context: the reference decoder keeps SBR state per
+    /// `ChannelElement` (`che[type][tag]`), not in one shared instance,
+    /// because each element's envelope/noise/QMF history is independent.
+    /// A single shared `Sbr` here used to mean only the last channel
+    /// element processed in a frame kept valid SBR state; every other
+    /// SBR-carrying element's high band silently used stale data from
+    /// whichever element happened to run last.
+    sbr_by_channel: [Option<Box<sbr::Sbr>>; MAX_CHANNELS],
+    /// Once true, all subsequent frames output 2048 samples/channel and
+    /// every decoded element applies SBR (reference: `sbr_apply` runs for
+    /// every channel element whenever `m4ac.sbr > 0`, independent of
+    /// whether that specific element's FIL carried fresh data this frame
+    /// — an element with no fresh data this frame still upsamples via QMF
+    /// passthrough using its own carried-over state).
     sbr_output_active: bool,
+    /// True once the stream's sample rate has been doubled for SBR.
+    /// Doubling must happen exactly once regardless of how many channel
+    /// elements carry SBR.
+    sbr_rate_doubled: bool,
 
     /// M/S decision bits for the current common-window CPE (512 entries).
     ms_mask: Box<[bool]>,
@@ -481,9 +497,9 @@ impl AacDecoder {
             buf: vec![0.0; 1024].into_boxed_slice(),
             temp: vec![0.0; 128].into_boxed_slice(),
             noise: NoiseGenerator::new(),
-            sbr: None,
-            sbr_channels: None,
+            sbr_by_channel: std::array::from_fn(|_| None),
             sbr_output_active: false,
+            sbr_rate_doubled: false,
             cces: (0..4)
                 .map(|_| CouplingChannel {
                     state: ChannelState::new(),
@@ -866,14 +882,20 @@ impl AacDecoder {
                                     Some((ch0, n, ty)) => (ty, (ch0, n)),
                                     None => (id, (0usize, 1usize)),
                                 };
-                                let sbr = self.sbr.get_or_insert_with(|| {
-                                    // First SBR discovery: the output rate
-                                    // doubles (implicit SBR signaling).
+                                if !self.sbr_rate_doubled {
+                                    // First SBR discovery anywhere in the
+                                    // stream: the output rate doubles
+                                    // (implicit SBR signaling), exactly
+                                    // once regardless of how many channel
+                                    // elements carry SBR.
+                                    self.sbr_rate_doubled = true;
+                                    self.info.sample_rate *= 2;
+                                }
+                                let sbr = self.sbr_by_channel[nch.0].get_or_insert_with(|| {
                                     Box::new(sbr::Sbr::new(id_type as usize))
                                 });
                                 if sbr.sample_rate == 0 {
-                                    sbr.sample_rate = 2 * self.info.sample_rate as i32;
-                                    self.info.sample_rate = sbr.sample_rate as u32;
+                                    sbr.sample_rate = self.info.sample_rate as i32;
                                 }
                                 sbr::parse::decode_sbr_extension(
                                     sbr,
@@ -882,7 +904,6 @@ impl AacDecoder {
                                     count,
                                     id_type as usize,
                                 );
-                                self.sbr_channels = Some(nch);
                                 self.sbr_output_active = true;
                                 if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
                                     FIL_SPANS.with(|s| {
@@ -974,7 +995,6 @@ impl AacDecoder {
                 std::mem::swap(&mut self.channels_state[0], &mut self.cces[i].state);
             }
         }
-        let mut sbr_frame_out: Option<(usize, usize)> = None; // (first ch, nch)
         for el in &decoded[..decoded_count] {
             let win = el.win;
             self.apply_coupling(el, 0);
@@ -996,11 +1016,20 @@ impl AacDecoder {
         }
 
         // SBR enhancement: replaces the 1024-sample core output with 2048
-        // samples per channel for the element the FIL data applied to.
+        // samples per channel, for every SCE/CPE element decoded this
+        // frame (reference: `sbr_apply` runs for every channel element
+        // once SBR is signaled anywhere in the stream, using that
+        // element's own carried-over state — even on a frame where its
+        // FIL carried no fresh data, it still needs the QMF-passthrough
+        // upsample to stay in sync with elements that did).
         if self.sbr_output_active {
-            if let Some((first, count)) = self.sbr_channels {
-                let nch = count.min(2);
+            let mut idx = 0;
+            while idx < block_count {
+                let el = block_channels[idx];
+                let count = if el.is_cpe { 2 } else { 1 };
+                let first = el.ch;
                 if decoded[..decoded_count].iter().any(|d| d.ch == first) {
+                    let nch = count.min(2);
                     let mut core = [
                         self.channels_state[first].out.to_vec(),
                         if nch == 2 {
@@ -1010,14 +1039,15 @@ impl AacDecoder {
                         },
                     ];
                     let id = if nch == 2 { 1 } else { 0 };
-                    let sbr = self.sbr.get_or_insert_with(|| Box::new(sbr::Sbr::new(id)));
+                    let sbr = self.sbr_by_channel[first]
+                        .get_or_insert_with(|| Box::new(sbr::Sbr::new(id)));
                     sbr.apply(id, &mut core, nch);
                     for (c, dst_ch) in (first..first + nch).enumerate() {
                         let dst = &mut self.channels_state[dst_ch].out;
                         dst[..2048].copy_from_slice(&core[c][..2048]);
                     }
-                    sbr_frame_out = Some((first, nch));
                 }
+                idx += count;
             }
         }
 
@@ -1033,7 +1063,7 @@ impl AacDecoder {
             Pce(&'a [u8]),
             Element,
         }
-        let frame_len = if sbr_frame_out.is_some() { 2048 } else { 1024 };
+        let frame_len = if self.sbr_output_active { 2048 } else { 1024 };
         let order: Order = if self.pce_plan_len > 0 && block_count == self.channels {
             Order::Pce(&self.pce_out_order[..self.channels])
         } else if self.pce_plan_len == 0 && block_count == self.channels {

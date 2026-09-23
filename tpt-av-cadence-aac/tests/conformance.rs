@@ -588,6 +588,56 @@ fn he_aac_sbr_fidelity_matches_reference_at_high_snr() {
     assert!(snr > 80.0, "HE-AAC SBR fidelity regressed: {snr:.2} dB");
 }
 
+/// Regression test for a real correctness bug (not just a fidelity gap):
+/// `AacDecoder` used to keep exactly one shared `Sbr` context
+/// (`self.sbr: Option<Box<sbr::Sbr>>`) for the whole stream, and
+/// `self.sbr_channels` was unconditionally overwritten by every FIL/SBR
+/// element parsed in a frame. In a multichannel HE-AAC stream with more
+/// than one SBR-carrying channel element (5.1 here: front pair, center,
+/// LFE, side pair — three SCE/CPE elements each carrying their own SBR
+/// payload), only the *last* channel element processed in a frame kept
+/// correct data; every earlier element's `channels_state[ch].out` samples
+/// past index 1024 were left however qmf synthesis last wrote them for a
+/// *different* channel-element's state, corrupting the entire upper half
+/// of those channels' output (measured ~-2 dB SNR pre-fix vs FFmpeg,
+/// i.e. uncorrelated noise, not merely "no SBR enhancement"). Fixed by
+/// giving every channel element its own persistent `Sbr` context
+/// (`sbr_by_channel`, indexed by the element's first channel, mirroring
+/// the reference decoder's per-`ChannelElement` `che[type][tag].sbr`) and
+/// applying SBR for every decoded element each frame, not just the one
+/// whose FIL happened to be parsed last.
+#[test]
+fn multichannel_he_aac_sbr_matches_reference_on_every_channel() {
+    let aac_path = data_dir().join("sbr_multichannel_5_1.aac");
+    let ref_path = data_dir().join("sbr_multichannel_5_1_ref.f32");
+    let (_decoder, pcm) = decode_all(&aac_path);
+    let ref_bytes = std::fs::read(&ref_path).unwrap();
+    let reference: Vec<f32> = ref_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(pcm.len(), reference.len(), "length");
+    const NCH: usize = 6;
+    let n = pcm.len() / NCH;
+    for ch in 0..NCH {
+        let mut signal = 0.0f64;
+        let mut error = 0.0f64;
+        for i in 0..n {
+            let a = pcm[i * NCH + ch];
+            let e = reference[i * NCH + ch];
+            let d = f64::from(a) - f64::from(e);
+            error += d * d;
+            signal += f64::from(e).powi(2);
+        }
+        let snr = 10.0 * (signal / error).log10();
+        eprintln!("sbr_multichannel_5_1: channel {ch} SNR={snr:.2} dB");
+        assert!(
+            snr > 80.0,
+            "multichannel HE-AAC SBR regressed on channel {ch}: {snr:.2} dB"
+        );
+    }
+}
+
 /// Deterministic 1 s WAV with a distinct tone per channel (300 Hz in 200 Hz
 /// steps), so multichannel channel-order permutations are detectable.
 fn write_tone_wav(path: &Path, rate: u32, channels: u16) {

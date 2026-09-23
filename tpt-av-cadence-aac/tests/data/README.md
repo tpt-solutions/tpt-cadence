@@ -45,3 +45,19 @@ float comparison, not bit-exact equality.
   self-generated fixtures, vs. ~18-23 dB before) and `todo.md`'s AAC SBR
   session log for how this was found — tracing this exact fixture's QMF
   analysis output frame-by-frame against a live FFmpeg build.
+
+- `sbr_multichannel_5_1.aac` / `sbr_multichannel_5_1_ref.f32` — 1 s 5.1
+  (6-channel) 48 kHz HE-AAC (SBR), same `libfdk-aac` toolchain, from a
+  deterministic six-tone WAV (one tone per channel, 220 Hz in 110 Hz
+  steps). Locks in the fix for a real multichannel correctness bug: the
+  decoder used to keep exactly one shared `Sbr` context for the whole
+  stream, so in a frame with more than one SBR-carrying channel element
+  (this stream's front pair, center, and side pair each carry their own
+  SBR payload; only the LFE doesn't), only the *last* element processed
+  kept valid state — every earlier element's upper-half (samples
+  1024-2047) output was whatever the last element's QMF synthesis had
+  left there, i.e. uncorrelated noise (~-2 dB SNR vs FFmpeg), not simply
+  "SBR disabled". See `tests/conformance.rs`'s
+  `multichannel_he_aac_sbr_matches_reference_on_every_channel` (gated at
+  >80 dB per channel; measured ~117-133 dB post-fix) and `todo.md`'s AAC
+  SBR session log.
