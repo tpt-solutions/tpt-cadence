@@ -6,8 +6,8 @@
 
 use std::io::Cursor;
 
-use tpt_av_cadence_core::FormatReader;
-use tpt_av_cadence_opus::{OggOpusReader, OpusHead};
+use tpt_av_cadence_core::{Encoder, FormatReader};
+use tpt_av_cadence_opus::{OggOpusEncoder, OggOpusReader, OpusHead};
 
 // ---------------------------------------------------------------------------
 // Test-side Ogg muxer (the container crate deliberately exposes only the
@@ -442,5 +442,301 @@ fn vector02_through_ogg_container_is_bit_exact() {
     assert!(
         max_diff <= 1.0 / 32768.0 + 1e-6,
         "container decode diverged from .dec by {max_diff}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OggOpusEncoder: real encode -> real decode round trip
+// ---------------------------------------------------------------------------
+
+/// Mono end-to-end: encode a tone through the real `OggOpusEncoder`, decode
+/// through the real `OggOpusReader`/`OpusDecoder`, and check (a) the
+/// decoded sample count exactly matches the input (end-trim correctly
+/// discards the zero-pad tail needed to complete the final 960-sample
+/// frame — this test deliberately uses a sample count that is *not* a
+/// multiple of 960, so a wrong granule would either truncate real audio or
+/// leak padding silence into the count) and (b) the decoded signal
+/// correlates well with the original at the codec's fixed algorithmic
+/// delay.
+#[test]
+fn ogg_opus_encoder_round_trips_a_tone_through_the_real_decoder() {
+    let sample_rate = 48_000u32;
+    let freq_hz = 440.0f32;
+    let n_samples = 960 * 5 + 137; // deliberately not a multiple of 960
+    let mut original = Vec::with_capacity(n_samples);
+    let mut phase = 0.0f32;
+    for _ in 0..n_samples {
+        original.push(0.5 * phase.sin());
+        phase += 2.0 * std::f32::consts::PI * freq_hz / sample_rate as f32;
+    }
+
+    let mut out = Vec::new();
+    {
+        // 64_000 bps -> 160 bytes/20ms-frame: the one mono CBR byte budget
+        // known not to trigger the CELT encoder's CBR-overshoot bug (see
+        // `celt_encoder_cbr_budget_other_than_the_two_tested_values_currently_corrupts_decode`
+        // in this file and todo.md) — not chosen for audio quality reasons.
+        let mut enc = OggOpusEncoder::new(&mut out, sample_rate, 1, 64_000).unwrap();
+        let mut pos = 0;
+        // Feed in irregular chunks to exercise the encoder's own internal
+        // frame-boundary buffering, not just whole-frame-at-a-time calls.
+        for chunk in [200usize, 960, 333, 960, 960, 1000] {
+            let end = (pos + chunk).min(original.len());
+            enc.encode(&original[pos..end]).unwrap();
+            pos = end;
+        }
+        if pos < original.len() {
+            enc.encode(&original[pos..]).unwrap();
+        }
+        enc.finish().unwrap();
+    }
+
+    let (pcm, mut reader) = decode_all_with(
+        OggOpusReader::from_source(Box::new(Cursor::new(out))).unwrap(),
+        960,
+    );
+    assert_eq!(reader.decoder().info().channels, 1, "decoded channel count");
+    assert_eq!(
+        pcm.len(),
+        n_samples,
+        "end-trim must recover exactly the encoded sample count"
+    );
+
+    // SNR is measured over the well-aligned, full-frame region only
+    // (frames 2..5, skipping the first two atypical/warm-up frames and the
+    // final partial frame whose zero-padded tail is a separate concern
+    // from this test's point — exact-length recovery — already checked
+    // above). 440 Hz at 48 kHz has a ~109-sample period, so the search
+    // range is capped below that to avoid picking a spurious
+    // same-shape-different-cycle peak.
+    let region_start = 960 * 2;
+    let region_end = 960 * 5;
+    let mut best_snr = f64::NEG_INFINITY;
+    for delay in 0..100i32 {
+        let sig_pow: f64 = original[region_start..region_end]
+            .iter()
+            .map(|&v| (v as f64) * (v as f64))
+            .sum();
+        let err_pow: f64 = original[region_start..region_end]
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| {
+                let di = region_start as i32 + i as i32 - delay;
+                let b = if di >= 0 && (di as usize) < pcm.len() {
+                    pcm[di as usize]
+                } else {
+                    0.0
+                };
+                let d = a as f64 - b as f64;
+                d * d
+            })
+            .sum();
+        let snr = 10.0 * (sig_pow / err_pow.max(1e-12)).log10();
+        if snr > best_snr {
+            best_snr = snr;
+        }
+    }
+    assert!(
+        best_snr > 12.0,
+        "best-delay SNR too low for a real encode/decode round trip: {best_snr:.1} dB"
+    );
+}
+
+/// Stereo: a tone hard-panned to the left channel decodes back with the
+/// right channel measurably quieter (not duplicated/collapsed to mono).
+#[test]
+fn ogg_opus_encoder_stereo_round_trip_keeps_channels_distinguishable() {
+    let sample_rate = 48_000u32;
+    let freq_hz = 440.0f32;
+    let n_frames = 960 * 4;
+    let mut original = Vec::with_capacity(n_frames * 2);
+    let mut phase = 0.0f32;
+    for _ in 0..n_frames {
+        let s = 0.5 * phase.sin();
+        original.push(s);
+        original.push(2e-3 * phase.sin()); // quiet, not exact-zero (see CBR-padding fix note)
+        phase += 2.0 * std::f32::consts::PI * freq_hz / sample_rate as f32;
+    }
+
+    let mut out = Vec::new();
+    {
+        // 320 bytes/frame (128_000 bps): the one stereo CBR byte budget
+        // known not to trigger the CBR-overshoot bug — see the mono test
+        // above for the full note.
+        let mut enc = OggOpusEncoder::new(&mut out, sample_rate, 2, 128_000).unwrap();
+        enc.encode(&original).unwrap();
+        enc.finish().unwrap();
+    }
+
+    let (pcm, mut reader) = decode_all_with(
+        OggOpusReader::from_source(Box::new(Cursor::new(out))).unwrap(),
+        960,
+    );
+    assert_eq!(reader.decoder().info().channels, 2);
+    assert_eq!(pcm.len(), n_frames * 2);
+
+    let left_rms: f64 = (pcm
+        .iter()
+        .step_by(2)
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        / n_frames as f64)
+        .sqrt();
+    let right_rms: f64 = (pcm
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        / n_frames as f64)
+        .sqrt();
+    assert!(left_rms > 0.1, "left channel should carry real signal");
+    assert!(
+        right_rms < left_rms * 0.1,
+        "right (quiet) channel leaked too much energy from left: \
+         left_rms={left_rms:.6} right_rms={right_rms:.6}"
+    );
+}
+
+/// A stream with `finish()` called before any `encode()` call still
+/// produces a valid, decodable (silent) container — the EOS page must land
+/// on a real audio packet, not be skipped entirely.
+#[test]
+fn ogg_opus_encoder_empty_stream_still_produces_a_valid_container() {
+    let mut out = Vec::new();
+    {
+        let mut enc = OggOpusEncoder::new(&mut out, 48_000, 1, 64_000).unwrap();
+        enc.finish().unwrap();
+    }
+    let pcm = decode_all(&out, 960);
+    assert_eq!(pcm.len(), 0, "no samples were ever encoded");
+}
+
+#[test]
+fn ogg_opus_encoder_rejects_unsupported_sample_rate() {
+    let mut out = Vec::new();
+    assert!(OggOpusEncoder::new(&mut out, 44_100, 1, 64_000).is_err());
+}
+
+#[test]
+fn ogg_opus_encoder_rejects_unsupported_channel_count() {
+    let mut out = Vec::new();
+    assert!(OggOpusEncoder::new(&mut out, 48_000, 3, 64_000).is_err());
+}
+
+/// The encoder's own `OpusHead` output round-trips through `OpusHead::parse`.
+#[test]
+fn ogg_opus_encoder_head_round_trips_through_parse() {
+    let head = OpusHead {
+        version: 1,
+        channels: 2,
+        pre_skip: 0,
+        input_sample_rate: 48_000,
+        output_gain_q8: 0,
+        mapping_family: 0,
+    };
+    let bytes = head.write();
+    let parsed = OpusHead::parse(&bytes).unwrap();
+    assert_eq!(parsed, head);
+}
+
+/// **Known, real, unfixed bug — see `todo.md`'s "CELT CBR encoder can
+/// silently overshoot its byte budget" entry for the full investigation.**
+///
+/// `CeltEncoder::encode_frame`'s internal bit-budget arithmetic
+/// (`compute_allocation_encode`'s input, `quant_all_bands_encode`'s
+/// `total_bits_q`, `quant_energy_finalise`'s target) is all computed from
+/// the *requested* `bytes_per_frame` parameter. But `RangeEncoder::tell()`/
+/// `tell_frac()` are estimates (`ec_tell`), not exact predictions of
+/// `done()`'s real serialized byte count — a real encode can legitimately
+/// allocate right up to its nominal budget by the estimate, then have
+/// `done()`'s actual output land a byte or two *larger* than
+/// `bytes_per_frame`. Unlike undershoot (which the CBR-padding logic
+/// already handles correctly by padding with raw bits before the suffix),
+/// overshoot can't be patched after the fact — the extra bits are already
+/// committed to the range coder — and it desyncs `CeltDecoder`/
+/// `OpusDecoder`, which always derive their own bit budget from the
+/// packet's *actual* observed byte length (`data_len`), never from the
+/// encoder's original CBR target. The result isn't a decode error (Opus's
+/// packet framing has no CRC): it's silently corrupted audio.
+///
+/// This is *not* a narrow edge case: a sweep of 15+ CBR byte budgets from
+/// 100 to 400 bytes/frame (mono and stereo, 48 kHz, `LM = 3`) found that
+/// only the two exact values every pre-existing test in this crate happens
+/// to use (160 bytes/frame mono, 320 stereo) avoid the bug — nearly every
+/// other budget tested overshoots and corrupts its own decode. A na\u{27}ive
+/// fix (subtracting a fixed headroom from `compute_allocation_encode`'s
+/// budget alone) was tried and made things *worse* — it only touches one
+/// of at least three separate places that independently derive a Q3 bit
+/// budget from `bytes_per_frame` (allocation, `quant_all_bands_encode`,
+/// `quant_energy_finalise`), so patching one in isolation just introduces
+/// a *new* internal inconsistency (confirmed via `coded_bands` itself
+/// differing between what the encoder decided and what the decoder
+/// recovers). A real fix needs either a genuine hard output-size cap in
+/// `RangeEncoder` itself (mirroring libopus's `ec_enc_shrink`, which
+/// constrains storage *during* entropy coding rather than estimating
+/// after the fact) or a retry-with-smaller-budget loop — both bigger than
+/// a one-line patch, which is why this is `#[ignore]`d rather than fixed
+/// here.
+///
+/// This test pins the exact reproduction so a future session can verify
+/// its fix against it: mono, `bytes_per_frame = 240` (a bitrate no
+/// existing test exercised), a steady 440 Hz tone. Un-`#[ignore]` once
+/// fixed.
+#[test]
+#[ignore = "known unfixed CBR-overshoot bug — see doc comment and todo.md"]
+fn celt_encoder_cbr_budget_other_than_the_two_tested_values_currently_corrupts_decode() {
+    use tpt_av_cadence_opus::celt::decoder::CeltDecoder;
+    let mut enc = tpt_av_cadence_opus::celt::encoder::CeltEncoder::new(1, 3);
+    let mut dec = CeltDecoder::new(1, 48_000).unwrap();
+    let bytes_per_frame = 240; // deliberately not 160 (the only value every other test uses)
+    let freq_hz = 440.0f32;
+    let sample_rate = 48_000.0f32;
+    let mut phase = 0.0f32;
+    let mut original = Vec::new();
+    let mut decoded = Vec::new();
+    for _ in 0..8 {
+        let mut pcm_in = [0.0f32; 960];
+        for s in pcm_in.iter_mut() {
+            *s = 0.5 * phase.sin();
+            phase += 2.0 * std::f32::consts::PI * freq_hz / sample_rate;
+        }
+        original.extend_from_slice(&pcm_in);
+        let packet_bytes = enc.encode_frame(&pcm_in, bytes_per_frame);
+        assert_eq!(
+            packet_bytes.len() - 1,
+            bytes_per_frame,
+            "packet overshot its CBR target (this is the bug this test pins)"
+        );
+        let mut pcm_out = vec![0.0f32; 960];
+        let n = dec
+            .decode(Some(&packet_bytes[1..]), 960, &mut pcm_out)
+            .unwrap();
+        decoded.extend_from_slice(&pcm_out[..n]);
+    }
+    const CODEC_DELAY: i32 = 98; // matches encoder.rs's own measured pipeline delay
+    let skip = 960 * 2;
+    let sig_pow: f64 = original[skip..]
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum();
+    let err_pow: f64 = original[skip..]
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            let di = skip as i32 + i as i32 - CODEC_DELAY;
+            let b = if di >= 0 && (di as usize) < decoded.len() {
+                decoded[di as usize]
+            } else {
+                0.0
+            };
+            let d = a as f64 - b as f64;
+            d * d
+        })
+        .sum();
+    let snr_db = 10.0 * (sig_pow / err_pow.max(1e-12)).log10();
+    assert!(
+        snr_db > 12.0,
+        "snr={snr_db:.1} dB too low (the CBR-overshoot desync bug)"
     );
 }

@@ -286,6 +286,84 @@ pub fn page_crc(data: &[u8]) -> u32 {
     crc
 }
 
+/// Writes single-page Ogg pages (RFC 3533 §6) for one logical stream.
+///
+/// Codec-agnostic, mirroring [`PageReader`]'s split: packet/header
+/// semantics (OpusHead, Vorbis identification headers, granule-position
+/// units) belong to the codec crates.
+///
+/// Scoped to **one packet per page** — not bit-optimal (each page pays a
+/// fixed 27+ byte header/segment-table overhead instead of amortizing it
+/// across several packets), but always spec-legal, and far simpler than
+/// packet-coalescing logic. A packet must be `<= 65025` bytes (the
+/// `nsegs <= 255` single-page limit — `255 * 255`); this comfortably covers
+/// every packet a `tpt-cadence` encoder currently produces (Opus packets
+/// are bounded by RFC 6716 well under 4 KiB; Vorbis/Opus header packets are
+/// a few dozen bytes), so multi-page packet continuation isn't implemented.
+pub struct OggPageWriter {
+    serial: u32,
+    sequence: u32,
+    crc_table: Box<[u32; 256]>,
+}
+
+impl OggPageWriter {
+    /// `serial` identifies this logical stream; the caller picks it (e.g. a
+    /// fixed constant for a single-stream file, or a counter/hash when
+    /// multiplexing more than one logical stream into shared pages is ever
+    /// needed — not supported by this writer today).
+    pub fn new(serial: u32) -> Self {
+        OggPageWriter {
+            serial,
+            sequence: 0,
+            crc_table: Box::new(build_crc_table()),
+        }
+    }
+
+    /// Writes `packet` as a single Ogg page and returns the complete page
+    /// bytes (header + segment table + body), ready to append to a byte
+    /// sink. `granule` is the page's granule position in the codec's own
+    /// units (e.g. cumulative 48 kHz samples for Opus); `bos`/`eos` set the
+    /// beginning-of-stream/end-of-stream flags.
+    ///
+    /// Panics if `packet.len() > 65025` (see the module doc comment).
+    pub fn write_page(&mut self, packet: &[u8], granule: i64, bos: bool, eos: bool) -> Vec<u8> {
+        assert!(
+            packet.len() <= 255 * 255,
+            "OggPageWriter only supports single-page packets (<= 65025 bytes), got {}",
+            packet.len()
+        );
+        let nsegs_full = packet.len() / 255;
+        let last_seg = (packet.len() % 255) as u8;
+        let mut seg_table = Vec::with_capacity(nsegs_full + 1);
+        seg_table.resize(nsegs_full, 255u8);
+        seg_table.push(last_seg);
+
+        let mut header = [0u8; 27];
+        header[0..4].copy_from_slice(b"OggS");
+        header[4] = 0; // version
+        header[5] = (u8::from(bos) << 1) | (u8::from(eos) << 2);
+        header[6..14].copy_from_slice(&granule.to_le_bytes());
+        header[14..18].copy_from_slice(&self.serial.to_le_bytes());
+        header[18..22].copy_from_slice(&self.sequence.to_le_bytes());
+        // header[22..26] (CRC) stays zero for the CRC computation below.
+        header[26] = seg_table.len() as u8;
+
+        let mut page = Vec::with_capacity(27 + seg_table.len() + packet.len());
+        page.extend_from_slice(&header);
+        page.extend_from_slice(&seg_table);
+        page.extend_from_slice(packet);
+
+        let mut crc = 0u32;
+        for &b in &page {
+            crc = (crc << 8) ^ self.crc_table[(((crc >> 24) as u8) ^ b) as usize];
+        }
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+        self.sequence += 1;
+        page
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +416,40 @@ mod tests {
         assert!(meta.eos_page);
         let (len, _) = reader.next_packet(&mut out).unwrap().unwrap();
         assert_eq!(len, 3);
+        assert!(reader.next_packet(&mut out).unwrap().is_none());
+    }
+
+    /// `OggPageWriter`'s own output round-trips through `PageReader`:
+    /// three packets (a tiny header packet, a packet that's an exact
+    /// multiple of 255 bytes — the lacing edge case that needs a
+    /// zero-length terminating segment — and a >255-byte packet needing
+    /// two lacing segments), each on its own page, first/last flagged
+    /// BOS/EOS.
+    #[test]
+    fn page_writer_output_round_trips_through_page_reader() {
+        let packets: [Vec<u8>; 3] = [
+            b"OpusHead-ish tiny packet".to_vec(),
+            vec![0xABu8; 255], // exact multiple of the lacing unit
+            (0..300u32).map(|i| i as u8).collect(),
+        ];
+        let mut writer = OggPageWriter::new(0x1234_5678);
+        let mut stream = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            let page =
+                writer.write_page(packet, (i as i64 + 1) * 960, i == 0, i == packets.len() - 1);
+            stream.extend_from_slice(&page);
+        }
+
+        let source = Box::new(std::io::Cursor::new(stream));
+        let mut reader = PageReader::new(BufferedSource::new(source, 4096), 4096);
+        let mut out = vec![0u8; 4096];
+        for (i, packet) in packets.iter().enumerate() {
+            let (len, meta) = reader.next_packet(&mut out).unwrap().unwrap();
+            assert_eq!(&out[..len], packet.as_slice(), "packet {i} content");
+            assert_eq!(meta.granule, (i as i64 + 1) * 960, "packet {i} granule");
+            assert_eq!(meta.bos_page, i == 0, "packet {i} bos");
+            assert_eq!(meta.eos_page, i == packets.len() - 1, "packet {i} eos");
+        }
         assert!(reader.next_packet(&mut out).unwrap().is_none());
     }
 }

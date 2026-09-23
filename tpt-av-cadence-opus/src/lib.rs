@@ -42,6 +42,7 @@ pub mod celt;
 pub(crate) mod debug;
 pub mod decoder;
 pub mod ogg_opus;
+pub mod ogg_opus_encoder;
 pub mod packet;
 pub mod range;
 pub mod silk;
@@ -51,6 +52,7 @@ pub use decoder::{
     OUTPUT_CHANNELS,
 };
 pub use ogg_opus::{OggOpusDecoder, OggOpusReader, OpusHead};
+pub use ogg_opus_encoder::OggOpusEncoder;
 pub use packet::{Bandwidth, FrameDuration, Mode, Packet, Toc};
 pub use range::{RangeDecoder, RangeEncoder};
 

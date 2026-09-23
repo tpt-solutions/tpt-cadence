@@ -142,6 +142,22 @@ impl OpusHead {
         }
         Ok(head)
     }
+
+    /// Serializes the 19-byte family-0 (mono/stereo, trivial mapping)
+    /// identification header block — the exact bijective inverse of
+    /// [`OpusHead::parse`] for the subset this crate's encoder produces
+    /// (`mapping_family == 0`, so no channel mapping table follows).
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(19);
+        out.extend_from_slice(b"OpusHead");
+        out.push(self.version);
+        out.push(self.channels as u8);
+        out.extend_from_slice(&self.pre_skip.to_le_bytes());
+        out.extend_from_slice(&self.input_sample_rate.to_le_bytes());
+        out.extend_from_slice(&self.output_gain_q8.to_le_bytes());
+        out.push(self.mapping_family);
+        out
+    }
 }
 
 /// Ogg Opus decoder: pulls packets from the container, decodes them with
