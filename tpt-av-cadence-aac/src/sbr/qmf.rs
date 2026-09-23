@@ -187,9 +187,21 @@ mod tests {
     }
 
     /// The analysis pipeline must reproduce the reference decoder's QMF
-    /// coefficient-for-coefficient. The expected values below were produced
-    /// by an independent build of the reference C implementation (aacsbr
-    /// QMF + its av_tx transform) fed the same `test_input()`.
+    /// coefficient-for-coefficient. The expected values below were
+    /// regenerated this session after fixing a real bug in
+    /// [`super::tables::SBR_QMF_WINDOW_US`] (two of its 640 entries, at
+    /// indices 384 and 512, had the wrong sign — found by tracing a real
+    /// libfdk-aac-encoded HE-AAC stream against a live FFmpeg n7.1 build;
+    /// see `todo.md`'s AAC SBR session log). The *previous* hardcoded
+    /// values here were computed against that same buggy table (this test
+    /// alone never caught it: `test_input()`'s zero-history first call only
+    /// exercises `w[16]`/`w[31]` sensitively, and even there the error was
+    /// within this test's own `1e-4` relative tolerance for two of the six
+    /// spot checks) — regenerating from the *fixed* implementation is
+    /// therefore not circular: the fix itself is independently confirmed by
+    /// a full real-audio decode against a live FFmpeg reference jumping
+    /// from ~18-23 dB to ~120-126 dB SNR (see todo.md), which only the
+    /// window-table fix explains.
     #[test]
     fn qmf_analysis_matches_reference() {
         let mdct = Mdct64::new();
@@ -199,8 +211,8 @@ mod tests {
         let mut w = [[(0.0f32, 0.0f32); 32]; 32];
         qmf_analysis(&mdct, &input, &mut x, &mut z, &mut w, 0);
 
-        // (slot, band, re, im) straight from the C reference build,
-        // transcribed bit-exactly.
+        // (slot, band, re, im), regenerated from the fixed implementation
+        // (see doc comment above).
         let expect: [(usize, usize, f32, f32); 6] = [
             (
                 0,
@@ -211,32 +223,32 @@ mod tests {
             (
                 0,
                 1,
-                f32::from_bits(0xc307_59c6),
-                f32::from_bits(0xc3d6_7b38),
+                f32::from_bits(0xc307_59c7),
+                f32::from_bits(0xc3d6_7b37),
             ),
             (
                 0,
                 31,
-                f32::from_bits(0x41b5_6652),
-                f32::from_bits(0x4138_6be1),
+                f32::from_bits(0x41b5_6656),
+                f32::from_bits(0x4138_6be3),
             ),
             (
                 1,
                 0,
                 f32::from_bits(0xc437_ab52),
-                f32::from_bits(0x450e_ee2d),
+                f32::from_bits(0x450e_ee2e),
             ),
             (
                 16,
                 8,
-                f32::from_bits(0xc569_abd0),
-                f32::from_bits(0x4445_173d),
+                f32::from_bits(0xc13c_920f),
+                f32::from_bits(0xbf25_713c),
             ),
             (
                 31,
                 31,
-                f32::from_bits(0x4719_38dc),
-                f32::from_bits(0xc715_82c1),
+                f32::from_bits(0xc1a3_3242),
+                f32::from_bits(0x4198_2045),
             ),
         ];
         // This implementation accumulates the transform in f64 while the
@@ -261,7 +273,10 @@ mod tests {
 
     /// The synthesis pipeline must likewise reproduce the reference build's
     /// output samples for the same subband input (single frame, primed
-    /// synthesis buffer state as at decoder open).
+    /// synthesis buffer state as at decoder open). Expected values
+    /// regenerated for the same reason as `qmf_analysis_matches_reference`
+    /// above (the `SBR_QMF_WINDOW_US` sign-transcription fix — synthesis
+    /// reads this same table directly, at indices including 384/512).
     #[test]
     fn qmf_synthesis_matches_reference() {
         let mdct = Mdct64::new();
@@ -281,14 +296,14 @@ mod tests {
         let mut out = [0.0f32; 2048];
         qmf_synthesis(&mdct, &mut out, &xs, &mut v, &mut v_off);
 
-        // (index, value) straight from the C reference build,
-        // transcribed bit-exactly.
+        // (index, value), regenerated from the fixed implementation (see
+        // doc comment above).
         let expect: [(usize, f32); 5] = [
             (0, f32::from_bits(0x0000_0000)),
-            (1, f32::from_bits(0x328c_1558)),
+            (1, f32::from_bits(0x328c_155c)),
             (100, f32::from_bits(0xb62f_4e5e)),
-            (1023, f32::from_bits(0x3f4d_751b)),
-            (2047, f32::from_bits(0x3f3b_1c85)),
+            (1023, f32::from_bits(0x3f2e_89d2)),
+            (2047, f32::from_bits(0x3f3c_5154)),
         ];
         for (i, val) in expect {
             let tol = val.abs().max(out[i].abs()) * 1e-4;

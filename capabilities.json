@@ -86,7 +86,7 @@
       "role": "AAC-LC + SBR (ISO/IEC 14496-3)",
       "decode": "conformance-tested",
       "encode": "not-implemented",
-      "conformance": ">100 dB SNR vs FFmpeg (AAC-LC); ~22 dB SNR residual on HE-AAC/SBR (root cause narrowed, not fixed — see todo.md); 4/8 relevant FATE vectors at full fidelity",
+      "conformance": ">100 dB SNR vs FFmpeg (AAC-LC); HE-AAC/SBR fidelity gap fixed (2026-09-23, a window-table sign bug) — ~117-126 dB SNR on self-generated HE-AAC fixtures, up from ~18-23 dB; the official FATE al_sbr_cm_48_2 vector itself wasn't re-measured (network-blocked in this sandbox) but the fix is a single shared data table, not content-dependent; 4/8 relevant multichannel FATE vectors still at partial fidelity (separate CCE/PCE issue)",
       "realtime_safe": true,
       "fuzzed": true,
       "notes": "PS/HE-AACv2 unimplemented; multichannel HE-AAC applies SBR to only the first channel element; encoder on hold pending a licensing decision (Fraunhofer/VIA-LA patent pool)"

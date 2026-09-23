@@ -552,6 +552,42 @@ fn he_aac_sbr_stream_with_frame_end_aligned_fil_element_decodes_without_error() 
     );
 }
 
+/// Regression for a real data bug: two of `SBR_QMF_WINDOW_US`'s 640 entries
+/// (indices 384 and 512) had the wrong sign, found the same session as the
+/// `set_pos` fix above by tracing this exact fixture's QMF analysis output
+/// against a live FFmpeg n7.1 build frame-by-frame. This single wrong sign
+/// pair was the entire root cause of the ~18-23 dB HE-AAC/SBR fidelity gap
+/// this project's history documents at length across multiple prior
+/// sessions (every DSP/control-flow *formula* had already been audited and
+/// cleared — a wrong constant is invisible to a code-reading audit). Fixing
+/// it raised this exact fixture's SNR against FFmpeg's decode from ~22.6 dB
+/// to ~120 dB. Gated well below the measured value (not at it) so ordinary
+/// float-environment variance across platforms/compilers can't make this
+/// flaky, while still being utterly incompatible with the pre-fix ~20 dB
+/// collapse ever regressing silently.
+#[test]
+fn he_aac_sbr_fidelity_matches_reference_at_high_snr() {
+    let aac_path = data_dir().join("sbr_fidelity_tone.aac");
+    let ref_path = data_dir().join("sbr_fidelity_tone_ref.f32");
+    let (_decoder, pcm) = decode_all(&aac_path);
+    let ref_bytes = std::fs::read(&ref_path).unwrap();
+    let reference: Vec<f32> = ref_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(pcm.len(), reference.len(), "length");
+    let mut signal = 0.0f64;
+    let mut error = 0.0f64;
+    for (&a, &e) in pcm.iter().zip(&reference) {
+        let d = f64::from(a) - f64::from(e);
+        error += d * d;
+        signal += f64::from(e).powi(2);
+    }
+    let snr = 10.0 * (signal / error).log10();
+    eprintln!("sbr_fidelity_tone: SNR={snr:.2} dB");
+    assert!(snr > 80.0, "HE-AAC SBR fidelity regressed: {snr:.2} dB");
+}
+
 /// Deterministic 1 s WAV with a distinct tone per channel (300 Hz in 200 Hz
 /// steps), so multichannel channel-order permutations are detectable.
 fn write_tone_wav(path: &Path, rate: u32, channels: u16) {

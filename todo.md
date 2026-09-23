@@ -283,7 +283,7 @@ direct-summation kernel with a real radix FFT matching `av_tx`'s
 algorithm (not just flipping the accumulator to `f32`), since operation
 *order* is what needs to match, not just precision.
 
-### Session update (2026-09-23): real FFmpeg oracle finally built; one real bug found and fixed; the MDCT-precision hypothesis above is now evidence-contradicted, not just unconfirmed
+### Session update (2026-09-23): real FFmpeg oracle finally built; ROOT CAUSE FOUND AND FIXED — the ~22 dB HE-AAC/SBR fidelity gap is resolved
 
 This session ran in a Linux cloud container rather than the Windows machine
 prior sessions used, which changes the "next forensic step" above in one
@@ -386,6 +386,92 @@ reference coefficients). Also worth root-causing on its own: the 2-call
 trace-alignment offset noted above, since an unexplained off-by-one in
 when SBR data starts applying is itself a plausible root cause worth
 ruling in or out before looking further upstream.
+
+**Continuation, same session — the next step above was followed through to a
+confirmed root cause.** Diffed the core AAC-LC time-domain samples
+(post-IMDCT, pre-QMF-analysis) for the aligned frame pair (matching
+instrumentation pattern, both sides, reverted after use): they matched
+almost exactly (~1e-7 relative, pure float rounding) — ruling out core
+spectral decode entirely, contrary to one of the two hypotheses above.
+Continued downstream: the QMF analysis TRANSFORM's raw multiply-accumulate
+terms (`z[j] = window_ds[j] * x[...]` for the specific `j` values feeding
+`sum64x5`'s output index 0) matched for `j = 0, 64, 128` but **diverged
+exactly at `j = 192` and `j = 256`**, with the divergence traced to the
+*window coefficients themselves*: `window_ds[192]`/`window_ds[256]`
+(derived in this crate as `SBR_QMF_WINDOW_US[2*192]`/`SBR_QMF_WINDOW_US[2*256]`
+= `SBR_QMF_WINDOW_US[384]`/`SBR_QMF_WINDOW_US[512]`) had the **wrong sign**
+— confirmed against both the real FFmpeg n7.1 *source* (`aacsbrdata.h`) and
+a live *runtime* dump from the running reference decoder (both agree:
+`sbr_qmf_window_us[384] == -0.361158997`, `[512] == -0.0132718217`), while
+this crate's `SBR_QMF_WINDOW_US` table had `+0.361159`/`+0.013271822` at
+those two positions. A full 640-entry diff against the runtime-dumped
+reference table found **exactly these two wrong entries and no others**.
+
+**Why this survived a prior session's "coefficient-for-coefficient" table
+audit** (see the historical record earlier in this AAC section): the
+reference window has a genuine hard sign *discontinuity* at index 384
+(`us[383] = +0.3723795546` next to `us[384] = -0.3611589903` — a real jump,
+not a smooth zero-crossing). With the wrong sign, this crate's table reads
+`..., +0.406, +0.395, +0.384, +0.372, +0.361159, -0.350, -0.339, ...` around
+that point — a *smooth, plausible-looking* curve with no visible discontinuity
+to catch on inspection. A prior session's spot-check evidently sampled
+indices where the sign happens to agree (this crate's own regression test
+below pins the actual index-384/512 values now, specifically because they're
+exactly where a coarser sample grid would miss a two-entry error). This is
+the textbook shape of a hard-to-catch bug: not a wrong *formula* (which a
+line-by-line code audit — the method used repeatedly and exhaustively across
+this project's whole SBR history — can in principle always eventually spot),
+but a wrong *piece of data*, which reads identically to correct data unless
+you specifically compare it, value by value, against a known-correct source.
+
+**Fix**: two literals corrected in
+`tpt-av-cadence-aac/src/sbr/tables.rs`'s `SBR_QMF_WINDOW_US` (indices 384
+and 512, sign flipped to match the verified-correct reference values).
+`SBR_QMF_WINDOW_US` is read directly by both `qmf_analysis` (via the
+`window_ds[j] = SBR_QMF_WINDOW_US[2*j]` decimation) and `qmf_synthesis`
+(directly, at several `w_off + j` offsets that also include 384/512) — the
+one fix corrects both directions.
+
+**Result — measured, not estimated**: this crate's own self-generated
+HE-AAC fixtures (necessary since the FATE sample is still unobtainable in
+this sandbox — see above) jumped from **~18-23 dB to ~117-126 dB** SNR
+against a live FFmpeg n7.1 decode: the noise fixture from the `set_pos` bug
+above went from 17.7 dB to 125.9 dB; the two-tone stereo fixture from 22.6
+dB to 119.8 dB; a fresh short tone fixture (now bundled, see
+`tests/data/README.md`) hits 116.9 dB and is gated in CI at >80 dB via the
+new `he_aac_sbr_fidelity_matches_reference_at_high_snr` test. This is not
+an incremental improvement on the documented gap — it's a full resolution:
+120 dB is deep into ordinary float-implementation-difference territory (the
+same ~1e-5-relative class of gap this project's *other* SNR-gated
+conformance tests already accept as normal float-vs-float noise), not a
+lingering bug.
+
+The two existing `qmf::tests::qmf_analysis_matches_reference` /
+`qmf_synthesis_matches_reference` unit tests had hardcoded "expected"
+literals that were themselves computed against the *buggy* table (their own
+`test_input()`'s first-call, zero-history case only stresses this bug
+mildly — two of the six original spot checks were coincidentally still
+within the test's `1e-4` tolerance) — regenerated from the now-fixed
+implementation, with the fix's correctness established independently via
+the real-decode SNR jump above, not circularly via these two tests. Added a
+new `tables.rs` unit test pinning the exact correct values at the
+384/512 sign discontinuity (and its immediate neighbors) as a direct
+regression guard on the table itself, plus a real-audio SNR-gated
+integration test (`he_aac_sbr_fidelity_matches_reference_at_high_snr`).
+
+**Verified**: full `cargo test -p tpt-av-cadence-aac --release` and `cargo
+test --workspace --release` green (29 AAC-crate tests, up from 27); clippy/
+fmt clean throughout.
+
+**What's still open**: this fix was validated against this crate's own
+generated fixtures, not the specific `al_sbr_cm_48_2` FATE sample (still
+network-blocked in this sandbox) or the 5.1/full-rate FATE samples/PS
+(HE-AACv2)/multichannel gaps tracked separately below — but since the root
+cause is a single shared data table read by every SBR analysis/synthesis
+call regardless of channel count or content, there's no structural reason
+to expect those to behave differently. Confirming that (and re-measuring
+the FATE sample's exact SNR) is a quick follow-up for whoever next has
+network access to `fate-suite.ffmpeg.org`, not a new investigation.
 
 Other remaining gaps (hardening, not blockers): the four multichannel
 FATE items' residual (al06/al07/al15/al22, 2-53 dB): frame-level
@@ -1515,7 +1601,7 @@ scaffolding, redundant with the crate's real tests — deleted rather than patch
 Full review notes: `C:\Users\phill\.claude\plans\review-platform-for-bugs-compiled-ullman.md`. Tracked here so items don't get lost back into prose.
 
 ### Known open correctness gaps (carried over from earlier sections, re-flagged for visibility)
-- [ ] AAC SBR fidelity gap: ~22 dB SNR residual vs reference (re-measured this session: 21.86 dB on `al_sbr_cm_48_2`; 17.7 dB on a self-generated HE-AAC noise fixture, same ballpark). See "Session update (2026-09-23): real FFmpeg oracle finally built..." above: this session finally got a byte-exact oracle trace (previously blocked on the Windows/MSYS2 build lift; trivial in this Linux sandbox) and found the leading hypothesis from the prior session (64-point synthesis MDCT precision inside `hf_inverse_filter`) is evidence-contradicted — the actual divergence is upstream of `hf_inverse_filter` entirely, specifically in the *current* frame's QMF-analyzed samples (`x_low[k][8..40]`, populated from `w_cur`) versus the *previous* frame's (`x_low[k][0..8]`, from `w_prev`, which matches almost exactly). Next step: diff core AAC-LC time-domain samples (pre-QMF-analysis) to localize further. **Found and fixed a real, unrelated bug while chasing this**: a `BitReader::set_pos` stale-`overread`-flag bug that hard-failed decode of any HE-AAC stream whose SBR extension payload capture rounded up to touch the frame buffer's true end (noise-like content triggers this far more than tones) — see `tpt-av-cadence-aac/src/bitreader.rs` and the new regression test/fixture.
+- [x] AAC SBR fidelity gap — **ROOT CAUSE FOUND AND FIXED (2026-09-23)**: two of `SBR_QMF_WINDOW_US`'s 640 entries (indices 384, 512) had the wrong sign — a plain data-transcription error, not a formula bug, which is why it survived a prior session's line-by-line code audit. Found by building a real FFmpeg n7.1 oracle from source (trivial in this Linux sandbox vs. the Windows/MSYS2 lift prior sessions faced) and tracing a real libfdk-aac-encoded HE-AAC stream's QMF analysis output frame-by-frame. Fixed both entries; real-audio SNR against a live FFmpeg decode jumped from ~18-23 dB to ~117-126 dB across every self-generated fixture tested (the official FATE `al_sbr_cm_48_2` sample itself remains unobtainable in this sandbox's network policy, so it wasn't re-measured directly, but the fix is a single shared data table with no content-dependent branching). See "Session update (2026-09-23): real FFmpeg oracle finally built; ROOT CAUSE FOUND AND FIXED" above for the full trace/diagnosis and the new regression tests (`tables.rs`'s sign-discontinuity pin, `qmf.rs`'s regenerated expected values, `conformance.rs`'s SNR-gated `he_aac_sbr_fidelity_matches_reference_at_high_snr`). Also found and fixed a real, separate bug while chasing this: a `BitReader::set_pos` stale-`overread`-flag bug that hard-failed decode of any HE-AAC stream whose SBR extension payload capture rounded up to touch the frame buffer's true end — see `tpt-av-cadence-aac/src/bitreader.rs` and its own regression test/fixture.
 - [ ] PS / HE-AACv2 unimplemented (PS payload parsed but skipped; decodes as mono)
 - [ ] Multichannel HE-AAC (5.1/7.1): only the first channel element's SBR payload is applied (one SBR context instead of one per channel element)
 - [ ] AAC multichannel CCE/PCE fidelity: 4 FATE vectors (al06/al07/al15/al22) at 2-53 dB, coupling/PCE interaction bugs not root-caused

@@ -399,7 +399,7 @@ pub const SBR_QMF_WINDOW_US: [f32; 640] = [
     0.3949211761,
     0.3836350013,
     0.3723795546,
-    0.3611589903,
+    -0.3611589903,
     -0.3499914122,
     -0.3388722693,
     -0.3278113727,
@@ -527,7 +527,7 @@ pub const SBR_QMF_WINDOW_US: [f32; 640] = [
     0.0167324712,
     0.0155405553,
     0.0143904666,
-    0.013271822,
+    -0.013271822,
     -0.0121849995,
     -0.0111315548,
     -0.0101150215,
@@ -1341,3 +1341,37 @@ pub const SBR_NOISE_TABLE: [[f32; 2]; 512] = [
     [-0.94705089665984, -0.29580042814306],
     [0.91599807087376, -0.98147830385781],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::SBR_QMF_WINDOW_US;
+
+    /// Regression for a real transcription bug found this session: indices
+    /// 384 and 512 of this 640-entry table had the wrong sign (positive
+    /// instead of negative), found by tracing a real libfdk-aac-encoded
+    /// HE-AAC stream against a live FFmpeg n7.1 build and comparing QMF
+    /// analysis output frame-by-frame (see `todo.md`'s AAC SBR session
+    /// log). The table has a hard sign discontinuity exactly at index 384
+    /// (`us[383]` and `us[384]` have opposite sign despite similar
+    /// magnitude, per the real reference: 0.3723795546 then -0.3611589903)
+    /// — a single flipped sign there produces a *smooth-looking* (and so
+    /// easy to miss on visual inspection) but wrong curve, which is
+    /// probably how this survived: `us[384]=+0.36` sits plausibly between
+    /// its neighbors `us[380]=+0.41` and `us[390]=-0.30` if you don't know
+    /// the reference has a sharp jump right there. This one wrong table
+    /// entry alone caused the ~18-23 dB HE-AAC/SBR fidelity gap documented
+    /// at length elsewhere in this project's history; fixing it raised
+    /// real-audio decode SNR against a live FFmpeg reference to ~120-126 dB
+    /// (see todo.md — every other DSP stage had already been individually
+    /// audited and cleared in prior sessions, since a wrong *data* value
+    /// looks identical to no bug at all when you're reading the *code*).
+    #[test]
+    fn window_us_matches_reference_at_the_sign_discontinuity() {
+        assert_eq!(SBR_QMF_WINDOW_US[383], 0.3723795546);
+        assert_eq!(SBR_QMF_WINDOW_US[384], -0.3611589903);
+        assert_eq!(SBR_QMF_WINDOW_US[385], -0.3499914122);
+        assert_eq!(SBR_QMF_WINDOW_US[511], 0.0143904666);
+        assert_eq!(SBR_QMF_WINDOW_US[512], -0.013271822);
+        assert_eq!(SBR_QMF_WINDOW_US[513], -0.0121849995);
+    }
+}
