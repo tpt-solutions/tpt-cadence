@@ -718,9 +718,9 @@ impl Sbr {
                 if e as i8 != e_a[0] && e as i8 != e_a[1] {
                     let (phi0, mut phi1) = match indexsine {
                         0 => (1.0f32, 0.0f32),
-                        1 => (0.0, (1 - 2 * (kx & 1)) as f32),
+                        1 => (0.0, (1i32 - 2 * (kx as i32 & 1)) as f32),
                         2 => (-1.0, 0.0),
-                        _ => (0.0, -((1 - 2 * (kx & 1)) as f32)),
+                        _ => (0.0, -((1i32 - 2 * (kx as i32 & 1)) as f32)),
                     };
                     let mut noise = indexnoise;
                     for m in 0..m_max {

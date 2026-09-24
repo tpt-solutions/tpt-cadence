@@ -9,7 +9,7 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 
 ### Added
 - Opus CELT encoder foundation: forward MDCT wired into a working
-  `CeltEncoder` (mono or stereo, fullband, CBR, 20 ms frames only) with a
+  `CeltEncoder` (mono or stereo, fullband, CBR, all four CELT frame sizes) with a
   passing encode-then-decode round trip, now including real transient
   detection, short-block MDCT/TF-resolution encoding, an anti-collapse
   decision (verified to measurably reduce pre-echo on transient content vs.
@@ -36,13 +36,17 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   currently poor pending a documented analysis-filter fix (see `todo.md`).
 
 ### Known limitations (tracked in `todo.md`)
-- AAC SBR (HE-AAC) has a ~22 dB SNR residual vs. the FFmpeg reference on an
-  otherwise-correct decode path; root cause not fully characterized.
 - PS / HE-AACv2 is parsed but not applied (decodes as mono).
-- Multichannel HE-AAC (5.1/7.1) applies only one SBR context instead of one
-  per channel element.
 - Four AAC FATE multichannel conformance items (CCE/PCE coupling) decode at
   reduced fidelity (2-53 dB) pending a coupling/PCE-interaction root cause.
+  The previous stereo and 5.1/7.1 SBR context bugs are fixed; HE-AAC/SBR
+  self-generated fixtures now reach roughly 117–133 dB SNR against FFmpeg.
+- The CELT-only Ogg Opus encoder's CBR storage/allocation mismatch is fixed:
+  range-coded output now uses libopus-style fixed-size storage, including
+  correct final carry flushing and partial raw-bit placement. Mono and stereo
+  frames remain exactly on budget across multiple rates, preventing the
+  decoder-side PVQ reallocation that previously caused silent corruption.
+  Hybrid SILK/CELT encoding and psychoacoustic tuning remain out of scope.
 - Broader official ISO/IEC AAC and MP3 conformance vector suites are not
   obtainable/integrated; AAC and MP3 correctness currently rest on FFmpeg-
   reference comparison rather than official test vectors.

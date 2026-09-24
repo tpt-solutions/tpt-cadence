@@ -13,15 +13,12 @@
 //!   comment for the full accounting: transient/TF handling and dual-stereo
 //!   independent per-channel coding are supported; SILK/hybrid encoding,
 //!   VBR, and M/S or intensity stereo coupling are not).
-//! - **`pre_skip = 0`**: this crate's own `CeltEncoder` doesn't currently
-//!   report or compensate for its ~120-sample MDCT-overlap algorithmic
-//!   delay at the container level, and this crate's own `OggOpusDecoder`
-//!   doesn't apply any matching skip either — so round-tripping a stream
-//!   produced by this encoder through this crate's own decoder stays
-//!   internally consistent (no silent samples dropped on either side), even
-//!   though a strict RFC 7845 player would ideally see a few milliseconds
-//!   of algorithmic delay signaled here. A real next step if gapless
-//!   round-tripping against *other* Opus tools ever matters.
+//! - **RFC 7845 pre-skip = 120 samples**: this encoder's CELT analysis/
+//!   synthesis path has one 120-sample MDCT overlap of algorithmic delay.
+//!   Audio-page granules include that delay, and the final granule is
+//!   `input_samples + PRE_SKIP`, so pre-skip removal recovers exactly the
+//!   original sample count for both this crate's decoder and external Opus
+//!   players.
 //! - **One packet per Ogg page** (`OggPageWriter`'s own scope) — not
 //!   bit-optimal (a fixed ~27+ byte page overhead per 20 ms packet, plus
 //!   segment-table bytes) but always spec-legal.
@@ -41,6 +38,9 @@ const SAMPLE_RATE: u32 = 48_000;
 /// `CeltEncoder`'s documented `N2 = SHORT_MDCT_SIZE << lm` convention.
 const LM: usize = 3;
 const FRAME_LEN: usize = 120 << LM; // 960 samples/channel
+/// CELT MDCT-overlap algorithmic delay at the 48 kHz Opus output rate.
+/// Audio granules include this offset and RFC 7845 pre-skip removes it.
+const PRE_SKIP: u16 = 120;
 
 /// A fixed, non-randomized Ogg logical-stream serial number. Fine for this
 /// encoder's single-stream-per-file scope (no multiplexing); a real
@@ -107,7 +107,7 @@ impl<W: Write> OggOpusEncoder<W> {
         let head = OpusHead {
             version: 1,
             channels,
-            pre_skip: 0,
+            pre_skip: PRE_SKIP,
             input_sample_rate: sample_rate,
             output_gain_q8: 0,
             mapping_family: 0,
@@ -156,7 +156,7 @@ impl<W: Write> OggOpusEncoder<W> {
             self.sink.write_all(&page)?;
         }
         self.buffered_packet = Some(packet);
-        self.buffered_granule = self.emitted_samples;
+        self.buffered_granule = self.emitted_samples + i64::from(PRE_SKIP);
         Ok(())
     }
 }
@@ -195,6 +195,15 @@ impl<W: Write + Send> Encoder for OggOpusEncoder<W> {
             self.pending.resize(n, 0.0);
             self.emit_frame()?;
         }
+        // The codec's PRE_SKIP samples of algorithmic delay require real
+        // decoded frames after the input endpoint. Flush zero-padded CELT
+        // frames until enough untrimmed output exists for the final granule
+        // (`total_samples + PRE_SKIP`) to survive pre-skip removal intact.
+        let required_decoded = self.total_samples + i64::from(PRE_SKIP);
+        while self.emitted_samples < required_decoded {
+            self.pending.resize(n, 0.0);
+            self.emit_frame()?;
+        }
         if let Some(last) = self.buffered_packet.take() {
             // The true final page's granule is always the exact input
             // sample count, trimming any zero-pad tail added above.
@@ -203,9 +212,10 @@ impl<W: Write + Send> Encoder for OggOpusEncoder<W> {
             // interprets a *second* BOS page on the same serial as the
             // start of a new chained link and immediately ends the
             // current one without yielding this page's packet at all.
+            let final_granule = self.total_samples + i64::from(PRE_SKIP);
             let page = self
                 .page_writer
-                .write_page(&last, self.total_samples, false, true);
+                .write_page(&last, final_granule, false, true);
             self.sink.write_all(&page)?;
         }
         self.sink.flush()?;
@@ -224,10 +234,16 @@ impl<W: Write> Drop for OggOpusEncoder<W> {
                 self.pending.resize(n, 0.0);
                 let _ = self.emit_frame();
             }
+            let required_decoded = self.total_samples + i64::from(PRE_SKIP);
+            while self.emitted_samples < required_decoded {
+                self.pending.resize(n, 0.0);
+                let _ = self.emit_frame();
+            }
             if let Some(last) = self.buffered_packet.take() {
+                let final_granule = self.total_samples + i64::from(PRE_SKIP);
                 let page = self
                     .page_writer
-                    .write_page(&last, self.total_samples, false, true);
+                    .write_page(&last, final_granule, false, true);
                 let _ = self.sink.write_all(&page);
             }
             let _ = self.sink.flush();

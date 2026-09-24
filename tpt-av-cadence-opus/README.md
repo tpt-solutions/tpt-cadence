@@ -24,9 +24,15 @@ accumulation order; the `.dec` reference files themselves drift from
 modern libopus at the same scale). `final_range` is the durable
 bit-exactness contract.
 
-Remaining gaps (tracked in [`todo.md`](../todo.md) at the repository
-root): SBR/multichannel mappings are out of scope for this crate, and
-`cargo-fuzz` targets are still pending workspace-wide.
+## Encoder status
+
+A CELT-only `Encoder` and top-level Ogg Opus writer are implemented for
+48 kHz mono/stereo, fullband, CBR, and all four CELT frame sizes. CELT
+entropy output now uses libopus-style fixed-size storage, so every packet
+stays at the requested byte budget and cannot change decoder-side PVQ
+allocation through silent overshoot. This remains foundation work: SILK/hybrid
+encoding, psychoacoustic tuning, and RFC 7845 pre-skip delay compensation are
+still open and tracked in [`todo.md`](../todo.md) at the repository root.
 
 ## License
 

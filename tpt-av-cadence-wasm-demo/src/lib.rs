@@ -28,10 +28,7 @@ pub fn decode_wav_to_f32(bytes: &[u8]) -> Vec<f32> {
     let channels = reader.info().channels as usize;
     let mut out = Vec::new();
     let mut buf = vec![0.0f32; 4096 * channels.max(1)];
-    loop {
-        let Ok(frames) = reader.decoder().decode(&mut buf) else {
-            break;
-        };
+    while let Ok(frames) = reader.decoder().decode(&mut buf) {
         if frames == 0 {
             break;
         }

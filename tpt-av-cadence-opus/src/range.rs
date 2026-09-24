@@ -248,6 +248,18 @@ impl<'a> RangeDecoder<'a> {
 // Encoder
 // ---------------------------------------------------------------------------
 
+/// Error returned when a fixed-size range-encoded frame cannot fit storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeEncoderOverflow;
+
+impl std::fmt::Display for RangeEncoderOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("range-encoded output exceeds fixed storage")
+    }
+}
+
+impl std::error::Error for RangeEncoderOverflow {}
+
 /// Range encoder (RFC 6716 §5.1): state `(val, rng, rem, ext)` initialized
 /// to `(0, 2^31, -1, 0)`.
 ///
@@ -421,12 +433,8 @@ impl RangeEncoder {
         // `l` = number of significant bits in `end` (31 - b trailing
         // zeros), rounded up to a whole number of bytes below. Reference
         // `ec_enc_done` drives this loop by a bit counter, not by `end`
-        // becoming zero: a byte whose bits happen to all be zero (e.g. the
-        // low byte of a 9-significant-bit `end`) still must be emitted,
-        // since the decoder's `tell()`-derived budget already counted it.
-        // Terminating early on `end == 0` silently drops that trailing
-        // zero byte and under-produces relative to every other Opus
-        // decoder/encoder.
+        // becoming zero: a byte whose bits happen to all be zero must still
+        // be emitted.
         let mut l = 31i32 - b as i32;
         while l > 0 {
             self.carry_out((end >> 23) as u32);
@@ -434,14 +442,15 @@ impl RangeEncoder {
             l -= 8;
         }
         if (self.rem != 0 && self.rem != -1) || self.ext > 0 {
-            self.carry_out(0); // flush: 9 zero bits
+            self.carry_out(0);
         }
         if self.rem != -1 {
             self.out.push(self.rem as u8);
         }
 
-        // Flush any partial raw-bit byte, then append raw bits so that
-        // end_bytes[0] lands last in the frame.
+        // Unbounded storage keeps a partial raw byte separate. Fixed-size
+        // encoders use `try_done_sized`, which mirrors libopus and can merge
+        // these bits into an existing storage byte without corruption.
         if self.nend_bits > 0 {
             self.end_bytes.push(self.end_window as u8);
             self.end_window = 0;
@@ -451,6 +460,69 @@ impl RangeEncoder {
             self.out.push(*byte);
         }
         self.out
+    }
+
+    /// Finalizes into exactly `storage` bytes, mirroring libopus's
+    /// `ec_enc_init` + `ec_enc_done` fixed-buffer layout.
+    ///
+    /// Complete raw-bit bytes occupy the physical end of the output. A
+    /// partial raw byte is ORed into the byte immediately before that suffix;
+    /// any remaining gap is zero-filled. Returns [`RangeEncoderOverflow`]
+    /// rather than truncating entropy-coded data when the frame cannot fit.
+    pub fn try_done_sized(mut self, storage: usize) -> Result<Vec<u8>, RangeEncoderOverflow> {
+        let range_end = self.val as u64 + self.rng as u64 - 1;
+        let mut b: u32 = 0;
+        loop {
+            if b >= 31 {
+                break;
+            }
+            let two_b = 1u64 << (b + 1);
+            let e = ((self.val as u64) + two_b - 1) & !(two_b - 1);
+            if e + two_b - 1 <= range_end {
+                b += 1;
+            } else {
+                break;
+            }
+        }
+        let two_b = 1u64 << b;
+        let mut end = ((self.val as u64) + two_b - 1) & !(two_b - 1);
+        let mut l = 31i32 - b as i32;
+        while l > 0 {
+            self.carry_out((end >> 23) as u32);
+            end = (end << 8) & 0x7FFF_FFFF;
+            l -= 8;
+        }
+        if self.rem != -1 || self.ext > 0 {
+            self.carry_out(0);
+        }
+
+        let complete_raw = self.end_bytes.len();
+        let partial_raw = self.nend_bits;
+        let occupied = self.out.len().saturating_add(complete_raw);
+        if occupied > storage || (partial_raw != 0 && complete_raw >= storage) {
+            return Err(RangeEncoderOverflow);
+        }
+        // `l` is now negative by the number of unused low bits in the final
+        // range-coded byte. Those bits are the only safe place for a partial
+        // raw byte when the occupied data already reaches physical storage.
+        if partial_raw != 0 && occupied >= storage && -l < partial_raw as i32 {
+            return Err(RangeEncoderOverflow);
+        }
+
+        let mut output = vec![0u8; storage];
+        output[..self.out.len()].copy_from_slice(&self.out);
+        let suffix_start = storage - complete_raw;
+        for (dst, src) in output[suffix_start..]
+            .iter_mut()
+            .zip(self.end_bytes.iter().rev())
+        {
+            *dst = *src;
+        }
+        if partial_raw != 0 {
+            let partial_at = suffix_start - 1;
+            output[partial_at] |= self.end_window as u8;
+        }
+        Ok(output)
     }
 
     /// Whole-bit usage, mirroring the decoder.
@@ -594,6 +666,45 @@ mod tests {
         for &(v, bits) in &raw {
             assert_eq!(dec.read_raw_bits(bits), v);
         }
+    }
+
+    #[test]
+    fn roundtrip_uint_then_raw_bits_fixed_storage() {
+        let mut rng_state = 7u64;
+        let mut enc = RangeEncoder::new();
+        let mut values = Vec::new();
+        for _ in 0..200 {
+            let ft = 1 + (xorshift(&mut rng_state) % 100_000) as u32;
+            let t = (xorshift(&mut rng_state) % ft as u64) as u32;
+            enc.encode_uint(t, ft);
+            values.push((t, ft));
+        }
+        let mut raw = Vec::new();
+        for bits in [1u32, 3, 8, 13, 24] {
+            let v = xorshift(&mut rng_state) as u32 & ((1u32 << bits) - 1);
+            enc.write_raw_bits(v, bits);
+            raw.push((v, bits));
+        }
+        let natural = enc.clone().done().len();
+        let frame = enc.try_done_sized(natural).unwrap();
+        assert_eq!(frame.len(), natural);
+
+        let mut dec = RangeDecoder::new(&frame);
+        for &(t, ft) in &values {
+            assert_eq!(dec.decode_uint(ft).unwrap(), t);
+        }
+        for &(v, bits) in &raw {
+            assert_eq!(dec.read_raw_bits(bits), v);
+        }
+    }
+
+    #[test]
+    fn fixed_storage_reports_overflow_without_truncating() {
+        let mut enc = RangeEncoder::new();
+        for _ in 0..200 {
+            enc.encode_bit_logp(true, 8);
+        }
+        assert!(enc.try_done_sized(1).is_err());
     }
 
     #[test]

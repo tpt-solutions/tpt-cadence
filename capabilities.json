@@ -1,7 +1,7 @@
 {
   "$schema": "n/a — hand-maintained, mirrors README.md's crate/format tables and todo.md status; update both together",
   "generated": "manually maintained, not auto-generated",
-  "last_updated": "2026-09-23",
+  "last_updated": "2026-09-24",
   "crates": [
     {
       "crate": "tpt-av-cadence-core",
@@ -78,7 +78,7 @@
       "conformance": "100% final_range match on all 12 official RFC 6716 test vectors; SILK-only vectors PCM bit-exact; residual PCM SNR gap on CELT/hybrid vectors is float-ULP-class, not an entropy desync",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "CeltEncoder covers mono-or-stereo, fullband, CBR, all 4 frame sizes, with transient/TF handling; a top-level OggOpusEncoder (implements the Encoder trait, writes real .opus/Ogg files via a new OggPageWriter in tpt-av-cadence-ogg) landed 2026-09-23. A real CBR-padding UNDERSHOOT bug (stereo encode's loud channel corrupted under bit-exact digital silence on the other channel) was found and fixed 2026-09-23. A second, more serious CBR OVERSHOOT bug was found the same day and is NOT fixed: the encoder's internal Q3 bit-budget math assumes the requested bytes_per_frame exactly, but RangeEncoder::tell() can underestimate done()'s real output size, so the encoder silently produces packets LARGER than requested at nearly every bitrate except two specific validated values (160 bytes/20ms mono = 64kbps, 320 stereo = 128kbps) -- every other bitrate tested (15+ values swept, 100-400 bytes/frame) corrupts decode with no error signal, since the decoder always derives its own bit budget from the packet's actual size, not the encoder's original target. This is the top-priority remaining Opus item -- see todo.md's CBR-overshoot session log and the #[ignore]d regression test in tests/ogg_opus.rs pinning it. No M/S or intensity stereo coupling (encoder policy choice, not a bug); no SILK/hybrid encode."
+      "notes": "CeltEncoder covers mono-or-stereo, fullband, CBR, all 4 frame sizes, with transient/TF handling; a top-level OggOpusEncoder implements the Encoder trait and writes real .opus/Ogg files through OggPageWriter. The former CBR storage/allocation mismatch is fixed: RangeEncoder::try_done_sized mirrors libopus fixed-size storage, correct carry flushing, and partial raw-bit placement. Mono and stereo regression coverage at multiple budgets confirms every CELT payload remains exactly bytes_per_frame, preventing packet-length-driven PVQ reallocation and silent decode corruption. Remaining encoder scope is SILK/hybrid encoding, psychoacoustic tuning, M/S or intensity stereo coupling, and RFC 7845 pre-skip delay compensation."
     },
     {
       "crate": "tpt-av-cadence-aac",

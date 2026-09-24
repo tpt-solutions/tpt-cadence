@@ -255,15 +255,10 @@ impl CeltEncoder {
     /// per-frame byte budget (no VBR). Multi-frame-per-packet (framing
     /// codes 1-3) is out of scope — see the module doc comment.
     ///
-    /// **Known bug, not yet fixed**: at most CBR byte budgets (every
-    /// budget except the two values this crate's own tests happen to use,
-    /// 160 bytes/frame mono and 320 stereo), the returned packet can
-    /// silently overshoot `bytes_per_frame` by a byte or two — see
-    /// `todo.md`'s "CELT CBR encoder can silently overshoot its byte
-    /// budget" writeup for the full investigation (now spanning several
-    /// sessions) and `tests/ogg_opus.rs::
-    /// celt_encoder_cbr_budget_other_than_the_two_tested_values_currently_corrupts_decode`
-    /// for the pinned reproduction.
+    /// The CELT entropy stream is finalized into exactly `bytes_per_frame`
+    /// bytes using libopus-style fixed storage, so decoder-side allocation
+    /// sees the same packet length used by the encoder. Overshoot is rejected
+    /// rather than silently emitted.
     pub fn encode_frame(&mut self, pcm: &[f32], bytes_per_frame: usize) -> Vec<u8> {
         self.encode_frame_impl(pcm, bytes_per_frame, None)
     }
@@ -577,7 +572,6 @@ impl CeltEncoder {
             &mut enc,
             channels,
         );
-
         let mut seed = 0u32;
         let mut collapse_masks = [0u8; 2 * NB_EBANDS];
         let mut norm = [0.0f32; 2 * N2_MAX];
@@ -723,11 +717,10 @@ impl CeltEncoder {
             enc.write_raw_bits(0, 8);
         }
 
-        let frame = enc.done();
-        debug_assert!(
-            frame.len() >= bytes_per_frame,
-            "CBR padding must guarantee the target byte count"
-        );
+        let frame = enc
+            .try_done_sized(bytes_per_frame)
+            .expect("CELT allocation should fit its fixed CBR storage");
+        debug_assert_eq!(frame.len(), bytes_per_frame);
 
         // TOC byte: CELT-only, fullband, config 28+lm (28/29/30/31 for
         // 2.5/5/10/20 ms — see `packet.rs::Toc::frame_duration`'s "CELT:

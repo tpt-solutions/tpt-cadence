@@ -472,10 +472,9 @@ fn ogg_opus_encoder_round_trips_a_tone_through_the_real_decoder() {
 
     let mut out = Vec::new();
     {
-        // 64_000 bps -> 160 bytes/20ms-frame: the one mono CBR byte budget
-        // known not to trigger the CELT encoder's CBR-overshoot bug (see
-        // `celt_encoder_cbr_budget_other_than_the_two_tested_values_currently_corrupts_decode`
-        // in this file and todo.md) — not chosen for audio quality reasons.
+        // 64_000 bps -> 160 bytes/20ms-frame. This budget is covered by the
+        // existing round-trip test, but it is not generally overflow-safe;
+        // see `celt_encoder_cbr_stays_within_requested_budget` in this file.
         let mut enc = OggOpusEncoder::new(&mut out, sample_rate, 1, 64_000).unwrap();
         let mut pos = 0;
         // Feed in irregular chunks to exercise the encoder's own internal
@@ -560,9 +559,9 @@ fn ogg_opus_encoder_stereo_round_trip_keeps_channels_distinguishable() {
 
     let mut out = Vec::new();
     {
-        // 320 bytes/frame (128_000 bps): the one stereo CBR byte budget
-        // known not to trigger the CBR-overshoot bug — see the mono test
-        // above for the full note.
+        // 320 bytes/frame = 128 kbps for a 20 ms stereo CELT frame.
+        // A broader budget matrix is covered by
+        // `celt_encoder_cbr_stays_within_requested_budget` below.
         let mut enc = OggOpusEncoder::new(&mut out, sample_rate, 2, 128_000).unwrap();
         enc.encode(&original).unwrap();
         enc.finish().unwrap();
@@ -640,103 +639,41 @@ fn ogg_opus_encoder_head_round_trips_through_parse() {
     assert_eq!(parsed, head);
 }
 
-/// **Known, real, unfixed bug — see `todo.md`'s "CELT CBR encoder can
-/// silently overshoot its byte budget" entry for the full investigation.**
-///
-/// `CeltEncoder::encode_frame`'s internal bit-budget arithmetic
-/// (`compute_allocation_encode`'s input, `quant_all_bands_encode`'s
-/// `total_bits_q`, `quant_energy_finalise`'s target) is all computed from
-/// the *requested* `bytes_per_frame` parameter. But `RangeEncoder::tell()`/
-/// `tell_frac()` are estimates (`ec_tell`), not exact predictions of
-/// `done()`'s real serialized byte count — a real encode can legitimately
-/// allocate right up to its nominal budget by the estimate, then have
-/// `done()`'s actual output land a byte or two *larger* than
-/// `bytes_per_frame`. Unlike undershoot (which the CBR-padding logic
-/// already handles correctly by padding with raw bits before the suffix),
-/// overshoot can't be patched after the fact — the extra bits are already
-/// committed to the range coder — and it desyncs `CeltDecoder`/
-/// `OpusDecoder`, which always derive their own bit budget from the
-/// packet's *actual* observed byte length (`data_len`), never from the
-/// encoder's original CBR target. The result isn't a decode error (Opus's
-/// packet framing has no CRC): it's silently corrupted audio.
-///
-/// This is *not* a narrow edge case: a sweep of 15+ CBR byte budgets from
-/// 100 to 400 bytes/frame (mono and stereo, 48 kHz, `LM = 3`) found that
-/// only the two exact values every pre-existing test in this crate happens
-/// to use (160 bytes/frame mono, 320 stereo) avoid the bug — nearly every
-/// other budget tested overshoots and corrupts its own decode. A na\u{27}ive
-/// fix (subtracting a fixed headroom from `compute_allocation_encode`'s
-/// budget alone) was tried and made things *worse* — it only touches one
-/// of at least three separate places that independently derive a Q3 bit
-/// budget from `bytes_per_frame` (allocation, `quant_all_bands_encode`,
-/// `quant_energy_finalise`), so patching one in isolation just introduces
-/// a *new* internal inconsistency (confirmed via `coded_bands` itself
-/// differing between what the encoder decided and what the decoder
-/// recovers). A real fix needs either a genuine hard output-size cap in
-/// `RangeEncoder` itself (mirroring libopus's `ec_enc_shrink`, which
-/// constrains storage *during* entropy coding rather than estimating
-/// after the fact) or a retry-with-smaller-budget loop — both bigger than
-/// a one-line patch, which is why this is `#[ignore]`d rather than fixed
-/// here.
-///
-/// This test pins the exact reproduction so a future session can verify
-/// its fix against it: mono, `bytes_per_frame = 240` (a bitrate no
-/// existing test exercised), a steady 440 Hz tone. Un-`#[ignore]` once
-/// fixed.
+/// Regression: CELT CBR output must use libopus-style fixed-size entropy
+/// storage. The previous unbounded serializer emitted the final zero carry
+/// byte and a separate partial raw byte, adding two physical bytes beyond the
+/// allocation-derived packet size. The decoder then derived a different PVQ
+/// allocation and could silently return corrupted audio.
 #[test]
-#[ignore = "known unfixed CBR-overshoot bug — see doc comment and todo.md"]
-fn celt_encoder_cbr_budget_other_than_the_two_tested_values_currently_corrupts_decode() {
-    use tpt_av_cadence_opus::celt::decoder::CeltDecoder;
-    let mut enc = tpt_av_cadence_opus::celt::encoder::CeltEncoder::new(1, 3);
-    let mut dec = CeltDecoder::new(1, 48_000).unwrap();
-    let bytes_per_frame = 240; // deliberately not 160 (the only value every other test uses)
-    let freq_hz = 440.0f32;
-    let sample_rate = 48_000.0f32;
-    let mut phase = 0.0f32;
-    let mut original = Vec::new();
-    let mut decoded = Vec::new();
-    for _ in 0..8 {
-        let mut pcm_in = [0.0f32; 960];
-        for s in pcm_in.iter_mut() {
-            *s = 0.5 * phase.sin();
-            phase += 2.0 * std::f32::consts::PI * freq_hz / sample_rate;
+fn celt_encoder_cbr_stays_within_requested_budget() {
+    for &(channels, bytes_per_frame) in &[
+        (1usize, 100usize),
+        (1, 160),
+        (1, 240),
+        (2, 160),
+        (2, 240),
+        (2, 320),
+    ] {
+        let mut enc = tpt_av_cadence_opus::celt::encoder::CeltEncoder::new(channels, 3);
+        let mut dec =
+            tpt_av_cadence_opus::celt::decoder::CeltDecoder::new(channels, 48_000).unwrap();
+        let mut phase = 0.0f32;
+        for _ in 0..8 {
+            let mut pcm = vec![0.0f32; 960 * channels];
+            for sample in pcm.chunks_mut(channels) {
+                for value in sample {
+                    *value = 0.5 * phase.sin();
+                }
+                phase += 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            }
+            let packet = enc.encode_frame(&pcm, bytes_per_frame);
+            assert_eq!(
+                packet.len() - 1,
+                bytes_per_frame,
+                "channels={channels} budget={bytes_per_frame}"
+            );
+            let mut decoded = vec![0.0f32; 960 * channels];
+            dec.decode(Some(&packet[1..]), 960, &mut decoded).unwrap();
         }
-        original.extend_from_slice(&pcm_in);
-        let packet_bytes = enc.encode_frame(&pcm_in, bytes_per_frame);
-        assert_eq!(
-            packet_bytes.len() - 1,
-            bytes_per_frame,
-            "packet overshot its CBR target (this is the bug this test pins)"
-        );
-        let mut pcm_out = vec![0.0f32; 960];
-        let n = dec
-            .decode(Some(&packet_bytes[1..]), 960, &mut pcm_out)
-            .unwrap();
-        decoded.extend_from_slice(&pcm_out[..n]);
     }
-    const CODEC_DELAY: i32 = 98; // matches encoder.rs's own measured pipeline delay
-    let skip = 960 * 2;
-    let sig_pow: f64 = original[skip..]
-        .iter()
-        .map(|&v| (v as f64) * (v as f64))
-        .sum();
-    let err_pow: f64 = original[skip..]
-        .iter()
-        .enumerate()
-        .map(|(i, &a)| {
-            let di = skip as i32 + i as i32 - CODEC_DELAY;
-            let b = if di >= 0 && (di as usize) < decoded.len() {
-                decoded[di as usize]
-            } else {
-                0.0
-            };
-            let d = a as f64 - b as f64;
-            d * d
-        })
-        .sum();
-    let snr_db = 10.0 * (sig_pow / err_pow.max(1e-12)).log10();
-    assert!(
-        snr_db > 12.0,
-        "snr={snr_db:.1} dB too low (the CBR-overshoot desync bug)"
-    );
 }

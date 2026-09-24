@@ -6,10 +6,13 @@
 **A pure-Rust, zero-dependency audio codec suite. Memory-safe, real-time capable, and permissively licensed (MIT OR Apache-2.0).**
 
 **Status:** Early-stage / Pre-1.0 — WAV, AIFF, FLAC, and raw PCM are implemented and
-bit-exact conformance-tested (decode and encode); AAC-LC and MP3 pass
-FFmpeg-reference conformance (>100 dB SNR) for decode, and both also have
-encoders (MP3's is bitstream-valid but not yet fidelity-competitive); Opus
-has a decoder plus an in-progress CELT encoder foundation, and Vorbis
+bit-exact conformance-tested (decode and encode); AAC-LC and HE-AAC/SBR and
+MP3 pass FFmpeg-reference conformance (>100 dB SNR) for decode. AAC remains
+decode-only pending a licensing decision; the MP3 encoder produces valid but
+not yet fidelity-competitive bitstreams. Opus decode and Ogg Opus support are
+conformance-tested, with a CELT-only/Ogg Opus encoder foundation in progress;
+its CBR packets now stay exactly on budget through fixed-size entropy storage.
+Hybrid SILK/CELT encoding and psychoacoustic tuning remain open. Vorbis
 decode is conformance-tested with no encoder yet.
 **Ecosystem:** [TPT Solutions Open Source](https://opensource.tptsolutions.co.nz/)
 
@@ -47,7 +50,7 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable — decode + encode, bit-exact |
 | [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable — decode + encode, bit-exact |
 | [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable — decode + encode (fixed predictors only), bit-exact |
-| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact; `Decoder`/`FormatReader` impls. 🚧 `CeltEncoder` foundation (mono/fullband/non-transient/CBR/20 ms) not yet a full `Encoder` |
+| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact. 🚧 CELT-only `Encoder` and Ogg Opus writer — mono/stereo, fullband, fixed-size CBR, all 4 frame sizes; hybrid encoding remains open |
 | [`tpt-av-cadence-ogg`](tpt-av-cadence-ogg) | Ogg page/packet container (RFC 3533) shared by Vorbis and Opus | ✅ In use |
 | [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg), decode-only |
 | [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams). ⚠️ Encoder produces valid bitstreams (FFmpeg-decodable) but poor audio fidelity — analysis-filter mismatch, see `todo.md` |
@@ -229,11 +232,13 @@ enforced by CI, and decoders that are individually conformance-tested
 against official references rather than only exercised in aggregate.
 
 **Why you might not (yet):** it's a young, pre-1.0 project — smaller
-ecosystem and less battle-tested in production than `symphonia`; no
-compressed-format encoders yet; no container demuxing (that's `tpt-kinetix`'s
-job, not this crate's); not yet published to crates.io; and there's no
-published benchmark suite yet, so no performance claims are made here one
-way or the other. Development so far has been on Windows/MSVC, though CI
+ecosystem and less battle-tested in production than `symphonia`; compressed
+encoders are incomplete (FLAC is limited to fixed predictors and MP3 has
+poor fidelity; Opus is CELT-only without psychoacoustic tuning or hybrid
+SILK/CELT support); no container demuxing (that's `tpt-kinetix`'s job, not this
+crate's); not yet
+published to crates.io; and there's no published benchmark suite yet, so no
+performance claims are made here one way or the other. Development so far has been on Windows/MSVC, though CI
 exercises Linux, macOS, and Windows on every change.
 
 ## Repository Layout

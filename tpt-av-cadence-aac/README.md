@@ -7,9 +7,11 @@ Pure Rust, zero external dependencies.
 Whole-stream PCM conformance against FFmpeg's decoder at >100 dB SNR and
 <=1e-5 peak error on bundled mono/stereo fixtures, on live FFmpeg round
 trips at 8-48 kHz in mono and stereo (123.6-125.5 dB measured), and on
-raw-framed streams (bit-identical to the ADTS path); HE-AAC decodes with
-the enhancement band at ~22 dB SNR versus FFmpeg (fidelity gap documented
-below). See `tests/conformance.rs`.
+raw-framed streams (bit-identical to the ADTS path). HE-AAC/SBR reaches
+roughly 117-126 dB SNR on self-generated stereo fixtures and roughly
+117-133 dB per channel on a self-generated 5.1 fixture after the QMF-window
+and per-channel-element SBR-state fixes. Four official CCE/PCE coupling
+items still decode at reduced fidelity. See `tests/conformance.rs`.
 
 ## Supported
 
@@ -45,14 +47,9 @@ below). See `tests/conformance.rs`.
 ## Not supported
 
 - **Parametric stereo (HE-AACv2):** a mono-core PS stream decodes as mono
-  (the SBR payload's PS extension data is skipped). **5.1/7.1 HE-AAC**
-  decodes but only the first element's SBR payload is applied (one SBR
-  context per decoder rather than one per channel element). **SBR fidelity:
-  the HE-AAC pipeline is a line-faithful port of the reference decoder
-  (filterbank and frequency-table derivation verified against an
-  independent build of the reference C code) and reproduces FFmpeg's
-  HE-AAC decode at ~22 dB whole-file SNR on the FATE conformance sample;
-  closing the remaining gap is an open item.**
+  (the SBR payload's PS extension data is skipped). Four official
+  CCE/PCE coupling conformance items still decode at reduced fidelity while
+  their interaction with program-config state is investigated.
 - **960/480-sample frames** (GASpecificConfig `frameLengthFlag = 1`) and
   gain control — not part of AAC-LC.
 - **LTP data** is parsed for bitstream alignment (LC streams may carry it)
