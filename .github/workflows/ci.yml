@@ -27,11 +27,18 @@ jobs:
       # relative path (`../../tpt-av-test/...`), so the sibling repo must be
       # checked out one level above this one for any build/test/bench to
       # resolve its manifest.
+      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
+      # check out inside the workspace and move it up to the sibling
+      # position the workspace's path dependency (`../../tpt-av-test/...`)
+      # expects.
       - name: Checkout tpt-av-test (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: tpt-solutions/tpt-av-test
-          path: ../tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
 
       - name: Install Rust (${{ matrix.rust }})
         uses: dtolnay/rust-toolchain@master
@@ -63,11 +70,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
+      # check out inside the workspace and move it up to the sibling
+      # position the workspace's path dependency (`../../tpt-av-test/...`)
+      # expects.
       - name: Checkout tpt-av-test (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: tpt-solutions/tpt-av-test
-          path: ../tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -85,6 +99,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cargo-deny parses the full workspace manifest, including
+      # tpt-av-cadence-test-utils's path dependency on tpt-av-test-reference,
+      # so the sibling repo must be present even though this job never
+      # builds any code.
+      - name: Checkout tpt-av-test (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: tpt-solutions/tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
 
@@ -100,11 +127,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
+      # check out inside the workspace and move it up to the sibling
+      # position the workspace's path dependency (`../../tpt-av-test/...`)
+      # expects.
       - name: Checkout tpt-av-test (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: tpt-solutions/tpt-av-test
-          path: ../tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -135,11 +169,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
+      # check out inside the workspace and move it up to the sibling
+      # position the workspace's path dependency (`../../tpt-av-test/...`)
+      # expects.
       - name: Checkout tpt-av-test (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: tpt-solutions/tpt-av-test
-          path: ../tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -175,11 +216,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
+      # check out inside the workspace and move it up to the sibling
+      # position the workspace's path dependency (`../../tpt-av-test/...`)
+      # expects.
       - name: Checkout tpt-av-test (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: tpt-solutions/tpt-av-test
-          path: ../tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -225,11 +273,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
+      # check out inside the workspace and move it up to the sibling
+      # position the workspace's path dependency (`../../tpt-av-test/...`)
+      # expects.
       - name: Checkout tpt-av-test (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: tpt-solutions/tpt-av-test
-          path: ../tpt-av-test
+          path: tpt-av-test
+
+      - name: Move tpt-av-test to sibling directory
+        run: mv tpt-av-test ..
 
       - uses: dtolnay/rust-toolchain@master
         with:

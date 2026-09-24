@@ -46,7 +46,11 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   correct final carry flushing and partial raw-bit placement. Mono and stereo
   frames remain exactly on budget across multiple rates, preventing the
   decoder-side PVQ reallocation that previously caused silent corruption.
-  Hybrid SILK/CELT encoding and psychoacoustic tuning remain out of scope.
+- The Ogg Opus writer now signals the measured 120-sample CELT algorithmic
+  delay as RFC 7845 pre-skip, offsets all audio granules, flushes delayed tail
+  frames, and sets the EOS granule to `input_samples + 120`. Wire-level header
+  and granule assertions plus exact-length round trips verify gapless sample
+  recovery. SILK/hybrid encoding and psychoacoustic tuning remain out of scope.
 - Broader official ISO/IEC AAC and MP3 conformance vector suites are not
   obtainable/integrated; AAC and MP3 correctness currently rest on FFmpeg-
   reference comparison rather than official test vectors.

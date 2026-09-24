@@ -472,9 +472,8 @@ fn ogg_opus_encoder_round_trips_a_tone_through_the_real_decoder() {
 
     let mut out = Vec::new();
     {
-        // 64_000 bps -> 160 bytes/20ms-frame. This budget is covered by the
-        // existing round-trip test, but it is not generally overflow-safe;
-        // see `celt_encoder_cbr_stays_within_requested_budget` in this file.
+        // 64_000 bps -> 160 bytes/20ms-frame. The broader fixed-size CBR
+        // budget matrix is covered by `celt_encoder_cbr_stays_within_requested_budget`.
         let mut enc = OggOpusEncoder::new(&mut out, sample_rate, 1, 64_000).unwrap();
         let mut pos = 0;
         // Feed in irregular chunks to exercise the encoder's own internal
@@ -489,6 +488,22 @@ fn ogg_opus_encoder_round_trips_a_tone_through_the_real_decoder() {
         }
         enc.finish().unwrap();
     }
+
+    // Wire-level RFC 7845 assertions: the first page carries OpusHead with
+    // the CELT algorithmic delay, and the final EOS page ends after that
+    // delay so pre-skip removal recovers exactly `n_samples` frames.
+    assert_eq!(&out[..4], b"OggS");
+    let first_segments = out[26] as usize;
+    let first_packet = &out[27 + first_segments..27 + first_segments + 19];
+    let head = OpusHead::parse(first_packet).unwrap();
+    assert_eq!(head.pre_skip, 120);
+    let final_page = out
+        .windows(4)
+        .rposition(|window| window == b"OggS")
+        .unwrap();
+    let final_granule =
+        i64::from_le_bytes(out[final_page + 6..final_page + 14].try_into().unwrap());
+    assert_eq!(final_granule, n_samples as i64 + 120);
 
     let (pcm, mut reader) = decode_all_with(
         OggOpusReader::from_source(Box::new(Cursor::new(out))).unwrap(),

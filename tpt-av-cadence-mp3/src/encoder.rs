@@ -243,8 +243,13 @@ fn analyze_block_polyphase(
 ) {
     let win = &crate::tables::ANALYSIS_WINDOW;
 
-    for (i, &s) in new_samples.iter().enumerate() {
-        x_hist[(*off + i) % HAN_SIZE] = s;
+    // `shine_window_filter_subband` receives the 32 PCM samples in forward
+    // order, then fills the circular buffer backwards:
+    // `x[off + 31] = sample[0]` through `x[off] = sample[31]`. This ordering
+    // is essential to the prototype filter's phase, not an implementation
+    // detail that can be normalized away later.
+    for (i, &sample) in new_samples.iter().enumerate() {
+        x_hist[(*off + (31 - i)) % HAN_SIZE] = sample;
     }
 
     let mut y = [0.0f64; 64];
@@ -1290,6 +1295,20 @@ mod tests {
         assert_eq!(pick_table_select(8206), 31);
     }
 
+    #[test]
+    fn analysis_history_uses_shine_reverse_fill_order() {
+        let mut hist = [0.0f32; HAN_SIZE];
+        let mut off = 0usize;
+        let new_samples: [f32; 32] = std::array::from_fn(|i| i as f32);
+        let mut subbands = [0.0f32; 32];
+        analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut subbands);
+
+        assert_eq!(off, 480);
+        for i in 0..32 {
+            assert_eq!(hist[(31 - i) as usize], i as f32);
+        }
+    }
+
     /// Isolates `analyze_block_polyphase` from the MDCT/quantization/Huffman
     /// stages entirely: feeds raw analysis-filter subband output straight
     /// into `crate::synth::dct_ii` + `synth_granule` (skipping
@@ -1330,7 +1349,12 @@ mod tests {
                 let mut subbands = [0.0f32; 32];
                 analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut subbands);
                 for band in 0..32usize {
-                    grbuf[band * 18 + t] = subbands[band];
+                    let sign = if band & 1 != 0 && t & 1 != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    grbuf[band * 18 + t] = subbands[band] * sign;
                 }
             }
             synth::dct_ii(&mut grbuf, 18);
@@ -1448,7 +1472,12 @@ mod tests {
                 let mut subbands = [0.0f32; 32];
                 analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut subbands);
                 for band in 0..32usize {
-                    grbuf[band * 18 + t] = subbands[band];
+                    let sign = if band & 1 != 0 && t & 1 != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    grbuf[band * 18 + t] = subbands[band] * sign;
                 }
             }
             synth::dct_ii(&mut grbuf, 18);

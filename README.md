@@ -11,8 +11,9 @@ MP3 pass FFmpeg-reference conformance (>100 dB SNR) for decode. AAC remains
 decode-only pending a licensing decision; the MP3 encoder produces valid but
 not yet fidelity-competitive bitstreams. Opus decode and Ogg Opus support are
 conformance-tested, with a CELT-only/Ogg Opus encoder foundation in progress;
-its CBR packets now stay exactly on budget through fixed-size entropy storage.
-Hybrid SILK/CELT encoding and psychoacoustic tuning remain open. Vorbis
+its CBR packets stay exactly on budget and RFC 7845 pre-skip/granules recover
+the exact input sample count. Hybrid SILK/CELT encoding and psychoacoustic
+tuning remain open. Vorbis
 decode is conformance-tested with no encoder yet.
 **Ecosystem:** [TPT Solutions Open Source](https://opensource.tptsolutions.co.nz/)
 
