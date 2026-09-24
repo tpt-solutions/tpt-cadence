@@ -31,12 +31,12 @@ items still decode at reduced fidelity. See `tests/conformance.rs`.
   scalefactor deltas, Temporal Noise Shaping, Perceptual Noise Substitution,
   M/S and intensity stereo, all four window sequences with sine and KBD
   shapes, and the pulse tool.
-- **SBR (HE-AAC):** implicit and explicit (ASC `extensionSamplingFrequency`)
-  signaling, full enhancement-band synthesis — QMF analysis/synthesis
-  filterbanks, patch construction, envelope/noise mapping with the limiter,
-  chirp-controlled inverse filtering, and sinusoid addition. Detecting an
-  SBR payload doubles the output rate. See "Not supported" for the fidelity
-  caveat and the PS/multichannel limitations.
+- **SBR (HE-AAC):** implicit signaling and explicit ASC AOT 5 hierarchical
+  signaling (`extensionSamplingFrequencyIndex`) are supported, including the
+  extension output rate and full enhancement-band synthesis — QMF
+  analysis/synthesis filterbanks, patch construction, envelope/noise mapping
+  with the limiter, chirp-controlled inverse filtering, and sinusoid addition.
+  See "Not supported" for the PS and multichannel limitations.
 - **Seek:** decode-and-discard, sample-frame accurate at transform (1024
   sample) granularity. `seek()` may block and allocate; it is not real-time
   safe (per the core `Decoder` contract).
@@ -46,10 +46,12 @@ items still decode at reduced fidelity. See `tests/conformance.rs`.
 
 ## Not supported
 
-- **Parametric stereo (HE-AACv2):** a mono-core PS stream decodes as mono
-  (the SBR payload's PS extension data is skipped). Four official
-  CCE/PCE coupling conformance items still decode at reduced fidelity while
-  their interaction with program-config state is investigated.
+- **Parametric stereo (HE-AACv2):** implicit PS payloads are skipped, so a
+  mono-core stream decodes as mono. Explicit AOT 29 signaling is parsed by
+  `AudioSpecificConfig` but rejected by `AacDecoder` rather than silently
+  downmixed. Four official CCE/PCE coupling conformance items still decode at
+  reduced fidelity while their interaction with program-config state is
+  investigated.
 - **960/480-sample frames** (GASpecificConfig `frameLengthFlag = 1`) and
   gain control — not part of AAC-LC.
 - **LTP data** is parsed for bitstream alignment (LC streams may carry it)

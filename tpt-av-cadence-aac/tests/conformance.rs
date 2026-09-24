@@ -155,6 +155,35 @@ fn raw_config_stream_matches_adts_decode() {
     compare_with_reference(&out, &expected, "raw config stream");
 }
 
+#[test]
+fn explicit_he_aac_config_activates_sbr_output_rate() {
+    // AOT 5, 44.1 kHz AAC-LC core, mono, explicit 48 kHz SBR output.
+    let asc = tpt_av_cadence_aac::AudioSpecificConfig::parse(&[0x2a, 0x09, 0x94, 0x00]).unwrap();
+    let decoder = tpt_av_cadence_aac::AacDecoder::from_config(
+        &asc,
+        Box::new(std::io::Cursor::new(Vec::new())),
+    )
+    .unwrap();
+    assert_eq!(decoder.info().sample_rate, 48_000);
+    assert_eq!(decoder.info().channels, 1);
+}
+
+#[test]
+fn explicit_heaacv2_config_rejects_unsupported_ps_synthesis() {
+    // AOT 29, 44.1 kHz core, explicit 48 kHz output. Metadata parsing
+    // succeeds, but the decoder must not silently downmix the PS result.
+    let asc = tpt_av_cadence_aac::AudioSpecificConfig::parse(&[0xea, 0x09, 0x94, 0x00]).unwrap();
+    assert!(asc.ps_signaled);
+    let result = tpt_av_cadence_aac::AacDecoder::from_config(
+        &asc,
+        Box::new(std::io::Cursor::new(Vec::new())),
+    );
+    assert!(matches!(
+        result,
+        Err(tpt_av_cadence_core::CadenceError::UnsupportedFeature(_))
+    ));
+}
+
 fn push_bits(out: &mut Vec<u8>, acc: &mut (u32, u32), value: u32, n: u32) {
     acc.0 = (acc.0 << n) | value;
     acc.1 += n;

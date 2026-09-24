@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Explicit HE-AAC `AudioSpecificConfig` signaling: AOT 5 hierarchical configs
+  now preserve the AAC-LC core rate, expose the SBR extension/output rate,
+  validate `sbrPresentFlag` and reserved frequency indices, and activate the
+  existing SBR synthesis path from the first raw block. AOT 29 metadata is
+  parsed and identifies PS signaling, while the decoder rejects it explicitly
+  until PS synthesis is implemented.
+
 - **SBR (Spectral Band Replication) — HE-AAC support.** A new `sbr` module
   ports the reference decoder's enhancement pipeline: SBR header/grid/
   dtdf/invf/envelope/noise/harmonic bitstream parsing with the ten SBR
@@ -25,8 +32,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   code; the FATE HE-AAC sample (al_sbr_cm_48_2) decodes at 48 kHz with
   full-length output and ~22 dB SNR versus FFmpeg's decode (gated >=20 dB
   in the conformance test; the residual gap is documented in the README).
-  Known limitations: PS data is skipped (HE-AACv2 stays mono); 5.1/7.1
-  HE-AAC applies only the first element's SBR payload.
+  Known limitation: Parametric Stereo is not synthesized; PS IID/ICC/IPD/OPD
+  parameters are parsed and validated, but the payload currently falls back
+  to mono and explicit AOT 29 signaling is rejected.
 
 ### Fixed
 

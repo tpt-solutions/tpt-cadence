@@ -39,20 +39,12 @@
 //!   substitute. The implementation was checked directly against the live
 //!   `shine` encoder source line by line (sample-fill order, fold formula,
 //!   offset update, matrixing formula all verified to match), so this is a
-//!   faithful port, not a guess. **However, this does NOT yet reconstruct
-//!   accurately against this crate's decoder** (`crate::synth`) — an
-//!   isolation test that bypasses the MDCT/quant/Huffman stages entirely
-//!   still shows poor correlation, and a direct probe of `crate::synth`'s
-//!   own per-band impulse response suggests its internal representation
-//!   (derived from a `minimp3`-style fast/folded synthesis algorithm, not a
-//!   plain per-tap FIR) may not correspond to the plain ISO/shine model the
-//!   way this implementation assumes. See `todo.md`'s "MP3 encoder
-//!   (2026-09-22, continued)" section for the full investigation, what was
-//!   ruled out, and the recommended next step. The per-band 36-point
-//!   forward MDCT (by contrast) IS verified exact: it's the analytic
-//!   adjoint of this crate's decoder IMDCT, derived algebraically from
-//!   `crate::imdct::imdct_gr` and checked against it directly in this
-//!   module's tests. The encoder also pre-compensates for the decoder's
+//!   faithful port, not a guess. The encoder/decoder polyphase pair is
+//!   regression-tested, and the encoder pre-compensates for the decoder's
+//!   alias/sign processing. The per-band 36-point forward MDCT is verified
+//!   exact: it is the analytic adjoint of this crate's decoder IMDCT, derived
+//!   algebraically from `crate::imdct::imdct_gr` and checked directly in
+//!   this module's tests. The encoder also pre-compensates for the decoder's
 //!   unconditional `antialias`/`change_sign` post-processing steps.
 //!
 //! Despite the reduced ambition and the open analysis-filter fidelity gap,

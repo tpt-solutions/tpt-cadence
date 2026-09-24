@@ -8,12 +8,10 @@
 //! (silence, a sub-one-frame stream).
 //!
 //! `mono_sine_tone_decodes_with_concentrated_energy` and
-//! `stereo_white_noise_round_trips_recognizably` are `#[ignore]`d: the
-//! isolated analysis, MDCT, Huffman, and synthesis stages now have
-//! regression coverage, but the complete frame-level encoder/decoder
-//! fidelity path still needs a production pass. They are retained as the
-//! concrete target for that follow-up work and can be run explicitly with
-//! `cargo test -- --ignored`.
+//! `stereo_white_noise_round_trips_recognizably` are active end-to-end
+//! fidelity gates. The analysis, MDCT, Huffman, side-info, and synthesis
+//! stages are covered, and both targets now pass with the current reduced
+//! encoder scope.
 
 use std::io::Cursor;
 
@@ -148,11 +146,9 @@ fn mono_sine_tone_produces_a_valid_decodable_stream() {
     );
 }
 
-/// End-to-end mono fidelity target. The polyphase and Huffman stages are
-/// isolated and verified, but frame-level granule reconstruction still needs
-/// a complete mono bitstream pass.
+/// End-to-end mono fidelity gate: the decoded tone must remain concentrated at
+/// the source frequency and correlate after the bounded MP3 delay.
 #[test]
-#[ignore = "frame-level fidelity target remains open; see the MP3 encoder session log"]
 fn mono_sine_tone_decodes_with_concentrated_energy() {
     let sample_rate = 44_100u32;
     let freq = 1000.0f32;
@@ -206,11 +202,9 @@ fn stereo_white_noise_produces_a_valid_decodable_stream() {
     );
 }
 
-/// Stereo end-to-end fidelity target. The isolated analysis, MDCT, Huffman,
-/// and synthesis stages are covered, but frame-level stereo reconstruction
-/// still needs a complete pass.
+/// End-to-end stereo fidelity gate: independently generated channels must
+/// remain recognizable after delay alignment without collapsing together.
 #[test]
-#[ignore = "frame-level stereo fidelity target remains open; see the MP3 encoder session log"]
 fn stereo_white_noise_round_trips_recognizably() {
     let sample_rate = 44_100u32;
     let (frames, left, right) = stereo_white_noise_frames(sample_rate);

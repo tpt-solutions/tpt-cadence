@@ -344,6 +344,11 @@ impl AacDecoder {
         config: &AudioSpecificConfig,
         source: Box<dyn ByteSource>,
     ) -> Result<Self, CadenceError> {
+        if config.ps_signaled {
+            return Err(CadenceError::UnsupportedFeature(
+                "HE-AACv2 Parametric Stereo synthesis is not supported".to_string(),
+            ));
+        }
         let sample_rate = config.sample_rate()?;
         let mut decoder = Self::open_with_params(
             BufferedSource::new(source, 8192),
@@ -355,6 +360,10 @@ impl AacDecoder {
         )?;
         if config.program_config.is_some() {
             decoder.recompute_pce_out_order();
+        }
+        if config.extension_sampling_frequency_index.is_some() {
+            decoder.sbr_output_active = true;
+            decoder.sbr_rate_doubled = true;
         }
         Ok(decoder)
     }

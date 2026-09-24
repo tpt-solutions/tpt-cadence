@@ -2,9 +2,11 @@
 //! III (MP3) file:
 //! `cargo run -p tpt-av-cadence-mp3 --example mp3_encode -- tone.mp3`
 //!
-//! See `src/encoder.rs`'s module doc comment for this encoder's scope and
-//! known quality limitations — it produces valid, decodable MP3 streams,
-//! but is not yet competitive with a reference encoder like LAME.
+//! See `src/encoder.rs`'s module doc comment for this encoder's reduced
+//! feature scope and known quality limitations. It produces valid, decodable
+//! MP3 streams with active mono and independent-stereo fidelity gates, while
+//! psychoacoustics, reservoir borrowing, short blocks, and stereo coupling
+//! remain out of scope.
 
 use std::f32::consts::PI;
 use std::fs::File;

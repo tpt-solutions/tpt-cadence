@@ -24,6 +24,16 @@ Contributions are welcome in the form of **GitHub issues**:
 - Questions about the project's design or roadmap (see [DESIGN.md](DESIGN.md) and
   [todo.md](todo.md)).
 
+## Release preparation
+
+Release preparation is manual and non-publishing. Run
+`python tools/release_prep.py --check` to validate the current workspace
+version and changelog. To generate a local patch, run
+`python tools/release_prep.py --prepare VERSION`; the manual
+`release-prep` GitHub Actions workflow performs the same operation and uploads
+`Cargo.toml` and `CHANGELOG.md` as artifacts. The tooling never creates a
+commit, tag, push, or crates.io publication.
+
 ## Licensing
 
 `tpt-cadence` is dual-licensed under MIT OR Apache-2.0.

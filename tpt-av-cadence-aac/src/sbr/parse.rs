@@ -563,10 +563,14 @@ fn read_sbr_data(sbr: &mut Sbr, br: &mut SbrBitReader, vlc: &SbrVlc, id_aac: usi
             let ext_id = br.bits(2);
             match ext_id {
                 1 => {
-                    // EXTENSION_ID_PS: parametric stereo — unsupported;
-                    // skip the declared payload.
-                    br.bits(num_bits_left as u32);
-                    num_bits_left = 0;
+                    // EXTENSION_ID_PS: retain and validate the parameter
+                    // payload. PS stereo synthesis is not wired yet, so
+                    // current output remains the safe mono fallback.
+                    num_bits_left -= super::ps::ParametricStereo::decode(
+                        &mut sbr.ps,
+                        br,
+                        num_bits_left as usize,
+                    ) as i32;
                 }
                 _ => {
                     br.bits(num_bits_left as u32);

@@ -8,6 +8,10 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 ## [Unreleased]
 
 ### Added
+- Non-publishing release preparation: `tools/release_prep.py` validates workspace
+  metadata and can generate a local version/changelog patch; the manual
+  `release-prep` workflow uploads that patch as an artifact and never commits,
+  tags, pushes, or publishes.
 - Opus CELT encoder foundation: forward MDCT wired into a working
   `CeltEncoder` (mono or stereo, fullband, CBR, all four CELT frame sizes) with a
   passing encode-then-decode round trip, now including real transient
@@ -32,11 +36,17 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   not yet implemented (see `todo.md`).
 - MP3 encoder (`Mp3Encoder`): MPEG-1 Layer III, fixed CBR bitrate, long
   blocks only, bit-reservoir-free framing. Bitstream validity is verified
-  independently via a live FFmpeg decode of its output; audio fidelity is
-  currently poor pending a documented analysis-filter fix (see `todo.md`).
+  independently via a live FFmpeg decode of its output; active reduced-scope
+  mono and independent-stereo end-to-end fidelity gates pass. Psychoacoustic
+  tuning, reservoir borrowing, short blocks, and stereo coupling remain out of
+  scope.
 
 ### Known limitations (tracked in `todo.md`)
-- PS / HE-AACv2 is parsed but not applied (decodes as mono).
+- Parametric Stereo is not synthesized: PS IID/ICC/IPD/OPD parameters are now
+  parsed and validated in the SBR extension path, including nested PS
+  extensions, but output currently falls back to mono. Explicit AOT 29
+  signaling is parsed but rejected by the decoder. Explicit HE-AAC AOT 5 ASC
+  signaling is supported.
 - Four AAC FATE multichannel conformance items (CCE/PCE coupling) decode at
   reduced fidelity (2-53 dB) pending a coupling/PCE-interaction root cause.
   The previous stereo and 5.1/7.1 SBR context bugs are fixed; HE-AAC/SBR
@@ -55,12 +65,13 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   obtainable/integrated; AAC and MP3 correctness currently rest on FFmpeg-
   reference comparison rather than official test vectors.
 - MP3 encoder produces valid, independently-FFmpeg-decodable bitstreams. The
-  analysis polyphase path now matches shine's reverse circular-buffer fill;
+  analysis polyphase path matches shine's reverse circular-buffer fill;
   forward MDCT/antialias/change-sign precompensation, escape-Huffman pair
-  orientation, count1 zero-width handling, and mono/stereo synthesis state now
-  have isolated regression coverage. Frame-level mono/stereo fidelity and
-  production-quality bit allocation remain open; the end-to-end fidelity
-  targets are retained as ignored regression tests.
+  orientation, count1 zero-width handling, MPEG-1 stereo side-info field
+  order, and mono/stereo synthesis state now have regression coverage.
+  Active mono and independent-stereo end-to-end fidelity gates pass within
+  the reduced flat-gain/no-reservoir encoder scope. Psychoacoustic tuning,
+  bit-reservoir borrowing, and full feature-set expansion remain out of scope.
 - Encoders beyond the Opus CELT foundation, the WAV/AIFF/PCM writers, the
   FLAC encoder, and the MP3 encoder above (Vorbis, AAC) are not yet started;
   AAC encoding is on hold pending a patent-licensing decision.

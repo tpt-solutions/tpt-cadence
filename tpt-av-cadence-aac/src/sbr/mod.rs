@@ -17,6 +17,8 @@
 pub mod dsp;
 pub mod freq;
 pub mod parse;
+pub(crate) mod ps;
+mod ps_tables;
 pub mod qmf;
 pub mod tables;
 
@@ -169,6 +171,9 @@ pub struct Sbr {
     /// sidestep the double-`&mut self` borrow of calling `self.hf_assemble`
     /// with a buffer that lives inside `self`, then move it back after.
     pub y1_scratch: Option<Box<[[QmfPair; 64]; 38]>>,
+    /// Persistent PS parameter state. Stereo synthesis is not yet applied,
+    /// but parsing is retained so malformed PS cannot corrupt SBR framing.
+    pub(crate) ps: ps::ParametricStereo,
 }
 
 /// `ff_exp2fi`: exact power of two.
@@ -223,6 +228,7 @@ impl Sbr {
             qmf_filter_scratch: [[0.0; 64]; 2],
             qmf_analysis_z: Box::new([0.0; 320]),
             y1_scratch: Some(Box::new([[(0.0, 0.0); 64]; 38])),
+            ps: ps::ParametricStereo::new(),
         };
         sbr.turnoff();
         sbr.data[0].synthesis_filterbank_samples_offset = SBR_SYNTHESIS_BUF_SIZE - (1280 - 128);

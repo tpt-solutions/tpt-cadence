@@ -1,0 +1,41 @@
+name: Release preparation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version to prepare, for example 0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Validate release metadata
+        run: python tools/release_prep.py --check
+
+      - name: Prepare local release patch
+        run: python tools/release_prep.py --prepare "${{ inputs.version }}"
+
+      - name: Validate generated patch
+        run: |
+          git diff --check
+          cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Upload patch without publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-prep-${{ inputs.version }}
+          path: |
+            Cargo.toml
+            CHANGELOG.md
