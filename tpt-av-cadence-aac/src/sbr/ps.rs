@@ -392,6 +392,54 @@ mod tests {
     }
 
     #[test]
+    fn nested_extension_payload_is_consumed_exactly() {
+        let bytes = packed(&[
+            (1, 1),
+            (1, 1),
+            (0, 3),
+            (1, 1),
+            (0, 3),
+            (1, 1),
+            (0, 1),
+            (1, 2),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (1, 4),
+            (1, 2),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+        ]);
+        let mut ps = ParametricStereo::new();
+        let mut br = SbrBitReader::new(BitReader::new(&bytes));
+        let used = ps.decode(&mut br, bytes.len() * 8);
+        assert!(ps.start);
+        assert_eq!(used, 45);
+        assert_eq!(br.br.pos(), 45);
+    }
+
+    #[test]
     fn malformed_payload_disables_ps() {
         let bytes = [0b1010_0000u8];
         let mut ps = ParametricStereo::new();
