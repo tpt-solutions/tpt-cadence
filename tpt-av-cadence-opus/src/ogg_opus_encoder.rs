@@ -205,8 +205,9 @@ impl<W: Write + Send> Encoder for OggOpusEncoder<W> {
             self.emit_frame()?;
         }
         if let Some(last) = self.buffered_packet.take() {
-            // The true final page's granule is always the exact input
-            // sample count, trimming any zero-pad tail added above.
+            // The final page's granule is the exact input endpoint plus the
+            // codec delay; decoder pre-skip removal then recovers exactly the
+            // original number of samples.
             // `bos = false`: only the very first page (the OpusHead page
             // written in `new()`) may ever carry BOS — `PageReader`
             // interprets a *second* BOS page on the same serial as the
