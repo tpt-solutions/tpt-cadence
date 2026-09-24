@@ -1001,11 +1001,16 @@ impl<W: Write> Mp3Encoder<W> {
                     N_LONG_SFB,
                     "region split must cover all long sfb bands"
                 );
+                bw.push(plan.table_select as u64, 5);
+                bw.push(plan.table_select as u64, 5);
+                bw.push(plan.table_select as u64, 5);
+                debug_assert_eq!(
+                    16 + 6,
+                    N_LONG_SFB,
+                    "region split must cover all long sfb bands"
+                );
                 bw.push(15, 4); // region0_count - 1 = 15 -> 16 bands
-                bw.push(5, 3); // region1_count - 1 = 5 -> 6 bands (16+6 == N_LONG_SFB)
-                bw.push(plan.table_select as u64, 5);
-                bw.push(plan.table_select as u64, 5);
-                bw.push(plan.table_select as u64, 5);
+                bw.push(5, 3); // region1_count - 1 = 5 -> 6 bands (16+6 == N_LONG_SFB);
                 bw.push(0, 1); // preflag = 0
                 bw.push(0, 1); // scalefac_scale = 0
                 bw.push(0, 1); // count1table_select (unused: count1 region is never reached)
@@ -1283,6 +1288,36 @@ mod tests {
                     "L*L^-1 [{i}][{j}] = {acc}, want {expect}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn encoded_stereo_side_info_orders_tables_before_regions() {
+        use crate::{header, sideinfo};
+        use std::io::Cursor;
+
+        let sample_rate = 44_100u32;
+        let mut samples = vec![0.0f32; 1152 * 2];
+        for (i, sample) in samples.iter_mut().step_by(2).enumerate() {
+            *sample =
+                0.25 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / sample_rate as f32).sin();
+        }
+        let mut output = Cursor::new(Vec::new());
+        let mut encoder = Mp3Encoder::new(&mut output, sample_rate, 2, 128).unwrap();
+        encoder.encode(&samples).unwrap();
+        encoder.finish().unwrap();
+        drop(encoder);
+        let data = output.into_inner();
+
+        let hdr = header::parse_header(&data[..4]).unwrap();
+        let mut bits = crate::bitreader::BitReader::new(&data[4..hdr.total_bytes()]);
+        let mut granules = std::array::from_fn::<_, 4, _>(|_| sideinfo::GranuleInfo::default());
+        sideinfo::read_side_info(&mut bits, &hdr, &mut granules).unwrap();
+        assert_eq!(bits.bit_pos(), 32 * 8);
+        for granule in &granules {
+            assert!((24..=31).contains(&granule.table_select[0]));
+            assert_eq!(granule.table_select, [granule.table_select[0]; 3]);
+            assert_eq!(granule.region_count, [15, 5, 255]);
         }
     }
 
