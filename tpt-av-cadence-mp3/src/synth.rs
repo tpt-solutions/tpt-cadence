@@ -224,3 +224,55 @@ pub fn synth_granule(
         qmf_state.copy_from_slice(&lins[NBANDS * 64..NBANDS * 64 + 960]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_stereo_channels_match_mono_synthesis() {
+        let mut mono = [0.0f32; 576];
+        for (band, samples) in mono.chunks_exact_mut(18).enumerate() {
+            for (t, sample) in samples.iter_mut().enumerate() {
+                *sample = ((band * 17 + t * 7) as f32 * 0.03125).sin() * 64.0;
+            }
+        }
+        let mut stereo = [0.0f32; 1152];
+        for ch in 0..2 {
+            stereo[ch * 576..(ch + 1) * 576].copy_from_slice(&mono);
+        }
+
+        let mut mono_buf = mono;
+        let mut mono_state = [0.0f32; 960];
+        let mut mono_lins = vec![0.0f32; 33 * 64];
+        let mut mono_pcm = [0.0f32; 576];
+        synth_granule(
+            &mut mono_state,
+            &mut mono_buf,
+            1,
+            &mut mono_pcm,
+            &mut mono_lins,
+        );
+
+        let mut stereo_state = [0.0f32; 960];
+        let mut stereo_lins = vec![0.0f32; 33 * 64];
+        let mut stereo_pcm = [0.0f32; 1152];
+        synth_granule(
+            &mut stereo_state,
+            &mut stereo,
+            2,
+            &mut stereo_pcm,
+            &mut stereo_lins,
+        );
+
+        for (i, &sample) in mono_pcm.iter().enumerate() {
+            for ch in 0..2 {
+                let got = stereo_pcm[i * 2 + ch];
+                assert!(
+                    (got - sample).abs() < 1e-6,
+                    "sample {i} channel {ch}: stereo={got} mono={sample}"
+                );
+            }
+        }
+    }
+}

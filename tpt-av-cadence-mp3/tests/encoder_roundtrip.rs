@@ -8,16 +8,12 @@
 //! (silence, a sub-one-frame stream).
 //!
 //! `mono_sine_tone_decodes_with_concentrated_energy` and
-//! `stereo_white_noise_round_trips_recognizably` are `#[ignore]`d: they
-//! encode the bar this encoder *should* eventually clear (decoded audio
-//! perceptibly resembling the source), which the current analysis
-//! filterbank does not yet reach — see `src/encoder.rs`'s module doc
-//! comment and `todo.md` for the documented root cause (the analysis
-//! prototype filter is a generic windowed-sinc substitute, not matched to
-//! the decoder's real fixed synthesis prototype, so reconstruction is
-//! valid but has much more spectral leakage than a working encoder needs).
-//! They're kept (not deleted) as the concrete target for that follow-up
-//! work, and can be run explicitly with `cargo test -- --ignored`.
+//! `stereo_white_noise_round_trips_recognizably` are `#[ignore]`d: the
+//! isolated analysis, MDCT, Huffman, and synthesis stages now have
+//! regression coverage, but the complete frame-level encoder/decoder
+//! fidelity path still needs a production pass. They are retained as the
+//! concrete target for that follow-up work and can be run explicitly with
+//! `cargo test -- --ignored`.
 
 use std::io::Cursor;
 
@@ -109,6 +105,21 @@ fn pearson_correlation(a: &[f32], b: &[f32]) -> f64 {
     num / (da.sqrt() * db.sqrt())
 }
 
+fn best_delayed_correlation(decoded: &[f32], source: &[f32], max_delay: usize) -> (f64, usize) {
+    let mut best = (0.0f64, 0usize);
+    for delay in 0..=max_delay {
+        let n = decoded.len().min(source.len()).saturating_sub(delay);
+        if n < 1024 {
+            break;
+        }
+        let corr = pearson_correlation(&decoded[delay..delay + n], &source[..n]);
+        if corr.abs() > best.0.abs() {
+            best = (corr, delay);
+        }
+    }
+    best
+}
+
 #[test]
 fn mono_sine_tone_produces_a_valid_decodable_stream() {
     let sample_rate = 44_100u32;
@@ -137,13 +148,11 @@ fn mono_sine_tone_produces_a_valid_decodable_stream() {
     );
 }
 
-/// Target for follow-up work, not yet met — see this file's module doc
-/// comment and `todo.md` for the known root cause (the analysis
-/// filterbank's generic prototype isn't matched to the decoder's real
-/// fixed synthesis prototype).
+/// End-to-end mono fidelity target. The polyphase and Huffman stages are
+/// isolated and verified, but frame-level granule reconstruction still needs
+/// a complete mono bitstream pass.
 #[test]
-#[ignore = "analysis filterbank not yet matched to the decoder's synthesis \
-            prototype -- see src/encoder.rs and todo.md's MP3 encoder session log"]
+#[ignore = "frame-level fidelity target remains open; see the MP3 encoder session log"]
 fn mono_sine_tone_decodes_with_concentrated_energy() {
     let sample_rate = 44_100u32;
     let freq = 1000.0f32;
@@ -160,12 +169,10 @@ fn mono_sine_tone_decodes_with_concentrated_energy() {
         "sine tone energy not concentrated at {freq} Hz: at_freq={at_freq} off_freq={off_freq}"
     );
 
-    // Should also correlate reasonably with the (quantization-degraded but
-    // still recognizable) original tone shape over the overlapping range.
-    let corr = pearson_correlation(&decoded[..frames.len().min(decoded.len())], &frames);
+    let (corr, delay) = best_delayed_correlation(&decoded, &frames, 4096);
     assert!(
         corr > 0.5,
-        "decoded tone doesn't correlate with source: corr={corr}"
+        "decoded tone doesn't correlate with source: corr={corr} delay={delay}"
     );
 }
 
@@ -199,13 +206,11 @@ fn stereo_white_noise_produces_a_valid_decodable_stream() {
     );
 }
 
-/// Target for follow-up work, not yet met — see this file's module doc
-/// comment and `todo.md` for the known root cause (the analysis
-/// filterbank's generic prototype isn't matched to the decoder's real
-/// fixed synthesis prototype).
+/// Stereo end-to-end fidelity target. The isolated analysis, MDCT, Huffman,
+/// and synthesis stages are covered, but frame-level stereo reconstruction
+/// still needs a complete pass.
 #[test]
-#[ignore = "analysis filterbank not yet matched to the decoder's synthesis \
-            prototype -- see src/encoder.rs and todo.md's MP3 encoder session log"]
+#[ignore = "frame-level stereo fidelity target remains open; see the MP3 encoder session log"]
 fn stereo_white_noise_round_trips_recognizably() {
     let sample_rate = 44_100u32;
     let (frames, left, right) = stereo_white_noise_frames(sample_rate);
@@ -214,15 +219,15 @@ fn stereo_white_noise_round_trips_recognizably() {
 
     let decoded_left: Vec<f32> = decoded.iter().step_by(2).copied().collect();
     let decoded_right: Vec<f32> = decoded.iter().skip(1).step_by(2).copied().collect();
-    let corr_l = pearson_correlation(&decoded_left, &left);
-    let corr_r = pearson_correlation(&decoded_right, &right);
+    let (corr_l, delay_l) = best_delayed_correlation(&decoded_left, &left, 4096);
+    let (corr_r, delay_r) = best_delayed_correlation(&decoded_right, &right, 4096);
     assert!(
         corr_l > 0.3,
-        "decoded left channel doesn't correlate with source noise: corr={corr_l}"
+        "decoded left channel doesn't correlate with source noise: corr={corr_l} delay={delay_l}"
     );
     assert!(
         corr_r > 0.3,
-        "decoded right channel doesn't correlate with source noise: corr={corr_r}"
+        "decoded right channel doesn't correlate with source noise: corr={corr_r} delay={delay_r}"
     );
     // The two channels were independently generated noise: cross-channel
     // correlation should stay low, confirming independent (not

@@ -100,7 +100,7 @@
       "conformance": ">100 dB SNR vs FFmpeg on ten bundled decode fixtures; official ISO/IEC 11172-4 vectors not obtainable, so decode correctness rests on the FFmpeg oracle alone",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "Encoder output is independently FFmpeg-decodable (valid bitstream, bit-reservoir-free CBR) but has poor audio fidelity from an unresolved analysis/synthesis filter mismatch"
+      "notes": "Mp3Encoder emits valid, independently FFmpeg-decodable CBR Layer III bitstreams. The analysis polyphase path now matches shine's reverse circular-buffer fill; forward MDCT/antialias/change-sign precompensation, escape-Huffman pair ordering, count1 zero-width handling, and mono/stereo synthesis state have isolated regression coverage. Frame-level encoder fidelity remains open: independent stereo at the reduced flat-gain/no-reservoir scope is not yet quality-competitive, and the mono/stereo end-to-end fidelity targets remain ignored."
     },
     {
       "crate": "tpt-av-cadence-vorbis",

@@ -1695,7 +1695,7 @@ Verification: full workspace `cargo test --workspace` (every crate, 0 failed), `
 - [x] FLAC encoder (royalty-free by design, well-specified reference encoder to port/adapt) — see "FLAC encoder (2026-09-22)" below
 - [ ] Vorbis encoder (royalty-free by design, higher effort — psychoacoustic model)
 - [ ] AAC encoder — **on hold**: Fraunhofer/VIA-LA patent pool primarily targets encoders; needs a licensing decision from the user before any implementation work
-- [ ] MP3 encoder — core patents expired worldwide by 2017 (broadly considered safe), but confirm before shipping if there's commercial distribution. **Partial progress (2026-09-22):** `tpt-av-cadence-mp3::Mp3Encoder` lands a real, spec-compliant, bit-reservoir-free CBR encoder — bitstream validity is independently verified (FFmpeg decodes its output cleanly), but audio fidelity is currently poor due to an unresolved analysis-filter/synthesis-filter mismatch. See "MP3 encoder (2026-09-22)" below for what's confirmed-correct vs. the specific open problem and what was tried. Leaving this unchecked until the fidelity gap closes.
+- [ ] MP3 encoder — core patents expired worldwide by 2017 (broadly considered safe), but confirm before shipping if there's commercial distribution. **Partial progress (2026-09-24):** `tpt-av-cadence-mp3::Mp3Encoder` emits valid, spec-compliant, bit-reservoir-free CBR and is independently FFmpeg-decodable. The analysis polyphase fill now matches shine, the forward MDCT/antialias/change-sign chain is verified across all bands, escape-Huffman pair orientation and count1 zero-width handling are fixed, and identical stereo synthesis matches mono. Remaining work is frame-level encoder fidelity and production-quality bit allocation: the reduced flat-gain/no-reservoir encoder does not yet meet the mono/stereo end-to-end correlation targets, which remain ignored regression tests.
 
 ### WAV/AIFF/PCM writers (2026-09-22)
 
@@ -1971,12 +1971,13 @@ clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`
 all clean; no new dependencies. Added `examples/mp3_encode.rs`.
 
 **Honest summary**: bitstream validity is solid (independently verified via
-FFmpeg, not just self-consistent); audio fidelity is not — this is a
-real, working, spec-compliant MP3 encoder that currently produces
-poor-quality audio due to an unresolved analysis-filter/synthesis-filter
-mismatch, not a finished quality-competitive one. Marking the top-level
-todo item below `[x]` would overclaim; leaving it open with this note
-instead.
+FFmpeg, not just self-consistent). The analysis polyphase fill, forward
+MDCT/antialias/change-sign chain, Huffman granule encoding, and synthesis
+state now have isolated regression coverage. Complete frame-level mono/stereo
+fidelity and production-quality bit allocation remain open: the reduced
+flat-gain/no-reservoir encoder does not yet meet the end-to-end correlation
+targets, which remain ignored regression tests. Marking the top-level todo
+item `[x]` would therefore overclaim.
 
 ### FLAC encoder (2026-09-22)
 

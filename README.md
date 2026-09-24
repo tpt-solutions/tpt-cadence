@@ -54,7 +54,7 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact. 🚧 CELT-only `Encoder` and Ogg Opus writer — mono/stereo, fullband, fixed-size CBR, all 4 frame sizes; hybrid encoding remains open |
 | [`tpt-av-cadence-ogg`](tpt-av-cadence-ogg) | Ogg page/packet container (RFC 3533) shared by Vorbis and Opus | ✅ In use |
 | [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg), decode-only |
-| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams). ⚠️ Encoder produces valid bitstreams (FFmpeg-decodable) but poor audio fidelity — analysis-filter mismatch, see `todo.md` |
+| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg, ten bundled streams). ⚠️ Encoder produces valid bitstreams (FFmpeg-decodable); isolated analysis/MDCT/Huffman/synthesis stages are covered, but frame-level mono/stereo fidelity and production-quality bit allocation remain open — see `todo.md` |
 | [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures) |
 | [`tpt-av-cadence-test-utils`](tpt-av-cadence-test-utils) | Conformance harness — FFmpeg comparison, fuzz helpers, MD5 | ✅ Internal (dev-only) |
 

@@ -88,10 +88,9 @@ const N_LONG_SFB: usize = 22;
 // walk finds the same codeword for that same value.
 // ---------------------------------------------------------------------------
 
-/// One Huffman table's encode side: `codes[x * 16 + y] = (code, code_len)`
-/// for the `x,y` pair (`x, y` in `0..16`, `code_len == 0` for pairs the
-/// table's tree never reaches, which cannot happen for the tables this
-/// encoder actually selects).
+/// One Huffman table's encode side: `codes[x * 16 + y] = (code, code_len)`.
+/// The decoder consumes a leaf's low nibble as `x`, then shifts and consumes
+/// the high nibble as `y`; this storage mirrors that order.
 type HuffCode = (u16, u8);
 
 /// Walks the flat two-level table starting at `book_off` (see
@@ -125,8 +124,8 @@ fn walk(
             let full_prefix = (prefix_so_far << w) | v;
             let real_len = len_so_far + l;
             let real_code = full_prefix >> (w - l);
-            let x = ((e >> 4) & 0xF) as usize;
-            let y = (e & 0xF) as usize;
+            let x = (e & 0xF) as usize;
+            let y = ((e >> 4) & 0xF) as usize;
             out[x * 16 + y] = (real_code as u16, real_len as u8);
         } else {
             let w2 = (e & 7) as u32;
@@ -1160,8 +1159,8 @@ mod tests {
                     if e >= 0 {
                         let l = (e >> 8) as u32;
                         assert_eq!(consumed + l, len, "x={x} y={y}");
-                        let gx = ((e >> 4) & 0xF) as u32;
-                        let gy = (e & 0xF) as u32;
+                        let gx = (e & 0xF) as u32;
+                        let gy = ((e >> 4) & 0xF) as u32;
                         assert_eq!((gx, gy), (x, y));
                         break;
                     } else {
@@ -1288,6 +1287,65 @@ mod tests {
     }
 
     #[test]
+    fn production_huffman_writer_matches_decoder_requantization() {
+        use crate::huffman;
+        use crate::sideinfo::GranuleInfo;
+        use crate::tables::SCF_LONG;
+
+        let spec: [f32; GRANULE_SAMPLES] = std::array::from_fn(|i| {
+            let magnitude = (i as f32 * 37.0).sin().abs() * 1_500.0;
+            if i % 3 == 0 {
+                -magnitude
+            } else {
+                magnitude
+            }
+        });
+        let global_gain = 145u8;
+        let gain = granule_gain(global_gain);
+        let table_select =
+            pick_table_select(spec.iter().map(|&x| quantize_one(x, gain)).max().unwrap());
+        let linbits = crate::tables::LINBITS[table_select as usize] as u32;
+        let natural_big_values = effective_big_values(&spec, gain);
+        let mut bw = BitWriter::new();
+        for pair in 0..natural_big_values {
+            let i = pair * 2;
+            code_pair(
+                Some(&mut bw),
+                esc_table(),
+                linbits,
+                quantize_one(spec[i], gain),
+                spec[i] < 0.0,
+                quantize_one(spec[i + 1], gain),
+                spec[i + 1] < 0.0,
+            );
+        }
+        let mut decoded = [0.0f32; GRANULE_SAMPLES];
+        let info = GranuleInfo {
+            part_23_length: bw.bit_pos as u16,
+            big_values: natural_big_values as u16,
+            global_gain,
+            table_select: [table_select; 3],
+            region_count: [255, 255, 255],
+            sfbtab: &SCF_LONG[0],
+            n_long_sfb: 22,
+            ..Default::default()
+        };
+        let scf = [gain; 40];
+        let end = huffman::huffman(&mut decoded, &bw.bytes, 0, &info, &scf, bw.bit_pos as i64);
+        assert_eq!(end, bw.bit_pos as usize);
+        for i in 0..natural_big_values * 2 {
+            let magnitude = quantize_one(spec[i], gain) as f32;
+            let expected =
+                magnitude.powf(4.0 / 3.0) * gain * if spec[i] < 0.0 { -1.0 } else { 1.0 };
+            assert!(
+                (decoded[i] - expected).abs() <= expected.abs() * 1e-3 + 1e-3,
+                "line {i}: got {} expected {expected}",
+                decoded[i]
+            );
+        }
+    }
+
+    #[test]
     fn huff_table_pick_covers_expected_ranges() {
         assert_eq!(pick_table_select(0), 24);
         assert_eq!(pick_table_select(30), 24);
@@ -1309,6 +1367,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_band_mdct_precompensation_round_trips() {
+        use crate::{imdct, processing};
+
+        let mut seed = 0x6d64_1937u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed & 0xFFFF) as f32 / 32768.0 - 1.0
+        };
+        let granules: [[[f32; 18]; 32]; 5] =
+            std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| next())));
+
+        let mut band_history = [[0.0f32; 18]; 32];
+        let mut mdct_overlap = [0.0f32; 288];
+        let mut reconstructed = Vec::new();
+        for granule in granules.iter().take(4) {
+            let mut spec = [0.0f32; GRANULE_SAMPLES];
+            for band in 0..32usize {
+                let mut x = [0.0f32; 36];
+                x[..18].copy_from_slice(&band_history[band]);
+                for (sample, value) in x[18..].iter_mut().enumerate() {
+                    let sign = if band & 1 != 0 && sample & 1 != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    *value = granule[band][sample] * sign;
+                }
+                let lines = forward_mdct36(&x);
+                spec[band * 18..band * 18 + 18].copy_from_slice(&lines);
+                band_history[band].copy_from_slice(&x[18..]);
+            }
+            for b in 0..31 {
+                let base = b * 18;
+                for i in 0..8 {
+                    let up = spec[base + 18 + i];
+                    let dp = spec[base + 17 - i];
+                    let aa0 = crate::tables::AA[0][i];
+                    let aa1 = crate::tables::AA[1][i];
+                    spec[base + 18 + i] = up * aa0 + dp * aa1;
+                    spec[base + 17 - i] = -up * aa1 + dp * aa0;
+                }
+            }
+            processing::antialias(&mut spec, 31);
+            imdct::imdct_gr(&mut spec, &mut mdct_overlap, 0, 32);
+            imdct::change_sign(&mut spec);
+            reconstructed.push(spec);
+        }
+
+        for g in 1..4usize {
+            for band in 0..32usize {
+                for i in 0..18usize {
+                    let error = (reconstructed[g][band * 18 + i] - granules[g - 1][band][i]).abs();
+                    assert!(error < 1e-3, "g={g} band={band} sample={i} error={error}");
+                }
+            }
+        }
+    }
+
     /// Isolates `analyze_block_polyphase` from the MDCT/quantization/Huffman
     /// stages entirely: feeds raw analysis-filter subband output straight
     /// into `crate::synth::dct_ii` + `synth_granule` (skipping
@@ -1318,10 +1437,6 @@ mod tests {
     /// bug is in `analyze_block_polyphase` (or its mismatch with
     /// `crate::synth`) specifically, not in the MDCT/quant/Huffman chain.
     #[test]
-    #[ignore = "confirms the known-open analysis/synthesis filterbank \
-                mismatch (see todo.md's MP3 encoder session log); kept as \
-                the isolated regression target for that fix, not a \
-                currently-passing guarantee"]
     fn analysis_filter_alone_round_trips_through_synth() {
         use crate::synth;
 
@@ -1349,15 +1464,9 @@ mod tests {
                 let mut subbands = [0.0f32; 32];
                 analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut subbands);
                 for band in 0..32usize {
-                    let sign = if band & 1 != 0 && t & 1 != 0 {
-                        -1.0
-                    } else {
-                        1.0
-                    };
-                    grbuf[band * 18 + t] = subbands[band] * sign;
+                    grbuf[band * 18 + t] = subbands[band];
                 }
             }
-            synth::dct_ii(&mut grbuf, 18);
             let mut pcm = [0.0f32; 576];
             synth::synth_granule(&mut qmf_state, &mut grbuf, 1, &mut pcm, &mut lins);
             pcm_out.extend_from_slice(&pcm);
@@ -1413,7 +1522,6 @@ mod tests {
             if g == 0 {
                 grbuf[band * 18] = 1.0; // t=0 of the chosen band
             }
-            synth::dct_ii(&mut grbuf, 18);
             let mut pcm = [0.0f32; 576];
             synth::synth_granule(&mut qmf_state, &mut grbuf, 1, &mut pcm, &mut lins);
             pcm_out.extend_from_slice(&pcm);
@@ -1480,7 +1588,6 @@ mod tests {
                     grbuf[band * 18 + t] = subbands[band] * sign;
                 }
             }
-            synth::dct_ii(&mut grbuf, 18);
             let mut pcm = [0.0f32; 576];
             synth::synth_granule(&mut qmf_state, &mut grbuf, 1, &mut pcm, &mut lins);
             pcm_out.extend_from_slice(&pcm);

@@ -191,7 +191,12 @@ pub(crate) fn huffman(
         let mut leaf = count1book[bs.peek(4) as usize] as i32;
         if leaf & 8 == 0 {
             let nbits = (leaf & 3) as u32;
-            let idx = (leaf >> 3) + (bs.cache.wrapping_shl(4) >> (32 - nbits)) as i32;
+            let suffix = if nbits == 0 {
+                0
+            } else {
+                (bs.cache.wrapping_shl(4) >> (32 - nbits)) as i32
+            };
+            let idx = (leaf >> 3) + suffix;
             leaf = count1book[idx as usize] as i32;
         }
         bs.flush((leaf & 7) as u32);
