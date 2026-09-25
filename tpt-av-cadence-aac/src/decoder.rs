@@ -250,15 +250,13 @@ pub struct AacDecoder {
     pce_class_counts: [usize; 4],
     /// Output permutation for PCE streams (sniffed WAV order).
     pce_out_order: [u8; MAX_CHANNELS],
-    /// Per-element index within its own type (SCE/CPE/LFE), counted in
-    /// SNIFFED OUTPUT-POSITION order rather than PCE declaration order.
-    /// Mirrors the reference decoder's `id_map`/`iid`: `ff_aac_output_
-    /// configure` reorders elements by `sniff_channel_order` BEFORE
-    /// assigning `ac->che[type][iid]` slots, and `apply_channel_coupling`
-    /// then matches a CCE's `id_select` against that `iid` — NOT against
-    /// the element's declared instance tag. So CCE coupling targets must
-    /// be resolved the same (arguably buggy, but reference-matching) way:
-    /// by this sniffed-order index, not by `BlockElem::tag`.
+    /// Per-element index within its own type (SCE/CPE/LFE), counted in PCE
+    /// declaration order. Mirrors the reference decoder's `id_map`/`iid`:
+    /// `ff_aac_output_configure` walks the original `layout_map` while
+    /// assigning `ac->che[type][iid]`; `sniff_channel_order` only determines
+    /// output positions and does not reorder that map. `apply_channel_coupling`
+    /// then matches a CCE's `id_select` against that `iid`, not the declared
+    /// instance tag.
     pce_plan_iid: [u8; MAX_CHANNELS],
 
     channels_state: Vec<ChannelState>,
@@ -1770,15 +1768,15 @@ impl AacDecoder {
         }
         let mut out_slot = 0usize;
         // Reference `ff_aac_output_configure`: `id_map[type][tag] =
-        // type_counts[type]++` walks the layout_map in this SAME
-        // sniffed/sorted order (not PCE declaration order), assigning each
-        // element a per-type sequential index ("iid"). CCE coupling
-        // (`apply_channel_coupling`) then matches a target by THIS index,
-        // not by its declared tag — see `pce_plan_iid`'s doc comment.
+        // type_counts[type]++` walks the original PCE layout_map, assigning
+        // each element a per-type sequential index ("iid"). The independent
+        // `sniff_channel_order` pass below only chooses output positions;
+        // it does not reorder that map. CCE coupling then matches by this
+        // index, not by the element's declared tag.
         let mut type_counts = [0u8; 3];
-        for &(_pos, entry) in order.iter().take(self.pce_plan_len) {
-            let ty = self.pce_plan_type[entry as usize] as usize;
-            self.pce_plan_iid[entry as usize] = type_counts[ty];
+        for entry in 0..self.pce_plan_len {
+            let ty = self.pce_plan_type[entry] as usize;
+            self.pce_plan_iid[entry] = type_counts[ty];
             type_counts[ty] += 1;
         }
         for &(_pos, entry) in order.iter().take(self.pce_plan_len) {
