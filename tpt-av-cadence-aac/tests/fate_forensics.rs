@@ -126,6 +126,78 @@ fn demux_aac_mp4(path: &Path) -> (Vec<u8>, Vec<u8>) {
     (out.asc.expect("no esds AudioSpecificConfig"), samples)
 }
 
+/// Full-stream ours-vs-ffmpeg per-channel correlation: identifies exactly
+/// which output slot carries which reference channel (and which reference
+/// channels the oracle leaves silent) without the noise of short frames.
+#[test]
+#[ignore = "manual diagnostic harness; requires AAC_FATE_SAMPLES_DIR and ffmpeg"]
+fn full_correlation() {
+    let dir = std::env::var_os("AAC_FATE_SAMPLES_DIR")
+        .map(PathBuf::from)
+        .expect("AAC_FATE_SAMPLES_DIR");
+    let name = std::env::var("FATE_NAME").unwrap_or_else(|_| "al22_chCfg0PCE_44".into());
+    let mp4 = dir.join(format!("{name}.mp4"));
+    let (asc_bytes, samples) = demux_aac_mp4(&mp4);
+    let asc = tpt_av_cadence_aac::AudioSpecificConfig::parse(&asc_bytes).unwrap();
+    let mut decoder =
+        tpt_av_cadence_aac::AacDecoder::from_config(&asc, Box::new(std::io::Cursor::new(samples)))
+            .unwrap();
+    let mut pcm: Vec<f32> = Vec::new();
+    let mut buf = vec![0.0f32; 6720];
+    loop {
+        let frames = decoder.decode(&mut buf).unwrap();
+        if frames == 0 {
+            break;
+        }
+        let ch = usize::from(decoder.info().channels);
+        pcm.extend_from_slice(&buf[..frames * ch]);
+    }
+    let channels = usize::from(decoder.info().channels);
+    let rate = asc.sample_rate().unwrap();
+    if let Some(path) = std::env::var_os("FATE_DUMP_OURS") {
+        let mut bytes = Vec::with_capacity(pcm.len() * 4);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        eprintln!("dumped ours to {path:?}");
+    }
+    let reference =
+        tpt_av_cadence_test_utils::reference::decode_with_ffmpeg(&mp4, rate, channels as u16)
+            .unwrap();
+    let n = pcm.len().min(reference.len()) / channels;
+    eprintln!("{name}: {n} frames compared, {channels} channels");
+    let rms = |s: &Vec<f32>, off: usize| -> f64 {
+        let mut acc = 0.0f64;
+        for i in 0..n {
+            let v = s[i * channels + off] as f64;
+            acc += v * v;
+        }
+        acc.sqrt()
+    };
+    for a in 0..channels {
+        let ra = rms(&pcm, a);
+        let mut row = String::new();
+        for b in 0..channels {
+            let rb = rms(&reference, b);
+            let mut dot = 0.0f64;
+            for i in 0..n {
+                dot += (pcm[i * channels + a] as f64) * (reference[i * channels + b] as f64);
+            }
+            let c = if ra > 1e-9 && rb > 1e-9 {
+                dot / (ra * rb)
+            } else {
+                0.0
+            };
+            row.push_str(&format!("c{c:+.3} "));
+        }
+        eprintln!("ours ch{a} (rms {ra:.4}): {row}");
+    }
+    for b in 0..channels {
+        eprintln!("ffmpeg ch{b} rms {:.4}", rms(&reference, b));
+    }
+}
+
 #[test]
 #[ignore = "manual diagnostic harness; requires AAC_FATE_SAMPLES_DIR and ffmpeg"]
 fn forensics() {

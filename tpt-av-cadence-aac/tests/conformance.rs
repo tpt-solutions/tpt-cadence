@@ -970,18 +970,21 @@ fn fate_conformance_corpus() {
             ));
             continue;
         }
-        // Known-residual items, kept as regression guards at their current
-        // fidelity while the residual coupling/PCE-interaction differences
-        // against FFmpeg are under investigation:
-        // - al06: its PCE declares duplicate element tags, and the FFmpeg
-        //   reference itself drops the front-center channel entirely.
-        // - al07/al15/al22: multichannel CCE/PCE combinations decode with
-        //   correct structure and correlation but degraded quiet passages.
+        // Known-residual item, kept as a regression guard at its current
+        // fidelity while the remaining difference against FFmpeg is under
+        // investigation:
+        // - al07: multichannel CCE combination decodes with correct
+        //   structure and correlation but degraded quiet passages.
+        // (al06/al15/al22 previously carried reduced gates here; their low
+        // scores traced to the reference decode's `-ac` channel folding and
+        // to coupling channels being double-applied on refill-retried
+        // blocks — both fixed. al15 now clears the SNR gate comfortably but
+        // keeps a relaxed peak bound: its noise-fill passages show ~4e-5
+        // sample-level differences against FFmpeg that track float ulps in
+        // powf/accumulation, not any structural error.)
         let gate = match name {
-            "al06_44" => (5.0, 0.35),
             "al07_96" => (45.0, 0.01),
-            "al15_44" => (2.0, 1.0),
-            "al22_chCfg0PCE_44" => (1.5, 0.3),
+            "al15_44" => (100.0, 1e-4),
             _ => (100.0, 1e-5),
         };
         if let Err(e) = check_within(&pcm, &reference, gate.0, gate.1) {

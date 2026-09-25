@@ -638,15 +638,35 @@ impl AacDecoder {
             let avail = self.raw_len - self.raw_pos;
             self.work_buf[..avail].copy_from_slice(&self.frame_buf[self.raw_pos..self.raw_len]);
             // A parse that runs out of data may leave non-idempotent state
-            // behind (the PNS LCG advances one-way and the per-channel
-            // window-shape flags shift); snapshot those so the retry after
-            // a refill decodes from the same state as a first attempt.
+            // behind: the PNS LCG advances one-way, the per-channel (and
+            // CCE-scratch) window-shape flags shift, and a partial parse's
+            // coupling channels are already marked as decoded. Snapshot or
+            // clear all three so the retry after a refill decodes from the
+            // same state as a first attempt — otherwise the retry would
+            // slot a repeated CCE into a second slot and apply the same
+            // coupling channel twice.
             let noise_state = self.noise.state();
-            let kb_flags: [(bool, bool); MAX_CHANNELS] = std::array::from_fn(|i| {
+            let win_state: [(u8, bool, bool); MAX_CHANNELS + 1] = std::array::from_fn(|i| {
                 self.channels_state
                     .get(i)
-                    .map_or((false, false), |c| (c.kb_window_prev, c.kb_window_cur))
+                    .map_or((ONLY_LONG, false, false), |c| {
+                        (c.window_seq_prev, c.kb_window_prev, c.kb_window_cur)
+                    })
             });
+            let cce_win_state: Vec<(u8, bool, bool)> = self
+                .cces
+                .iter()
+                .map(|c| {
+                    (
+                        c.state.window_seq_prev,
+                        c.state.kb_window_prev,
+                        c.state.kb_window_cur,
+                    )
+                })
+                .collect();
+            for cce in &mut self.cces {
+                cce.coupled = false;
+            }
             // Lend the work buffer out so the block decoder can use &mut self.
             let work = std::mem::take(&mut self.work_buf);
             let (result, consumed, overread) = {
@@ -688,11 +708,21 @@ impl AacDecoder {
                 Err(e) => {
                     if overread && self.refill_raw()? > 0 {
                         self.noise.set_state(noise_state);
-                        for (i, (prev, cur)) in kb_flags.iter().enumerate() {
+                        for (i, (seq, prev, cur)) in win_state.iter().enumerate() {
                             if let Some(c) = self.channels_state.get_mut(i) {
+                                c.window_seq_prev = *seq;
                                 c.kb_window_prev = *prev;
                                 c.kb_window_cur = *cur;
                             }
+                        }
+                        // decode_cce seeds its scratch channel from
+                        // `cces[slot].state`, so a partial attempt's advanced
+                        // window-tracking state must be rolled back here too
+                        // or the retried CCE window shapes differently.
+                        for (cce, (seq, prev, cur)) in self.cces.iter_mut().zip(&cce_win_state) {
+                            cce.state.window_seq_prev = *seq;
+                            cce.state.kb_window_prev = *prev;
+                            cce.state.kb_window_cur = *cur;
                         }
                         continue;
                     }
@@ -1170,7 +1200,7 @@ impl AacDecoder {
             for (ci, cce) in self.cces.iter().enumerate().take(2) {
                 if cce.coupled {
                     eprintln!(
-                        "frame {} cce{ci}: point={} num_coupled={} ty={:?} id_select={:?} ch_select={:?} num_gain={} per_target_gain={:?} coeff_rms={:.2} out_rms={:.4} corr_ch0={:.4}",
+                        "frame {} cce{ci}: point={} num_coupled={} ty={:?} id_select={:?} ch_select={:?} num_gain={} per_target_gain={:?} coeff_rms={:.2} out_rms={:.4} corr_ch0={:.4} maxsfb={} groups={} group_len={:?}",
                         self.frame_count,
                         cce.coupling_point,
                         cce.num_coupled,
@@ -1193,8 +1223,21 @@ impl AacDecoder {
                             let na: f64 = cce.state.out.iter().take(1024).map(|&x| (x * x) as f64).sum();
                             let nb: f64 = self.channels_state[0].out.iter().take(1024).map(|&x| (x * x) as f64).sum();
                             if na > 0.0 && nb > 0.0 { n / (na * nb).sqrt() } else { 0.0 }
-                        }
+                        },
+                        cce.window.max_sfb,
+                        cce.window.num_window_groups,
+                        &cce.window.group_len[..cce.window.num_window_groups],
                     );
+                    for c in 0..cce.num_gain {
+                        let gains = &cce.gain[c * 512..(c + 1) * 512];
+                        let nz = gains.iter().filter(|&&g| g != 0.0).count();
+                        let ss: f64 = gains.iter().map(|&g| (g as f64) * (g as f64)).sum();
+                        let mx = gains.iter().fold(0.0f64, |m, &g| m.max((g as f64).abs()));
+                        eprintln!(
+                            "frame {} cce{ci} gain q={c}: nz={nz} ss={ss:.6} mx={mx:.6}",
+                            self.frame_count
+                        );
+                    }
                 }
             }
         }
