@@ -79,6 +79,20 @@
 //! coarse/fine/finalise energy quantizers already support the channel-count
 //! parameter.
 //!
+//! ## Dynamic allocation boosts (psychoacoustic allocation steering)
+//!
+//! The encoder's dynalloc loop is no longer a bare "no boost" walk: bands
+//! whose energy stands out above the frame's own typical spectral curve
+//! (median `means` of the active bands, i.e. energy relative to the
+//! decoder's expected e-means curve) are boosted through the bitstream's
+//! dynamic-allocation mechanism, one step per ~4 dB of excess above a
+//! 12 dB threshold, with a gross-masking gate 25 dB below the frame peak
+//! and a global boost budget of a quarter of the frame. The loop mirrors
+//! the decoder's bit-exactly (including the `quanta` accounting and the
+//! budget decrements), so the decoded per-band offsets equal the
+//! encoder's; content matching the expected curve costs one "no boost"
+//! bit per band, exactly as before.
+//!
 //! ## VBR (constrained, loudness-adaptive)
 //!
 //! [`CeltEncoder::encode_frame_vbr`] treats its byte argument as the
@@ -139,6 +153,18 @@ const TRANSIENT_RATIO: f32 = 8.0;
 /// tiny absolute jump can still be a large *ratio*) from spuriously
 /// triggering transient mode.
 const TRANSIENT_ENERGY_FLOOR: f32 = 400.0;
+
+/// Frame loudness in the log2-energy domain: log2 of the mean per-band
+/// energy across all `channels` band planes (`means` holds
+/// `log2(band_gain) - e_means(i)`, so the tilt is added back here). Used by
+/// both the VBR budget derivation and the dynalloc boost policy.
+fn frame_mean_energy_log2(means: &[f32; 2 * NB_EBANDS], channels: usize) -> f64 {
+    let mut e_sum = 0f64;
+    for (idx, &mean) in means[..channels * NB_EBANDS].iter().enumerate() {
+        e_sum += 2f64.powf(mean as f64 + e_means(idx % NB_EBANDS) as f64);
+    }
+    (e_sum / (channels * NB_EBANDS) as f64).log2()
+}
 
 /// Splits `syn[0..channels]` (the pre-emphasized frame(s), same scale
 /// `encode_frame` computes, only the first `(1 << lm) * SHORT_MDCT_SIZE`
@@ -229,6 +255,10 @@ pub struct CeltEncoder {
     /// [`CeltEncoder::encode_frame_vbr`] call; CBR calls neither read nor
     /// write it. CBR and VBR calls must not be interleaved on one encoder.
     vbr_ref: Option<f64>,
+    /// Dynamic-allocation boosts signaled by the most recent
+    /// [`CeltEncoder::encode_frame`] call (1/8-bit units per band), exposed
+    /// for tests via [`CeltEncoder::last_offsets`].
+    last_offsets: [i32; NB_EBANDS],
 }
 
 /// VBR loudness-reference tracking coefficient: the EMA weight of the
@@ -271,6 +301,7 @@ impl CeltEncoder {
             last_is_transient: false,
             last_intensity: NB_EBANDS,
             vbr_ref: None,
+            last_offsets: [0; NB_EBANDS],
         }
     }
 
@@ -285,6 +316,13 @@ impl CeltEncoder {
     /// not engage). Mono encoders always report `NB_EBANDS`.
     pub fn last_intensity(&self) -> usize {
         self.last_intensity
+    }
+
+    /// The dynamic-allocation boosts signaled in the most recent
+    /// [`CeltEncoder::encode_frame`] call (1/8-bit units per band; all
+    /// zeros when no band was boosted).
+    pub fn last_offsets(&self) -> &[i32; NB_EBANDS] {
+        &self.last_offsets
     }
 
     /// Number of PCM samples per channel [`CeltEncoder::encode_frame`]
@@ -393,11 +431,7 @@ impl CeltEncoder {
         means: &[f32; 2 * NB_EBANDS],
         channels: usize,
     ) -> usize {
-        let mut e_sum = 0f64;
-        for (idx, &mean) in means[..channels * NB_EBANDS].iter().enumerate() {
-            e_sum += 2f64.powf(mean as f64 + e_means(idx % NB_EBANDS) as f64);
-        }
-        let loud = (e_sum / (channels * NB_EBANDS) as f64).log2();
+        let loud = frame_mean_energy_log2(means, channels);
         let r = match self.vbr_ref {
             None => loud,
             Some(r) => r + VBR_REF_TRACKING * (loud - r),
@@ -765,20 +799,108 @@ impl CeltEncoder {
 
         let cap = init_caps(lm, channels);
 
-        let dynalloc_logp = 6i32;
-        let mut total_bits_q = total_bits_bytes << 3;
-        let mut tell = enc.tell_frac() as i32;
-        let offsets = [0i32; NB_EBANDS];
+        // --- Dynamic allocation boosts (energy-adaptive "psychoacoustic"
+        // allocation steering) ---
+        // Exact mirror of the decoder's dynalloc loop (same bit decisions,
+        // same `total_bits_q` decrements, same per-band `quanta` including
+        // the channel count), so the decoded `offsets` equal these. The
+        // POLICY is encoder-only and deliberately simple: boost bands whose
+        // energy stands out above the frame's own geometric-mean band level
+        // — one allocation step per ~3 dB of excess above a 6 dB threshold,
+        // capped per band by `cap`, globally by a quarter of the frame
+        // budget, and skipped entirely at very low bitrates where the
+        // signaling overhead outweighs the reallocation benefit. Spectrally
+        // flat content produces no boosts and costs one "no boost" bit per
+        // band, exactly as before.
+        let total_bits_q_init = total_bits_bytes << 3;
+        let mut total_bits_q = total_bits_q_init;
+        let boost_budget = total_bits_q >> 2;
+        let mut boost_bits_spent = 0i32;
+        // `means[i]` IS the right peakiness measure: it is the band's energy
+        // measured *relative to the expected spectral curve* (the decoder's
+        // e-means), so it needs no further width/tilt normalization — raw
+        // density would be dominated by that tilt and always favor low
+        // bands. Bands at or below the silence sentinel (`means` == -9.0)
+        // are excluded entirely. The reference is the MEDIAN `means` of the
+        // active bands: unlike a mean it is not dragged around by how many
+        // bands are active, so expected-curve-flat content produces no
+        // boosts while a genuine spectral spike stands out. A gross-masking
+        // gate keeps bands 25+ dB below the frame's peak unboosted (e.g. a
+        // quiet background under a loud tone).
+        let mut band_peakiness_db = [0f64; NB_EBANDS];
+        let mut active_means = [0f64; NB_EBANDS];
+        let mut active_bands = 0usize;
         for i in 0..NB_EBANDS {
-            let width = ((EBAND5MS[i + 1] - EBAND5MS[i]) as usize) << lm;
+            if (0..channels).any(|ch| means[ch * NB_EBANDS + i] > -8.9) {
+                let m = (0..channels)
+                    .map(|ch| means[ch * NB_EBANDS + i])
+                    .sum::<f32>() as f64
+                    / channels as f64;
+                active_means[active_bands] = m;
+                band_peakiness_db[i] = 6.0206 * m;
+                active_bands += 1;
+            }
+        }
+        let (reference_db, peak_db) = if active_bands > 0 {
+            let mut sorted = active_means[..active_bands].to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = 6.0206 * sorted[active_bands / 2];
+            let peak = band_peakiness_db
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            (median, peak)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut band_excess_db = [0.0f64; NB_EBANDS];
+        for i in 0..NB_EBANDS {
+            if (0..channels).any(|ch| means[ch * NB_EBANDS + i] > -8.9)
+                && band_peakiness_db[i] >= peak_db - 25.0
+            {
+                band_excess_db[i] = band_peakiness_db[i] - reference_db;
+            }
+        }
+
+        let mut dynalloc_logp = 6i32;
+        let mut tell = enc.tell_frac() as i32;
+        let mut offsets = [0i32; NB_EBANDS];
+        let allow_boost = bytes_per_frame >= 60;
+        for i in 0..NB_EBANDS {
+            let width = (channels * (EBAND5MS[i + 1] - EBAND5MS[i]) as usize) << lm;
             let quanta = ((width << 3) as i32).min((6 << 3).max(width as i32));
-            let dynalloc_loop_logp = dynalloc_logp;
-            if tell + (dynalloc_loop_logp << 3) < total_bits_q {
+            let mut dynalloc_loop_logp = dynalloc_logp;
+            let mut boost = 0i32;
+            let mut wanted = 0i32;
+            if allow_boost && band_excess_db[i] > 12.0 {
+                wanted = (((band_excess_db[i] - 12.0) / 4.0).ceil() as i32).min(8);
+            }
+            while tell + (dynalloc_loop_logp << 3) < total_bits_q
+                && boost < cap[i]
+                && boost_bits_spent + quanta <= boost_budget
+                && wanted > 0
+            {
+                enc.encode_bit_logp(true, dynalloc_loop_logp as u32);
+                tell = enc.tell_frac() as i32;
+                boost += quanta;
+                total_bits_q -= quanta;
+                boost_bits_spent += quanta;
+                wanted -= 1;
+                dynalloc_loop_logp = 1;
+            }
+            // Terminating "no more boost" bit — written only when the
+            // decoder's while-condition still holds, since it stops reading
+            // without a terminator when the boost hits `cap` or the budget.
+            if tell + (dynalloc_loop_logp << 3) < total_bits_q && boost < cap[i] {
                 enc.encode_bit_logp(false, dynalloc_loop_logp as u32);
                 tell = enc.tell_frac() as i32;
             }
-            let _ = quanta;
+            offsets[i] = boost;
+            if boost > 0 {
+                dynalloc_logp = 2.max(dynalloc_logp - 1);
+            }
         }
+        self.last_offsets = offsets;
 
         let alloc_trim = 5i32;
         if tell + (6 << 3) <= total_bits_q {
@@ -1991,6 +2113,32 @@ mod tests {
         }
     }
 
+    /// VBR encodes must be deterministic: identical input through two fresh
+    /// encoders yields byte-identical packet sequences (the loudness
+    /// reference is part of the encoder state and introduces no
+    /// nondeterminism).
+    #[test]
+    fn vbr_encode_is_deterministic() {
+        let mut phase = 0.0f32;
+        let mut frames = Vec::new();
+        for i in 0..10 {
+            let amp = if i % 3 == 0 { 0.7 } else { 0.05 };
+            let mut frame = [0.0f32; N2];
+            for s in frame.iter_mut() {
+                *s = amp * phase.sin();
+                phase += 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            }
+            frames.push(frame);
+        }
+        let mut enc_a = CeltEncoder::new(1, LM);
+        let mut enc_b = CeltEncoder::new(1, LM);
+        for frame in &frames {
+            let a = enc_a.encode_frame_vbr(frame, 160);
+            let b = enc_b.encode_frame_vbr(frame, 160);
+            assert_eq!(a, b, "VBR encode must be deterministic");
+        }
+    }
+
     /// Constrained VBR: with smoothly amplitude-modulated content (no
     /// frame-boundary discontinuities), frames louder than the recent past
     /// must receive a boosted budget and quieter frames a reduced one, while
@@ -2043,29 +2191,78 @@ mod tests {
         );
     }
 
-    /// VBR encodes must be deterministic: identical input through two fresh
-    /// encoders yields byte-identical packet sequences (the loudness
-    /// reference is part of the encoder state and introduces no
-    /// nondeterminism).
+    /// Dynamic-allocation boost policy: a strong narrowband tone must get
+    /// its band boosted (with inactive bands left alone), while digital
+    /// silence must produce no boosts at all. Boosts must also round-trip:
+    /// every packet decodes without error (the offsets are bitstream-coded,
+    /// so any encoder/decoder disagreement would corrupt the whole frame).
     #[test]
-    fn vbr_encode_is_deterministic() {
+    fn dynalloc_boosts_spectral_peaks_but_not_silence() {
+        let bytes_per_frame = 160;
+
+        // Spike: a lone 0.5-amplitude 3000 Hz tone (band 12 at lm = 3) over
+        // digital silence — every other band is inactive and must stay
+        // unboosted while the tone's band gets the allocation.
+        let mut enc = CeltEncoder::new(1, LM);
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
         let mut phase = 0.0f32;
-        let mut frames = Vec::new();
-        for i in 0..10 {
-            let amp = if i % 3 == 0 { 0.7 } else { 0.05 };
-            let mut frame = [0.0f32; N2];
-            for s in frame.iter_mut() {
-                *s = amp * phase.sin();
-                phase += 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+        for f in 0..6 {
+            let mut pcm = [0.0f32; N2];
+            for s in pcm.iter_mut() {
+                *s = 0.5 * (2.0 * std::f32::consts::PI * 3000.0 * phase / 48_000.0).sin();
+                phase += 1.0;
             }
-            frames.push(frame);
+            let packet = enc.encode_frame(&pcm, bytes_per_frame);
+            // Frames 0-1 are onset frames (empty MDCT tail = a click, with
+            // genuine broadband energy), so judge the steady state only.
+            if f < 2 {
+                continue;
+            }
+            let offsets = enc.last_offsets();
+            assert!(
+                offsets.iter().sum::<i32>() > 0,
+                "spike content should receive dynalloc boosts: {offsets:?}"
+            );
+            // 3000 Hz = bin 120 = band 12 (the MDCT window spreads it over
+            // bands 10-12, so the peak boost must be one of those).
+            let best_band = (0..NB_EBANDS).max_by_key(|&i| offsets[i]).unwrap();
+            assert!(
+                (10..=12).contains(&best_band),
+                "the largest boost should land on the tone's band: {offsets:?}"
+            );
+            assert!(
+                offsets[..8].iter().all(|&o| o == 0),
+                "inactive bands far below the tone should not be boosted: {offsets:?}"
+            );
+            assert!(
+                offsets[15..].iter().all(|&o| o == 0),
+                "inactive bands above the tone should not be boosted: {offsets:?}"
+            );
+            for (i, &o) in offsets.iter().enumerate() {
+                assert!(o >= 0, "negative offset at band {i}");
+            }
+            let parsed = parse_packet(&packet).unwrap();
+            let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &parsed, &packet, &mut pcm_out)
+                .expect("boosted packet must decode without error");
         }
-        let mut enc_a = CeltEncoder::new(1, LM);
-        let mut enc_b = CeltEncoder::new(1, LM);
-        for frame in &frames {
-            let a = enc_a.encode_frame_vbr(frame, 160);
-            let b = enc_b.encode_frame_vbr(frame, 160);
-            assert_eq!(a, b, "VBR encode must be deterministic");
+
+        // Silence: every band sits at the silence sentinel, so nothing is
+        // "active" and the boost loop must spend nothing — one "no boost"
+        // bit per band, the zero-offset default path.
+        let mut enc = CeltEncoder::new(1, LM);
+        for _ in 0..3 {
+            let pcm = [0.0f32; N2];
+            let packet = enc.encode_frame(&pcm, bytes_per_frame);
+            assert!(
+                enc.last_offsets().iter().all(|&o| o == 0),
+                "silence should not be boosted: {:?}",
+                enc.last_offsets()
+            );
+            let parsed = parse_packet(&packet).unwrap();
+            let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &parsed, &packet, &mut pcm_out)
+                .expect("unboosted packet must decode without error");
         }
     }
 }
