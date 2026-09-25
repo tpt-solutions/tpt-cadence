@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- CELT encoder (`celt::encoder::CeltEncoder`) and Ogg Opus writer
+  (`OggOpusEncoder`, implementing the core `Encoder` trait): 48 kHz
+  mono/stereo, fullband, all four CELT frame sizes. Transient detection
+  with short-block analysis, joint mid/side stereo, analysis-driven
+  intensity stereo for channel-similar high bands (with the decoder's
+  phase-inversion bit), energy-adaptive dynamic-allocation boosts, CBR
+  with libopus-style fixed-size entropy storage (`RangeEncoder::
+  try_done_sized`), loudness-adaptive constrained VBR
+  (`encode_frame_vbr` / `OggOpusEncoder::new_vbr`), and full RFC 7845
+  pre-skip/granule/end-trim handling for the measured 120-sample CELT
+  delay.
 - Opus packet parser (TOC byte, frame framing) and range coder.
 - Full CELT decoder (unit-tested).
 - Full SILK decoder (unit-tested).
@@ -42,6 +53,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- CELT encoder theta coding: the stereo n>2 step-pdf encoded upper-tail
+  levels (level > qn/2) with symbol width `p0` where the decoder uses
+  width 1, overrunning `ft` and silently corrupting the arithmetic-coder
+  state for side-dominant bands.
+- CELT encoder dynalloc width now includes the channel count, matching
+  the decoder's `quanta` (harmless at zero boosts, required for boosts).
 - `OpusDecoder::decode_frame` no longer allocates on redundancy/transition
   frames (three `Vec::to_vec` crossfade copies replaced with fixed-size
   buffers), restoring the crate's allocation-free `decode()` contract for

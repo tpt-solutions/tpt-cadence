@@ -27,17 +27,19 @@ bit-exactness contract.
 ## Encoder status
 
 A CELT-only `Encoder` and top-level Ogg Opus writer are implemented for
-48 kHz mono/stereo, fullband, CBR, and all four CELT frame sizes. CELT
-entropy output uses libopus-style fixed-size storage, so every packet stays
-at the requested byte budget and cannot change decoder-side PVQ allocation
-through silent overshoot. RFC 7845 pre-skip and granule positions include the
-measured 120-sample CELT overlap delay; `finish()` flushes the delayed tail so
-decoders recover the exact original sample count. Stereo coupling is
-complete: joint mid/side band coding, plus analysis-driven intensity stereo
-(Y = ±X, phase discarded) for the high bands of channel-similar content.
-This remains foundation work: SILK/hybrid encoding, psychoacoustic tuning,
-and VBR are still open and tracked in [`todo.md`](../todo.md) at the
-repository root.
+48 kHz mono/stereo, fullband, and all four CELT frame sizes. Rate control:
+CBR with libopus-style fixed-size entropy storage (every packet stays at
+the requested byte budget and cannot change decoder-side PVQ allocation
+through silent overshoot), or loudness-adaptive constrained VBR where each
+frame's budget tracks its dynamics around the average target. Stereo
+coupling is complete: joint mid/side band coding, plus analysis-driven
+intensity stereo (Y = ±X, phase discarded) for the high bands of
+channel-similar content, and energy-adaptive dynamic-allocation boosts for
+spectral peaks. RFC 7845 pre-skip and granule positions include the
+measured 120-sample CELT overlap delay; `finish()` flushes the delayed
+tail so decoders recover the exact original sample count. Remaining:
+SILK/hybrid encoding and psychoacoustic-model tuning, tracked in
+[`todo.md`](../todo.md) at the repository root.
 
 ## License
 
