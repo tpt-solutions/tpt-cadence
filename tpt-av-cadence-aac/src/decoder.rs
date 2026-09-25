@@ -250,6 +250,16 @@ pub struct AacDecoder {
     pce_class_counts: [usize; 4],
     /// Output permutation for PCE streams (sniffed WAV order).
     pce_out_order: [u8; MAX_CHANNELS],
+    /// Per-element index within its own type (SCE/CPE/LFE), counted in
+    /// SNIFFED OUTPUT-POSITION order rather than PCE declaration order.
+    /// Mirrors the reference decoder's `id_map`/`iid`: `ff_aac_output_
+    /// configure` reorders elements by `sniff_channel_order` BEFORE
+    /// assigning `ac->che[type][iid]` slots, and `apply_channel_coupling`
+    /// then matches a CCE's `id_select` against that `iid` — NOT against
+    /// the element's declared instance tag. So CCE coupling targets must
+    /// be resolved the same (arguably buggy, but reference-matching) way:
+    /// by this sniffed-order index, not by `BlockElem::tag`.
+    pce_plan_iid: [u8; MAX_CHANNELS],
 
     channels_state: Vec<ChannelState>,
     spectral_books: Vec<HuffmanTable>,
@@ -537,6 +547,7 @@ impl AacDecoder {
             pce_plan_len: pce_plan.map_or(0, |p| p.len()),
             pce_class_counts,
             pce_out_order: [0; MAX_CHANNELS],
+            pce_plan_iid: [0; MAX_CHANNELS],
             channels_state,
             spectral_books,
             sf_book,
@@ -1161,12 +1172,15 @@ impl AacDecoder {
             for (ci, cce) in self.cces.iter().enumerate().take(2) {
                 if cce.coupled {
                     eprintln!(
-                        "frame {} cce{ci}: point={} num_coupled={} targets={:?} gains0..6={:?} coeff_rms={:.2} out_rms={:.4} corr_ch0={:.4}",
+                        "frame {} cce{ci}: point={} num_coupled={} ty={:?} id_select={:?} ch_select={:?} num_gain={} per_target_gain={:?} coeff_rms={:.2} out_rms={:.4} corr_ch0={:.4}",
                         self.frame_count,
                         cce.coupling_point,
                         cce.num_coupled,
                         &cce.ty[..=cce.num_coupled],
-                        &cce.gain[..6],
+                        &cce.id_select[..=cce.num_coupled],
+                        &cce.ch_select[..=cce.num_coupled],
+                        cce.num_gain,
+                        (0..cce.num_gain).map(|c| cce.gain[c * 512]).collect::<Vec<_>>(),
                         {
                             let s: f64 = cce.state.coeffs.iter().take(1024).map(|&x| (x * x) as f64).sum();
                             (s / 1024.0).sqrt()
@@ -1419,6 +1433,17 @@ impl AacDecoder {
     /// time-domain), mirroring the reference dispatcher's gain indexing.
     fn apply_coupling(&mut self, target: &BlockElem, point: u8) {
         let target_ty = target.element_type;
+        // A CCE's id_select is matched against the target's PCE `iid`
+        // (see `pce_plan_iid`'s doc comment), not its declared tag, for
+        // PCE-configured streams; default channel configurations have no
+        // reordering, so `iid == tag` there and matching by tag is
+        // equivalent.
+        let target_id = if self.pce_plan_len > 0 {
+            self.pce_iid_for(target_ty == CPE as u8, target.tag as u32)
+                .unwrap_or(target.tag)
+        } else {
+            target.tag
+        };
         for ci in 0..self.cces.len() {
             let (coupled, cce_point) = (self.cces[ci].coupled, self.cces[ci].coupling_point);
             if !coupled || cce_point != point {
@@ -1431,7 +1456,7 @@ impl AacDecoder {
                     self.cces[ci].id_select[c],
                     self.cces[ci].ch_select[c],
                 );
-                if ty == target_ty && id == target.tag {
+                if ty == target_ty && id == target_id {
                     if sel != 1 {
                         self.apply_coupling_method(target.ch, ci, index, point);
                         if sel != 0 {
@@ -1539,6 +1564,20 @@ impl AacDecoder {
                 "channel element tag {tag} is not in the program configuration"
             ))
         })
+    }
+
+    /// Resolves a channel element's declared tag to its `pce_plan_iid`
+    /// (see that field's doc comment) for CCE target matching. `None` if
+    /// no plan entry of the given type declares this tag.
+    fn pce_iid_for(&self, want_cpe: bool, tag: u32) -> Option<u8> {
+        let want_type = if want_cpe { PCE_CPE } else { PCE_SCE };
+        let mut found = None;
+        for i in 0..self.pce_plan_len {
+            if self.pce_plan_type[i] == want_type && self.pce_plan_tag[i] as u32 == tag {
+                found = Some(self.pce_plan_iid[i]);
+            }
+        }
+        found
     }
 
     /// program_config_element (ISO/IEC 14496-3 4.4.4). Channel
@@ -1730,6 +1769,18 @@ impl AacDecoder {
             }
         }
         let mut out_slot = 0usize;
+        // Reference `ff_aac_output_configure`: `id_map[type][tag] =
+        // type_counts[type]++` walks the layout_map in this SAME
+        // sniffed/sorted order (not PCE declaration order), assigning each
+        // element a per-type sequential index ("iid"). CCE coupling
+        // (`apply_channel_coupling`) then matches a target by THIS index,
+        // not by its declared tag — see `pce_plan_iid`'s doc comment.
+        let mut type_counts = [0u8; 3];
+        for &(_pos, entry) in order.iter().take(self.pce_plan_len) {
+            let ty = self.pce_plan_type[entry as usize] as usize;
+            self.pce_plan_iid[entry as usize] = type_counts[ty];
+            type_counts[ty] += 1;
+        }
         for &(_pos, entry) in order.iter().take(self.pce_plan_len) {
             let chan = self.pce_plan_chan[entry as usize] as usize;
             if out_slot >= MAX_CHANNELS {
@@ -1744,12 +1795,13 @@ impl AacDecoder {
         }
         if self.fate_trace {
             eprintln!(
-                "PCE computed: len={} classes={:?} types={:?} tags={:?} chans={:?} positions={:?} out={:?}",
+                "PCE computed: len={} classes={:?} types={:?} tags={:?} chans={:?} iids={:?} positions={:?} out={:?}",
                 self.pce_plan_len,
                 self.pce_class_counts,
                 &self.pce_plan_type[..self.pce_plan_len],
                 &self.pce_plan_tag[..self.pce_plan_len],
                 &self.pce_plan_chan[..self.pce_plan_len],
+                &self.pce_plan_iid[..self.pce_plan_len],
                 &positions[..self.pce_plan_len],
                 &self.pce_out_order[..self.channels.max(1)]
             );
