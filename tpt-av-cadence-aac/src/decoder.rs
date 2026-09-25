@@ -212,6 +212,13 @@ struct BlockElem {
     is_cpe: bool,
     element_type: u8,
     tag: u8,
+    /// True for the element's primary entry. A CPE occupies two
+    /// consecutive `block_channels` slots (one per channel) so per-channel
+    /// passes (TNS, IMDCT, staging) run for both; coupling application must
+    /// happen once per ELEMENT, so the second slot must not re-apply its
+    /// element's coupling (its `ch + 1` would spill onto the next element's
+    /// first channel or the LFE).
+    couples: bool,
 }
 
 /// AAC-LC decoder.
@@ -824,6 +831,7 @@ impl AacDecoder {
             is_cpe: false,
             element_type: SCE as u8,
             tag: 0,
+            couples: true,
         }; MAX_CHANNELS];
         let mut block_count = 0usize;
         // The last channel element seen (first channel, count, element id):
@@ -867,6 +875,7 @@ impl AacDecoder {
                             is_cpe: false,
                             element_type: id as u8,
                             tag: tag as u8,
+                            couples: true,
                         };
                         block_count += 1;
                         che_prev = Some((ch, 1, id));
@@ -943,6 +952,7 @@ impl AacDecoder {
                             is_cpe: true,
                             element_type: CPE as u8,
                             tag: tag as u8,
+                            couples: true,
                         };
                         block_count += 1;
                         block_channels[block_count] = BlockElem {
@@ -951,6 +961,7 @@ impl AacDecoder {
                             is_cpe: true,
                             element_type: CPE as u8,
                             tag: tag as u8,
+                            couples: false,
                         };
                         block_count += 1;
                         che_prev = Some((ch_l, 2, id));
@@ -1083,6 +1094,7 @@ impl AacDecoder {
             is_cpe: false,
             element_type: SCE as u8,
             tag: 0,
+            couples: true,
         }; MAX_CHANNELS];
         let mut decoded_count = 0usize;
         for el in &block_channels[..block_count] {
@@ -1128,24 +1140,56 @@ impl AacDecoder {
                     .copy_from(&self.channels_state[CCE_SCRATCH_CHANNEL]);
             }
         }
-        for el in &decoded[..decoded_count] {
-            let win = el.win;
-            self.apply_coupling(el, 0);
+        // One iteration per ELEMENT (a CPE's two per-channel slots are
+        // consumed together): the reference processes each channel element
+        // as a unit — BEFORE_TNS coupling, TNS on both channels,
+        // BETWEEN_TNS coupling, both IMDCTs, then AFTER_IMDCT coupling —
+        // and per-channel iteration would re-apply a CPE's coupling from
+        // its second slot (spilling `ch + 1` onto the next element's first
+        // channel) or, for independent coupling, lose the right-channel
+        // term to its own later IMDCT.
+        let mut idx = 0usize;
+        while idx < decoded_count {
+            let el = decoded[idx];
+            if el.couples {
+                self.apply_coupling(&el, 0);
+            }
             {
                 let state = &mut self.channels_state[el.ch];
                 tns::apply(
                     &state.tns,
                     &mut state.coeffs,
-                    win.num_windows,
-                    win.num_swb,
-                    win.swb_offsets(),
-                    win.tns_max_bands(),
-                    win.max_sfb,
+                    el.win.num_windows,
+                    el.win.num_swb,
+                    el.win.swb_offsets(),
+                    el.win.tns_max_bands(),
+                    el.win.max_sfb,
                 );
             }
-            self.apply_coupling(el, 1);
-            self.imdct_and_window(el.ch, &win);
-            self.apply_coupling(el, 3);
+            let second = el.is_cpe.then(|| decoded.get(idx + 1)).flatten();
+            if let Some(right) = second {
+                let state = &mut self.channels_state[right.ch];
+                tns::apply(
+                    &state.tns,
+                    &mut state.coeffs,
+                    right.win.num_windows,
+                    right.win.num_swb,
+                    right.win.swb_offsets(),
+                    right.win.tns_max_bands(),
+                    right.win.max_sfb,
+                );
+            }
+            if el.couples {
+                self.apply_coupling(&el, 1);
+            }
+            self.imdct_and_window(el.ch, &el.win);
+            if let Some(right) = second {
+                self.imdct_and_window(right.ch, &right.win);
+            }
+            if el.couples {
+                self.apply_coupling(&el, 3);
+            }
+            idx += if el.is_cpe { 2 } else { 1 };
         }
 
         // SBR enhancement: replaces the 1024-sample core output with 2048

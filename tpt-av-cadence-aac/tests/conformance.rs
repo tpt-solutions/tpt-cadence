@@ -970,20 +970,15 @@ fn fate_conformance_corpus() {
             ));
             continue;
         }
-        // Known-residual item, kept as a regression guard at its current
-        // fidelity while the remaining difference against FFmpeg is under
-        // investigation:
-        // - al07: multichannel CCE combination decodes with correct
-        //   structure and correlation but degraded quiet passages.
-        // (al06/al15/al22 previously carried reduced gates here; their low
-        // scores traced to the reference decode's `-ac` channel folding and
-        // to coupling channels being double-applied on refill-retried
-        // blocks — both fixed. al15 now clears the SNR gate comfortably but
-        // keeps a relaxed peak bound: its noise-fill passages show ~4e-5
-        // sample-level differences against FFmpeg that track float ulps in
-        // powf/accumulation, not any structural error.)
+        // al06/al07/al15/al22 previously carried reduced gates here (their
+        // scores were 1.5-53 dB across three fixed root causes: the
+        // reference decode's `-ac` channel folding, coupling channels being
+        // double-applied on refill-retried blocks, and per-channel instead
+        // of per-element coupling/TNS/IMDCT sequencing — see todo.md).
+        // Everything now passes the standard gate; al15 keeps a relaxed
+        // peak bound because its noise-fill passages differ from FFmpeg by
+        // float ulps in powf/accumulation (~4e-5) at 105.8 dB SNR.
         let gate = match name {
-            "al07_96" => (45.0, 0.01),
             "al15_44" => (100.0, 1e-4),
             _ => (100.0, 1e-5),
         };
