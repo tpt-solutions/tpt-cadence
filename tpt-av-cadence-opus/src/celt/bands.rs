@@ -465,16 +465,18 @@ fn compute_theta(
     })
 }
 
-/// Encode-side counterpart of [`compute_theta`], **scoped to mono bands**
-/// (`stereo == false` — matching this crate's current encoder milestone;
-/// see `todo.md`). Since `stereo` is always false here, only two of
-/// `compute_theta`'s three entropy-coding branches are reachable: the
-/// triangular-pdf path (`qn != 1`, `b0 <= 1`, matching this function's
-/// original non-transient-only scope) and the uniform pdf path (`qn != 1`,
-/// `b0 > 1` — the transient/short-block time-split case this session
-/// added; the `stereo && n > 2` step-coded path stays out of scope). The
-/// `qn == 1` fallthrough (`itheta` forced to 0, no bits) is unaffected by
-/// `b0` either way.
+/// Encode-side counterpart of [`compute_theta`]. Only two of
+/// `compute_theta`'s theta entropy-coding branches are reachable from the
+/// mono paths (triangular pdf for `b0 <= 1`, uniform pdf for `b0 > 1` — the
+/// transient/short-block time-split case); the `stereo && n > 2` step-coded
+/// branch mirrors the decoder's search the same way. The `qn == 1`
+/// fallthrough (`itheta` forced to 0, no theta bits) now also mirrors the
+/// decoder exactly: it is reached either naturally at tiny band budgets or
+/// forced by intensity stereo (`stereo && i >= ctx.intensity`), and in the
+/// stereo case the decoder *may* read the phase-inversion (`inv`) bit —
+/// exactly when `b > 2 << BITRES && ctx.remaining_bits > 2 << BITRES` — so
+/// the encoder writes that same bit, decided from the sign of the true
+/// mid/side correlation (Y = -X reconstructs anti-correlated channels).
 ///
 /// Unlike the decoder (which discovers `itheta` from the bitstream), the
 /// encoder derives it from the actual energy split between `x0` and `x1`
@@ -506,9 +508,15 @@ fn compute_theta_encode(
             QTHETA_OFFSET
         };
     let qn = compute_qn(n, *b, offset, pulse_cap, stereo);
+    // Intensity stereo forces the decoder's single-level branch (`qn = 1`,
+    // `itheta = 0`): only the mid is coded and the side is reconstructed as
+    // +/- the mid. Mirror the forcing exactly, or the encoder would emit
+    // theta bits the decoder never reads.
+    let qn = if stereo && i >= ctx.intensity { 1 } else { qn };
 
     let tell = enc.tell_frac();
     let mut level = 0i32;
+    let mut inv = false;
     if qn != 1 {
         let norm0: f64 = x0
             .iter()
@@ -528,20 +536,73 @@ fn compute_theta_encode(
         let theta_q14 = theta * (2.0 / std::f64::consts::PI) * 16384.0;
         level = (theta_q14 * qn as f64 / 16384.0).round() as i32;
         level = level.clamp(0, qn);
+        // Rotated-component snap (stereo only). The energy-optimal theta
+        // can still leave one ROTATED component with (near-)zero content —
+        // exactly dual-mono content at 45° codes a zero side band, exactly
+        // anti-phase content a zero mid band — and any band that receives
+        // k > 0 pulses decodes as a unit-norm shape scaled by the band
+        // energy, i.e. full-level noise in the empty component. When the
+        // (x0+x1)² / (x1−x0)² decomposition shows one component is
+        // negligible, snap to the matching extreme: itheta = 0 codes the
+        // shared signal once in the mid (the decoder reconstructs Y = +X),
+        // itheta = 16384 once in the side (mid = −side) — both strictly
+        // better for such content and cheaper in bits. The 1e-3 fraction
+        // only fires on (near-)exact degeneracy; ordinary stereo content
+        // keeps the energy-optimal theta.
+        if stereo {
+            let mut sum_e = 0f64;
+            let mut diff_e = 0f64;
+            for j in 0..n {
+                let a = x0[j] as f64;
+                let c = x1[j] as f64;
+                sum_e += (a + c) * (a + c);
+                diff_e += (c - a) * (c - a);
+            }
+            let total = sum_e + diff_e;
+            if total > 0.0 {
+                if diff_e <= total * 1e-3 {
+                    level = 0;
+                } else if sum_e <= total * 1e-3 {
+                    level = qn;
+                }
+            }
+        }
         if stereo && n > 2 {
             let p0 = 3i32;
             let x0_level = qn / 2;
             let ft = p0 * (x0_level + 1) + x0_level;
-            let (fl, fh) = if level <= x0_level {
+            // The decoder's step pdf: width `p0` per level up to `x0_level`,
+            // then width 1 per level above. Encoding the upper tail with
+            // width `p0` overruns `ft` and corrupts the arithmetic-coder
+            // state (found by the intensity round-trip test when the
+            // rotated-component snap first pushed levels into the tail).
+            let (fl, fs) = if level <= x0_level {
                 (p0 * level, p0)
             } else {
-                ((x0_level + 1) * p0 + level - x0_level - 1, p0)
+                ((x0_level + 1) * p0 + level - x0_level - 1, 1)
             };
-            enc.encode(fl as u32, (fl + fh) as u32, ft as u32);
+            enc.encode(fl as u32, (fl + fs) as u32, ft as u32);
         } else if stereo || b0 > 1 {
             enc.encode_uint(level as u32, (qn + 1) as u32);
         } else {
             encode_theta_triangular(enc, qn, level);
+        }
+    } else if stereo {
+        // qn == 1, stereo: no theta is coded, but the decoder reads the
+        // phase-inversion flag exactly when the band budget and the frame
+        // remainder both exceed 2 bits — so the encoder must write one in
+        // precisely those cases (and only those, or the streams desync).
+        // The bit's value is the encoder's choice: flip Y when the true
+        // channels are anti-correlated, since the decoder reconstructs
+        // Y = X before applying it.
+        if *b > 2 << BITRES && ctx.remaining_bits > 2 << BITRES {
+            let dot: f32 = x0.iter().zip(x1.iter()).map(|(&a, &c)| a * c).sum();
+            inv = dot < 0.0;
+            enc.encode_bit_logp(inv, 2);
+            // The decoder overrides the flag the same way after reading it.
+            if ctx.disable_inv {
+                inv = false;
+            }
         }
     }
     let itheta = celt_udiv((level * 16384) as u32, qn.max(1) as u32) as i32;
@@ -565,7 +626,7 @@ fn compute_theta_encode(
         delta = frac_mul16(((n - 1) << 7) as i32, bitexact_log2tan(iside, imid));
     }
     SplitCtx {
-        inv: false,
+        inv,
         imid,
         iside,
         delta,
@@ -1362,6 +1423,13 @@ fn quant_band_stereo_encode<'a>(
         let a = x[1] * mid;
         x[1] = a - y[1] * side;
         y[1] += a;
+        // Phase inversion (intensity stereo): mirror the decoder's
+        // post-resynthesis Y flip.
+        if split.inv {
+            for v in y.iter_mut() {
+                *v = -*v;
+            }
+        }
         return cm;
     }
     let mut mbits = 0.max(b.min((b - split.delta) / 2));
@@ -1445,6 +1513,13 @@ fn quant_band_stereo_encode<'a>(
         (mid_cm, side_cm)
     };
     stereo_merge(x, y, mid);
+    // Phase inversion (intensity stereo): mirror the decoder, which flips Y
+    // after the mid/side resynthesis.
+    if split.inv {
+        for v in y.iter_mut() {
+            *v = -*v;
+        }
+    }
     mid_cm | side_cm
 }
 
@@ -1961,9 +2036,13 @@ pub(crate) fn quant_all_bands(
 }
 
 /// Encode-side counterpart of [`quant_all_bands`] for CELT-only frames. For
-/// stereo, `dual_stereo == false` selects the joint M/S path; mono retains
-/// the existing single-band path. The allocation policy is supplied by the
-/// caller so the signal and the emitted band layout cannot diverge.
+/// stereo, `dual_stereo == false` selects the joint M/S path and
+/// `intensity` (the value the allocation encoder wrote to the bitstream —
+/// pass `alloc.alloc.intensity`, so encoder and decoder agree) forces
+/// `theta = 0` mid-only coding with Y = ±X reconstruction from band
+/// `intensity` onward. Mono retains the existing single-band path. The
+/// allocation policy is supplied by the caller so the signal and the
+/// emitted band layout cannot diverge.
 ///
 /// `x`/`norm`/`scratch`/`htmp`/`iy`/`collapse_masks` have the same shapes
 /// and roles as in [`quant_all_bands`]: `x` is `n_total` samples per channel
@@ -1978,6 +2057,7 @@ pub(crate) fn quant_all_bands_encode(
     x: &mut [f32],
     stereo: bool,
     dual_stereo: bool,
+    intensity: usize,
     collapse_masks: &mut [u8],
     pulses: &[i32],
     short_blocks: bool,
@@ -2018,7 +2098,7 @@ pub(crate) fn quant_all_bands_encode(
     let mut update_lowband = true;
     let mut ctx = BandCtx {
         i: start,
-        intensity: 0,
+        intensity,
         spread,
         tf_change: 0,
         remaining_bits: 0,
@@ -2646,7 +2726,7 @@ mod encode_tests {
         let mut enc = RangeEncoder::new();
         let alloc_bits = ((data_len as i32 * 8) << 3) - enc.tell_frac() as i32 - 1;
         let alloc = compute_allocation_encode(
-            start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 1, &mut enc,
+            start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 1, NB_EBANDS, &mut enc,
         );
         let total_bits_q = (data_len as i32 * 8) * 8;
         let mut x_enc = target.clone();
@@ -2664,6 +2744,7 @@ mod encode_tests {
             &mut x_enc,
             false,
             true,
+            alloc.alloc.intensity,
             &mut collapse_masks_enc,
             &alloc.pulses,
             false,
@@ -2791,7 +2872,7 @@ mod encode_tests {
         let mut enc = RangeEncoder::new();
         let alloc_bits = ((data_len as i32 * 8) << 3) - enc.tell_frac() as i32 - 1;
         let alloc = compute_allocation_encode(
-            start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 2, &mut enc,
+            start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 2, NB_EBANDS, &mut enc,
         );
         let total_bits_q = (data_len as i32 * 8) * 8;
         let mut x_enc = vec![0.0f32; 2 * full_n];
@@ -2811,6 +2892,7 @@ mod encode_tests {
             &mut x_enc,
             true,
             false,
+            alloc.alloc.intensity,
             &mut collapse_masks_enc,
             &alloc.pulses,
             false,
@@ -2891,5 +2973,214 @@ mod encode_tests {
         let norm_d: f32 = x_dec[..band_n].iter().map(|v| v * v).sum::<f32>().sqrt();
         let corr = dot / (norm_t * norm_d).max(1e-12);
         assert!(corr > 0.7, "normalized correlation too low: corr={corr}");
+    }
+
+    /// Intensity stereo round trip: both channels carry per-band-normalized
+    /// content that is *identical* (dual mono) or *anti-phase* (y = -x), the
+    /// allocation encoder is told to engage intensity from band 8, and the
+    /// result must decode — through the trusted `compute_allocation` +
+    /// `quant_all_bands` pair — to a spectrum bit-identical to the encoder's
+    /// own reconstruction, with the decoder's channel 1 recovering ±channel
+    /// 0 in the intensity region (Y = ±X) and the `inv` flag selecting the
+    /// sign that matches the true side channel.
+    #[test]
+    fn quant_all_bands_encode_intensity_stereo_round_trips_through_decoder() {
+        use crate::celt::rate::{compute_allocation, compute_allocation_encode, init_caps};
+
+        let lm = 3i32;
+        let m = 1usize << lm;
+        let start = 0usize;
+        let end = NB_EBANDS;
+        let data_len = 320usize;
+        let chosen_intensity = 8usize;
+        let offsets = [0i32; NB_EBANDS];
+        let cap = init_caps(lm as usize, 2);
+        let alloc_trim = 5i32;
+
+        let full_n = m * 120;
+        let band_n = m * EBAND5MS[end] as usize;
+        for &antiphase in &[false, true] {
+            let mut seed = 0x5EED_5EEDu64;
+            let mut target0 = vec![0.0f32; band_n];
+            for v in target0.iter_mut() {
+                *v = lcg_next(&mut seed);
+            }
+            // Per-band unit normalization, matching the real CeltEncoder's
+            // `x_spec` (see the silent-channel test above for why).
+            for i in start..end {
+                let band = m * EBAND5MS[i] as usize..m * EBAND5MS[i + 1] as usize;
+                let norm: f32 = target0[band.clone()]
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    .sqrt();
+                if norm > 1e-10 {
+                    for v in target0[band].iter_mut() {
+                        *v /= norm;
+                    }
+                }
+            }
+            let mut target1 = target0.clone();
+            if antiphase {
+                for v in target1.iter_mut() {
+                    *v = -*v;
+                }
+            }
+
+            // --- Encode ---
+            let mut enc = RangeEncoder::new();
+            let alloc_bits = ((data_len as i32 * 8) << 3) - enc.tell_frac() as i32 - 1;
+            let alloc = compute_allocation_encode(
+                start,
+                end,
+                &offsets,
+                &cap,
+                alloc_trim,
+                alloc_bits,
+                lm,
+                2,
+                chosen_intensity,
+                &mut enc,
+            );
+            // The request is inside the legal window at this budget, so the
+            // bitstream must carry exactly the requested intensity point.
+            assert_eq!(
+                alloc.alloc.intensity, chosen_intensity,
+                "intensity request should survive the clamp (antiphase={antiphase})"
+            );
+            let total_bits_q = (data_len as i32 * 8) * 8;
+            let mut x_enc = vec![0.0f32; 2 * full_n];
+            x_enc[..band_n].copy_from_slice(&target0);
+            x_enc[full_n..full_n + band_n].copy_from_slice(&target1);
+            let mut collapse_masks_enc = vec![0u8; end * 2];
+            let mut norm_enc = vec![0.0f32; 2 * full_n];
+            let mut scratch = vec![0.0f32; 256];
+            let mut htmp = vec![0.0f32; 256];
+            let mut iy = vec![0i32; 256];
+            let mut rng_seed = 0x1357_9BDFu32;
+            let tf_res_enc = [0i32; NB_EBANDS];
+            quant_all_bands_encode(
+                &mut enc,
+                start,
+                end,
+                &mut x_enc,
+                true,
+                false,
+                alloc.alloc.intensity,
+                &mut collapse_masks_enc,
+                &alloc.pulses,
+                false,
+                SPREAD_NORMAL,
+                &tf_res_enc,
+                total_bits_q,
+                alloc.alloc.balance,
+                lm as usize,
+                alloc.alloc.coded_bands,
+                &mut rng_seed,
+                false,
+                &mut norm_enc,
+                &mut scratch,
+                &mut htmp,
+                &mut iy,
+            );
+            let final_seed_enc = rng_seed;
+            let frame = enc.done();
+
+            // --- Decode (trusted path) ---
+            let mut dec = RangeDecoder::new(&frame);
+            let dec_alloc = compute_allocation(
+                start, end, &offsets, &cap, alloc_trim, alloc_bits, lm, 2, &mut dec,
+            )
+            .unwrap();
+            assert_eq!(dec_alloc.alloc.intensity, chosen_intensity);
+            let mut x_dec = vec![0.0f32; 2 * full_n];
+            let mut collapse_masks_dec = vec![0u8; end * 2];
+            let mut norm_dec = vec![0.0f32; 2 * full_n];
+            let mut rng_seed_dec = 0x1357_9BDFu32;
+            quant_all_bands(
+                &mut dec,
+                start,
+                end,
+                &mut x_dec,
+                true,
+                &mut collapse_masks_dec,
+                &dec_alloc.pulses,
+                false,
+                SPREAD_NORMAL,
+                dec_alloc.alloc.dual_stereo,
+                dec_alloc.alloc.intensity,
+                &[0i32; NB_EBANDS],
+                total_bits_q,
+                dec_alloc.alloc.balance,
+                lm as usize,
+                dec_alloc.alloc.coded_bands,
+                &mut rng_seed_dec,
+                false,
+                &mut norm_dec,
+                &mut scratch,
+                &mut htmp,
+                &mut iy,
+            )
+            .unwrap();
+
+            let ctx = format!("antiphase={antiphase}");
+            assert_eq!(
+                alloc.alloc.coded_bands, dec_alloc.alloc.coded_bands,
+                "coded_bands mismatch: {ctx}"
+            );
+            assert_eq!(
+                alloc.alloc.dual_stereo, dec_alloc.alloc.dual_stereo,
+                "dual_stereo mismatch: {ctx}"
+            );
+            assert_eq!(alloc.ebits, dec_alloc.ebits, "ebits mismatch: {ctx}");
+            assert_eq!(
+                alloc.pulses, dec_alloc.pulses,
+                "pulse allocation mismatch: {ctx}"
+            );
+            assert_eq!(x_enc, x_dec, "final spectrum mismatch: {ctx}");
+            assert_eq!(
+                collapse_masks_enc, collapse_masks_dec,
+                "collapse masks: {ctx}"
+            );
+            assert_eq!(final_seed_enc, rng_seed_dec, "RNG seed: {ctx}");
+
+            // Channel 0 reconstruction still tracks its target…
+            let dot0: f32 = target0
+                .iter()
+                .zip(x_dec[..band_n].iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let norm_t: f32 = target0.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let norm_d: f32 = x_dec[..band_n].iter().map(|v| v * v).sum::<f32>().sqrt();
+            let corr0 = dot0 / (norm_t * norm_d).max(1e-12);
+            assert!(
+                corr0 > 0.7,
+                "channel 0 correlation too low: corr={corr0}: {ctx}"
+            );
+            // …and channel 1 tracks ±channel 0 with the expected sign in the
+            // intensity region (the encoder picked `inv` from the true
+            // mid/side correlation, so the anti-phase case must come out
+            // flipped).
+            let mut dot_xy = 0f32;
+            let mut ex = 0f32;
+            let mut ey = 0f32;
+            for j in m * EBAND5MS[chosen_intensity] as usize..band_n {
+                dot_xy += x_dec[j] * x_dec[full_n + j];
+                ex += x_dec[j] * x_dec[j];
+                ey += x_dec[full_n + j] * x_dec[full_n + j];
+            }
+            let corr_xy = dot_xy / (ex.sqrt() * ey.sqrt()).max(1e-12);
+            if antiphase {
+                assert!(
+                    corr_xy < -0.5,
+                    "anti-phase side should reconstruct as -mid: corr={corr_xy}"
+                );
+            } else {
+                assert!(
+                    corr_xy > 0.5,
+                    "dual-mono side should reconstruct as +mid: corr={corr_xy}"
+                );
+            }
+        }
     }
 }

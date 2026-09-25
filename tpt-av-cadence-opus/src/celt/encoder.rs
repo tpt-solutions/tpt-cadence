@@ -59,16 +59,25 @@
 //!   an improvement over leaving it off, since this encoder does not (yet)
 //!   analyze whether collapse is actually likely per frame.
 //!
-//! ## Stereo (this session)
+//! ## Stereo
 //!
-//! Stereo policy: **joint mid/side (M/S) band coding for stereo** — no
-//! intensity stereo. The allocation encoder signals `dual_stereo = false`
-//! for stereo, and the band quantizer emits the decoder-compatible theta
-//! split followed by mid/side quantization and reconstruction. Pre-emphasis,
-//! the MDCT analysis, and the per-band energy split all run once per channel
-//! (deinterleaving `channels`-wide input PCM into independent per-channel
-//! sample/MDCT-tail/spectrum state); the coarse/fine/finalise energy
-//! quantizers already support the channel-count parameter.
+//! Stereo policy: **joint mid/side (M/S) band coding, with intensity stereo
+//! for the high bands of channel-similar content**. The allocation encoder
+//! signals `dual_stereo = false` for stereo, and the band quantizer emits
+//! the decoder-compatible theta split followed by mid/side quantization and
+//! reconstruction. On top of that, an analysis-driven intensity decision
+//! (see `encode_frame_impl`) walks the bands from the top down and hands
+//! contiguous high bands to intensity coding (Y = ±X, phase discarded)
+//! while both channels carry real, coherent, level-matched energy — the
+//! classic "high-frequency phase doesn't localize" saving for effectively
+//! centered content, which frees the theta/side bits for quality elsewhere.
+//! The chosen point is written into the bitstream through the allocation's
+//! `ec_enc_uint` intensity field, so the decoder engages exactly where the
+//! encoder did. Pre-emphasis, the MDCT analysis, and the per-band energy
+//! split all run once per channel (deinterleaving `channels`-wide input PCM
+//! into independent per-channel sample/MDCT-tail/spectrum state); the
+//! coarse/fine/finalise energy quantizers already support the channel-count
+//! parameter.
 
 use super::bands::{quant_all_bands_encode, TF_SELECT_TABLE};
 use super::decoder::{OVERLAP, SPREAD_ICDF_TBL, TRIM_ICDF};
@@ -194,6 +203,11 @@ pub struct CeltEncoder {
     /// tests (and callers debugging encode-side behavior) can inspect the
     /// detector's decision without re-parsing the emitted TOC/bitstream.
     last_is_transient: bool,
+    /// First band index handed to intensity stereo by the most recent
+    /// [`CeltEncoder::encode_frame`] call (stereo only; `NB_EBANDS` when
+    /// intensity did not engage). This is the pre-clamp *request* — the
+    /// value written to the bitstream may be clamped up to `coded_bands`.
+    last_intensity: usize,
 }
 
 impl CeltEncoder {
@@ -220,6 +234,7 @@ impl CeltEncoder {
             preemph_mem: [0.0; 2],
             mdct_scratch: [Cpx::default(); N4_MAX],
             last_is_transient: false,
+            last_intensity: NB_EBANDS,
         }
     }
 
@@ -227,6 +242,13 @@ impl CeltEncoder {
     /// `is_transient` in the emitted bitstream.
     pub fn last_is_transient(&self) -> bool {
         self.last_is_transient
+    }
+
+    /// First band handed to intensity stereo by the most recent
+    /// [`CeltEncoder::encode_frame`] call (`NB_EBANDS` when intensity did
+    /// not engage). Mono encoders always report `NB_EBANDS`.
+    pub fn last_intensity(&self) -> usize {
+        self.last_intensity
     }
 
     /// Number of PCM samples per channel [`CeltEncoder::encode_frame`]
@@ -438,6 +460,73 @@ impl CeltEncoder {
             }
         }
 
+        // --- Intensity stereo decision (stereo only) ---
+        // From the top band downward, hand contiguous bands to intensity
+        // coding (the decoder reconstructs Y = ±X there — phase information
+        // is discarded) while every band holds real energy in BOTH channels
+        // with high |coherence| between the normalized spectra and similar
+        // per-band level. The level gate keeps hard-panned/quiet-side
+        // content out of intensity coding (replacing a -100 dB channel with
+        // a full-level ±mid would be a real regression, not a saving);
+        // the coherence gate keeps genuinely wide-band stereo content M/S
+        // coded, which is where joint coding earns its keep. Bands below
+        // INTENSITY_MIN_BAND always stay M/S: low-frequency phase carries
+        // real spatial information (and mono-compatible downmixes depend on
+        // it). The value is only a *request* — `compute_allocation_encode`
+        // clamps it into the decoder's `[start, coded_bands]` window before
+        // writing it to the bitstream.
+        let chosen_intensity = if stereo {
+            const INTENSITY_MIN_BAND: usize = 8;
+            const INTENSITY_MIN_COHERENCE: f64 = 0.95;
+            const INTENSITY_MAX_LEVEL_GAP_DB: f64 = 6.0;
+            let mut k = NB_EBANDS;
+            let mut engaged = false;
+            while k > INTENSITY_MIN_BAND {
+                let band = m * EBAND5MS[k - 1] as usize..m * EBAND5MS[k] as usize;
+                let mut e0 = 0f64;
+                let mut e1 = 0f64;
+                let mut dot = 0f64;
+                for idx in band.clone() {
+                    dot += x_spec[idx] as f64 * x_spec[n2 + idx] as f64;
+                    e0 += x_spec[idx] as f64 * x_spec[idx] as f64;
+                    e1 += x_spec[n2 + idx] as f64 * x_spec[n2 + idx] as f64;
+                }
+                // Each active channel's normalized band has unit energy, so
+                // `denom` is ~1 when both channels are active and ~0 when
+                // either band is silent.
+                let denom = (e0 * e1).sqrt();
+                if denom <= 0.5 {
+                    // Silent in at least one channel: intensity is neutral
+                    // there (Y = ±X of silence is silence), so the walk
+                    // continues through it without engaging on its own.
+                    k -= 1;
+                    continue;
+                }
+                // e_means' frequency tilt cancels in the per-band difference.
+                let level_gap_db = (means[k - 1] - means[NB_EBANDS + k - 1]) as f64 * 6.0206;
+                let coherent = (dot / denom).abs() >= INTENSITY_MIN_COHERENCE
+                    && level_gap_db.abs() <= INTENSITY_MAX_LEVEL_GAP_DB;
+                if !coherent {
+                    // First active band that can't be intensity-coded stops
+                    // the walk; the region decided so far (k..end) stands.
+                    break;
+                }
+                engaged = true;
+                k -= 1;
+            }
+            // Only engage if at least one band with real two-channel energy
+            // actually qualified — content whose intensity region is entirely
+            // silent gains nothing from the intensity point.
+            if engaged {
+                k
+            } else {
+                NB_EBANDS
+            }
+        } else {
+            NB_EBANDS
+        };
+        self.last_intensity = chosen_intensity;
+
         // --- Bitstream ---
         let mut enc = RangeEncoder::new();
 
@@ -576,7 +665,16 @@ impl CeltEncoder {
         };
         bits -= anti_collapse_rsv;
         let alloc = compute_allocation_encode(
-            0, NB_EBANDS, &offsets, &cap, alloc_trim, bits, lm as i32, channels, &mut enc,
+            0,
+            NB_EBANDS,
+            &offsets,
+            &cap,
+            alloc_trim,
+            bits,
+            lm as i32,
+            channels,
+            chosen_intensity,
+            &mut enc,
         );
 
         quant_fine_energy(
@@ -602,6 +700,7 @@ impl CeltEncoder {
             &mut x_spec[..channels * n2],
             stereo,
             alloc.alloc.dual_stereo,
+            alloc.alloc.intensity,
             &mut collapse_masks[..NB_EBANDS * channels],
             &alloc.pulses,
             is_transient,
@@ -1541,6 +1640,220 @@ mod tests {
                 .sqrt();
             eprintln!(
                 "{label}: best_snr={best_snr:.2} dB orig_rms={orig_rms:.4} dec_rms={dec_rms:.4}"
+            );
+        }
+    }
+
+    /// End-to-end intensity stereo, dual-mono content: identical content in
+    /// both channels is exactly what the intensity decision exists for
+    /// (every active band coherent, level-matched), so the encoder must
+    /// (a) actually engage intensity in the high bands, (b) produce a
+    /// bitstream the trusted decoder accepts, and (c) reconstruct both
+    /// channels faithfully — the side channel is rebuilt as +mid in the
+    /// intensity region, so a dual-mono source comes back dual-mono rather
+    /// than collapsed or decorrelated. The probe is a sum of tones spread
+    /// across the spectrum so the high bands (where intensity engages) carry
+    /// real energy, at a bitrate where CELT can code tonal content well.
+    #[test]
+    fn encode_then_decode_dual_mono_engages_intensity_stereo() {
+        let mut enc = CeltEncoder::new(2, LM);
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
+        let bytes_per_frame = 320;
+
+        // Tones spanning bands ~1 to ~19 (500 Hz .. 14 kHz), so the
+        // coherence walk finds active, coherent bands above band 8.
+        const FREQS: [f32; 5] = [500.0, 2_000.0, 5_000.0, 9_000.0, 14_000.0];
+        let mut phases = [0.0f32; FREQS.len()];
+        let mut next = |ch: usize| {
+            let mut s = 0.0f32;
+            for (f, p) in FREQS.iter().zip(phases.iter_mut()) {
+                s += 0.12 * p.sin();
+                *p += 2.0 * std::f32::consts::PI * f / 48_000.0;
+            }
+            let _ = ch;
+            s
+        };
+
+        let mut original = Vec::new();
+        let mut decoded_l = Vec::new();
+        let mut decoded_r = Vec::new();
+        let mut engaged = 0;
+        for _ in 0..8 {
+            let mut pcm_in = vec![0.0f32; N2 * 2];
+            for frame in pcm_in.chunks_mut(2) {
+                let s = next(0);
+                frame[0] = s;
+                frame[1] = s; // dual mono
+            }
+            original.extend_from_slice(&pcm_in);
+            let packet_bytes = enc.encode_frame(&pcm_in, bytes_per_frame);
+            if enc.last_intensity() < NB_EBANDS {
+                engaged += 1;
+            }
+            let packet = parse_packet(&packet_bytes).unwrap();
+            let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &packet, &packet_bytes, &mut pcm_out).unwrap();
+            decoded_l.extend(pcm_out.chunks(OUTPUT_CHANNELS).map(|c| c[0]));
+            decoded_r.extend(pcm_out.chunks(OUTPUT_CHANNELS).map(|c| c[1]));
+        }
+        assert!(
+            engaged >= 6,
+            "dual-mono content should engage intensity stereo in nearly every frame \
+             (engaged {engaged}/8)"
+        );
+
+        // Both decoded channels must track the (shared) source with solid
+        // fidelity: intensity trades phase for bits, and a dual-mono source
+        // has no phase structure to lose.
+        let snr = |decoded: &[f32]| -> f64 {
+            let skip = N2 * 2;
+            let mut best = f64::NEG_INFINITY;
+            for delay in 0..150i32 {
+                let sig: f64 = original[skip..]
+                    .iter()
+                    .step_by(2)
+                    .map(|&v| (v as f64) * (v as f64))
+                    .sum();
+                let err: f64 = original[skip..]
+                    .iter()
+                    .step_by(2)
+                    .enumerate()
+                    .map(|(i, &a)| {
+                        let di = skip as i32 + i as i32 - delay;
+                        let b = if di >= 0 && (di as usize) < decoded.len() {
+                            decoded[di as usize] as f64
+                        } else {
+                            0.0
+                        };
+                        (a as f64 - b) * (a as f64 - b)
+                    })
+                    .sum();
+                let snr = 10.0 * (sig / err.max(1e-12)).log10();
+                if snr > best {
+                    best = snr;
+                }
+            }
+            best
+        };
+        let snr_l = snr(&decoded_l);
+        let snr_r = snr(&decoded_r);
+        assert!(
+            snr_l > 8.0 && snr_r > 8.0,
+            "dual-mono per-channel SNR too low with intensity engaged: L={snr_l:.1} dB R={snr_r:.1} dB"
+        );
+
+        // And the two decoded channels must remain (near-)identical to each
+        // other — intensity reconstructs Y = +X here, and the M/S-coded low
+        // bands of identical content also reconstruct near-equally.
+        let mut dot = 0f64;
+        let mut el = 0f64;
+        let mut er = 0f64;
+        for (a, b) in decoded_l
+            .iter()
+            .skip(N2 * 2)
+            .zip(decoded_r.iter().skip(N2 * 2))
+        {
+            dot += (*a as f64) * (*b as f64);
+            el += (*a as f64) * (*a as f64);
+            er += (*b as f64) * (*b as f64);
+        }
+        let corr = dot / (el.sqrt() * er.sqrt()).max(1e-12);
+        assert!(corr > 0.98, "dual-mono channels diverged: corr={corr}");
+    }
+
+    /// End-to-end intensity stereo, anti-phase content (right = -left): the
+    /// per-band coherence is still ±1 with matched levels, so intensity must
+    /// engage, and the encoder must set the decoder's phase-inversion flag
+    /// so the side channel reconstructs as *minus* the mid. Without the
+    /// inversion the reconstruction would come out mono-summed (the
+    /// anti-phase signal would cancel to near-silence in a downmix), which
+    /// is exactly what the `inv` bit exists to prevent.
+    #[test]
+    fn encode_then_decode_antiphase_stereo_reconstructs_with_inversion() {
+        let mut enc = CeltEncoder::new(2, LM);
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
+        let bytes_per_frame = 320;
+
+        const FREQS: [f32; 5] = [500.0, 2_000.0, 5_000.0, 9_000.0, 14_000.0];
+        let mut phases = [0.0f32; FREQS.len()];
+        let mut next = || {
+            let mut s = 0.0f32;
+            for (f, p) in FREQS.iter().zip(phases.iter_mut()) {
+                s += 0.12 * p.sin();
+                *p += 2.0 * std::f32::consts::PI * f / 48_000.0;
+            }
+            s
+        };
+
+        let mut decoded_l = Vec::new();
+        let mut decoded_r = Vec::new();
+        let mut engaged = 0;
+        for _ in 0..8 {
+            let mut pcm_in = vec![0.0f32; N2 * 2];
+            for frame in pcm_in.chunks_mut(2) {
+                let s = next();
+                frame[0] = s;
+                frame[1] = -s; // anti-phase
+            }
+            let packet_bytes = enc.encode_frame(&pcm_in, bytes_per_frame);
+            if enc.last_intensity() < NB_EBANDS {
+                engaged += 1;
+            }
+            let packet = parse_packet(&packet_bytes).unwrap();
+            let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &packet, &packet_bytes, &mut pcm_out).unwrap();
+            decoded_l.extend(pcm_out.chunks(OUTPUT_CHANNELS).map(|c| c[0]));
+            decoded_r.extend(pcm_out.chunks(OUTPUT_CHANNELS).map(|c| c[1]));
+        }
+        assert!(
+            engaged >= 6,
+            "anti-phase content should engage intensity stereo (engaged {engaged}/8)"
+        );
+
+        // The right channel must correlate *negatively* with the left: the
+        // inversion flag preserved the anti-phase relationship.
+        let mut dot = 0f64;
+        let mut el = 0f64;
+        let mut er = 0f64;
+        for (a, b) in decoded_l
+            .iter()
+            .skip(N2 * 2)
+            .zip(decoded_r.iter().skip(N2 * 2))
+        {
+            dot += (*a as f64) * (*b as f64);
+            el += (*a as f64) * (*a as f64);
+            er += (*b as f64) * (*b as f64);
+        }
+        let corr = dot / (el.sqrt() * er.sqrt()).max(1e-12);
+        assert!(
+            corr < -0.5,
+            "anti-phase channels should stay anti-phase after decode: corr={corr}"
+        );
+    }
+
+    /// The intensity decision must NOT engage for hard-panned content (one
+    /// channel effectively silent): replacing a -114 dBFS channel with a
+    /// full-level ±mid would be a loudness regression, not a saving. Pins
+    /// the level-gap gate of the decision heuristic via the existing
+    /// hard-panned round-trip scenario.
+    #[test]
+    fn intensity_does_not_engage_for_hard_panned_content() {
+        let mut enc = CeltEncoder::new(2, LM);
+        let bytes_per_frame = 320;
+        let mut phase = 0.0f32;
+        for _ in 0..4 {
+            let mut pcm_in = vec![0.0f32; N2 * 2];
+            for frame in pcm_in.chunks_mut(2) {
+                let s = 0.5 * phase.sin();
+                frame[0] = s;
+                frame[1] = 2e-6 * phase.sin(); // -114 dBFS, but correlated
+                phase += 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            }
+            let _packet = enc.encode_frame(&pcm_in, bytes_per_frame);
+            assert_eq!(
+                enc.last_intensity(),
+                NB_EBANDS,
+                "level-mismatched channels must stay M/S coded"
             );
         }
     }

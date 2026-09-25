@@ -111,6 +111,7 @@ pub(crate) fn pulses2bits(band: usize, lm: i32, pulses: i32) -> i32 {
 }
 
 /// Interpolated allocation outcome for one band set.
+#[derive(Debug)]
 pub(crate) struct Allocation {
     pub coded_bands: usize,
     pub balance: i32,
@@ -362,12 +363,16 @@ fn interp_bits2pulses(
     })
 }
 
-/// Encode-side counterpart of [`interp_bits2pulses`]. The only encoder-specific
-/// decisions are the skip policy and the stereo mode. This implementation does
-/// not skip a band when a skip decision is available, and selects joint
-/// mid/side coding for stereo (`dual_stereo == false`) without intensity
-/// coupling. Mono is unaffected because the stereo parameters are not reserved
-/// for one channel.
+/// Encode-side counterpart of [`interp_bits2pulses`]. The encoder-specific
+/// decisions are the skip policy, the stereo mode, and the intensity point:
+/// this implementation does not skip a band when a skip decision is
+/// available, selects joint mid/side coding for stereo (`dual_stereo ==
+/// false`), and encodes `chosen_intensity` (clamped into the legal
+/// `[start, coded_bands]` window) as the same `ec_enc_uint` value the
+/// decoder reads back, so both sides' fine-bit DOF compensation and forced
+/// `qn` agree. `NB_EBANDS` is the "intensity never engages" choice (it
+/// clamps to `coded_bands`). Mono is unaffected because the stereo
+/// parameters are not reserved for one channel.
 ///
 /// Verified bit-for-bit against [`interp_bits2pulses`] (same `pulses`,
 /// `ebits`, `fine_priority`, and [`Allocation`] fields) in `tests` below.
@@ -389,6 +394,7 @@ fn interp_bits2pulses_encode(
     fine_priority: &mut [i32],
     c: usize,
     lm: i32,
+    chosen_intensity: usize,
     enc: &mut RangeEncoder,
 ) -> Allocation {
     let c_i = c as i32;
@@ -483,10 +489,13 @@ fn interp_bits2pulses_encode(
     debug_assert!(coded_bands > start);
 
     // Code the intensity and dual stereo parameters. The encoder uses joint
-    // mid/side coding for stereo (`dual_stereo == false`) and does not use
-    // intensity coupling.
+    // mid/side coding for stereo (`dual_stereo == false`) and encodes its
+    // chosen intensity point as the same `ec_enc_uint` value the decoder
+    // reads; the value is clamped to the `[start, coded_bands]` window the
+    // decoder's `ec_dec_uint` range allows.
     let intensity: usize = if intensity_rsv > 0 {
-        let value = (coded_bands - start) as u32;
+        let value = coded_bands.min(chosen_intensity.max(start)) - start;
+        let value = value as u32;
         enc.encode_uint(value, (coded_bands + 1 - start) as u32);
         start + value as usize
     } else {
@@ -816,6 +825,7 @@ pub(crate) fn compute_allocation_encode(
     total_bits: i32,
     lm: i32,
     c: usize,
+    chosen_intensity: usize,
     enc: &mut RangeEncoder,
 ) -> AllocationResult {
     let (total, skip_start, skip_rsv, intensity_rsv, dual_stereo_rsv, bits1, bits2, thresh) =
@@ -841,6 +851,7 @@ pub(crate) fn compute_allocation_encode(
         &mut fine_priority,
         c,
         lm,
+        chosen_intensity,
         enc,
     );
     AllocationResult {
@@ -923,50 +934,59 @@ mod tests {
         for &c in &[1usize, 2usize] {
             for lm in 0..4i32 {
                 for &total_bits in &[400i32, 1600, 6400, 16000] {
-                    let offsets = [0i32; NB_EBANDS];
-                    let cap = init_caps(lm as usize, c);
-                    let alloc_trim = 5i32;
+                    // Sweep the encoder's intensity choice, including values
+                    // below `start`, inside the legal window, and above
+                    // `coded_bands` (which must clamp to "never engages").
+                    // Mono ignores the choice entirely (no intensity bits
+                    // are reserved for one channel).
+                    for &chosen in &[0usize, 5usize, 12usize, NB_EBANDS] {
+                        let offsets = [0i32; NB_EBANDS];
+                        let cap = init_caps(lm as usize, c);
+                        let alloc_trim = 5i32;
 
-                    let mut enc = RangeEncoder::new();
-                    let enc_result = compute_allocation_encode(
-                        0, NB_EBANDS, &offsets, &cap, alloc_trim, total_bits, lm, c, &mut enc,
-                    );
-                    let frame = enc.done();
+                        let mut enc = RangeEncoder::new();
+                        let enc_result = compute_allocation_encode(
+                            0, NB_EBANDS, &offsets, &cap, alloc_trim, total_bits, lm, c, chosen,
+                            &mut enc,
+                        );
+                        let frame = enc.done();
 
-                    let mut dec = RangeDecoder::new(&frame);
-                    let dec_result = compute_allocation(
-                        0, NB_EBANDS, &offsets, &cap, alloc_trim, total_bits, lm, c, &mut dec,
-                    )
-                    .unwrap();
+                        let mut dec = RangeDecoder::new(&frame);
+                        let dec_result = compute_allocation(
+                            0, NB_EBANDS, &offsets, &cap, alloc_trim, total_bits, lm, c, &mut dec,
+                        )
+                        .unwrap();
 
-                    assert_eq!(
-                        enc_result.pulses, dec_result.pulses,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
-                    assert_eq!(
-                        enc_result.ebits, dec_result.ebits,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
-                    assert_eq!(
-                        enc_result.fine_priority, dec_result.fine_priority,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
-                    assert_eq!(
-                        enc_result.alloc.coded_bands, dec_result.alloc.coded_bands,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
-                    assert_eq!(
-                        enc_result.alloc.balance, dec_result.alloc.balance,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
-                    assert_eq!(
-                        enc_result.alloc.intensity, dec_result.alloc.intensity,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
-                    assert_eq!(
-                        enc_result.alloc.dual_stereo, dec_result.alloc.dual_stereo,
-                        "c={c} lm={lm} total_bits={total_bits}"
-                    );
+                        let ctx = format!("c={c} lm={lm} total_bits={total_bits} chosen={chosen}");
+                        assert_eq!(enc_result.pulses, dec_result.pulses, "{ctx}");
+                        assert_eq!(enc_result.ebits, dec_result.ebits, "{ctx}");
+                        assert_eq!(enc_result.fine_priority, dec_result.fine_priority, "{ctx}");
+                        assert_eq!(
+                            enc_result.alloc.coded_bands, dec_result.alloc.coded_bands,
+                            "{ctx}"
+                        );
+                        assert_eq!(enc_result.alloc.balance, dec_result.alloc.balance, "{ctx}");
+                        assert_eq!(
+                            enc_result.alloc.intensity, dec_result.alloc.intensity,
+                            "{ctx}"
+                        );
+                        // The clamp itself: a stereo request inside the legal
+                        // window and at or below coded_bands must round-trip
+                        // as exactly that value.
+                        if c == 2
+                            && (5..=12).contains(&chosen)
+                            && chosen <= enc_result.alloc.coded_bands
+                        {
+                            assert_eq!(
+                                enc_result.alloc.intensity, chosen,
+                                "clamped intensity should equal the request: {ctx}"
+                            );
+                        }
+                        assert_eq!(
+                            enc_result.alloc.dual_stereo, dec_result.alloc.dual_stereo,
+                            "{ctx}"
+                        );
+                    }
                 }
             }
         }
