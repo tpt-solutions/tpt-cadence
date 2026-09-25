@@ -282,6 +282,17 @@ pub struct AacDecoder {
     /// Doubling must happen exactly once regardless of how many channel
     /// elements carry SBR.
     sbr_rate_doubled: bool,
+    /// True once Parametric Stereo synthesis is active for this stream:
+    /// either the container signaled HE-AACv2 explicitly (ASC AOT 29) or
+    /// the first in-band PS payload was decoded for a mono stream (the
+    /// reference decoder's `m4ac.ps` flip in `decode_extension_payload`).
+    /// A mono core channel then synthesizes to a stereo output pair.
+    ps_signaled: bool,
+    /// True when the container explicitly configured PS (ASC AOT 5
+    /// disables it, AOT 29 enables it); only streams with unknown
+    /// signaling (ADTS, raw ASC AOT 2) may flip to PS output on the first
+    /// in-band SBR payload (reference `m4ac.ps == -1`).
+    ps_known: bool,
 
     /// M/S decision bits for the current common-window CPE (512 entries).
     ms_mask: Box<[bool]>,
@@ -344,11 +355,6 @@ impl AacDecoder {
         config: &AudioSpecificConfig,
         source: Box<dyn ByteSource>,
     ) -> Result<Self, CadenceError> {
-        if config.ps_signaled {
-            return Err(CadenceError::UnsupportedFeature(
-                "HE-AACv2 Parametric Stereo synthesis is not supported".to_string(),
-            ));
-        }
         let sample_rate = config.sample_rate()?;
         let mut decoder = Self::open_with_params(
             BufferedSource::new(source, 8192),
@@ -364,6 +370,19 @@ impl AacDecoder {
         if config.extension_sampling_frequency_index.is_some() {
             decoder.sbr_output_active = true;
             decoder.sbr_rate_doubled = true;
+        }
+        decoder.ps_known = true;
+        decoder.ps_signaled = config.ps_signaled;
+        if config.ps_signaled {
+            // HE-AACv2: the mono core is synthesized to a stereo output.
+            // The channel configuration is typically 1 (a single SCE); a
+            // CPE payload would already be stereo before PS applies, so
+            // the output count only grows for the mono case.
+            decoder.ps_signaled = true;
+            if decoder.channels == 1 {
+                decoder.channels = 2;
+                decoder.info.channels = 2;
+            }
         }
         Ok(decoder)
     }
@@ -509,6 +528,8 @@ impl AacDecoder {
             sbr_by_channel: std::array::from_fn(|_| None),
             sbr_output_active: false,
             sbr_rate_doubled: false,
+            ps_signaled: false,
+            ps_known: false,
             cces: (0..4)
                 .map(|_| CouplingChannel {
                     state: ChannelState::new(),
@@ -756,6 +777,9 @@ impl AacDecoder {
                     ));
                 }
                 let id = br.read_bits(3);
+                if std::env::var_os("FATE_TRACE").is_some() {
+                    eprintln!("frame {} element id={id} bitpos={}", self.frame_count, br.pos());
+                }
                 match id {
                     SCE | LFE => {
                         let tag = br.read_bits(4);
@@ -913,6 +937,32 @@ impl AacDecoder {
                                     count,
                                     id_type as usize,
                                 );
+                                sbr.ps_output = self.ps_signaled;
+                                if !self.ps_known
+                                    && !self.ps_signaled
+                                    && self.channels == 1
+                                    && id_type == 0
+                                {
+                                    // First in-band SBR payload in a mono
+                                    // stream whose container did not
+                                    // explicitly configure PS: the
+                                    // reference decoder treats the stream
+                                    // as HE-AACv2 and reconfigures its
+                                    // output as stereo ("treating HE-AAC
+                                    // mono as stereo"). Until a PS header
+                                    // actually arrives, synthesis
+                                    // duplicates the mono channel.
+                                    self.ps_signaled = true;
+                                    sbr.ps_output = true;
+                                    self.channels = 2;
+                                    self.info.channels = 2;
+                                    // The flip frame's own output is staged
+                                    // as stereo right after this; drop any
+                                    // pre-flip mono samples so the caller's
+                                    // channel interpretation stays coherent.
+                                    self.staged.clear();
+                                    self.staged_pos = 0;
+                                }
                                 self.sbr_output_active = true;
                                 if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
                                     FIL_SPANS.with(|s| {
@@ -1039,10 +1089,15 @@ impl AacDecoder {
                 let first = el.ch;
                 if decoded[..decoded_count].iter().any(|d| d.ch == first) {
                     let nch = count.min(2);
+                    let nch_out = usize::from(self.ps_signaled && nch == 1) + nch;
                     let mut core = [
                         self.channels_state[first].out.to_vec(),
                         if nch == 2 {
                             self.channels_state[first + 1].out.to_vec()
+                        } else if nch_out == 2 {
+                            // PS target channel: carries no core input,
+                            // only receives the synthesized output.
+                            vec![0.0f32; 2048]
                         } else {
                             Vec::new()
                         },
@@ -1050,8 +1105,9 @@ impl AacDecoder {
                     let id = if nch == 2 { 1 } else { 0 };
                     let sbr = self.sbr_by_channel[first]
                         .get_or_insert_with(|| Box::new(sbr::Sbr::new(id)));
+                    sbr.ps_output = self.ps_signaled;
                     sbr.apply(id, &mut core, nch);
-                    for (c, dst_ch) in (first..first + nch).enumerate() {
+                    for (c, dst_ch) in (first..first + nch_out).enumerate() {
                         let dst = &mut self.channels_state[dst_ch].out;
                         dst[..2048].copy_from_slice(&core[c][..2048]);
                     }
@@ -1060,6 +1116,63 @@ impl AacDecoder {
             }
         }
 
+        if std::env::var_os("FATE_TRACE").is_some() && self.frame_count < 6 {
+            for (i, el) in decoded[..decoded_count].iter().enumerate() {
+                eprintln!(
+                    "frame {} decoded[{i}]: ch={} is_cpe={} tag={}",
+                    self.frame_count, el.ch, el.is_cpe, el.tag
+                );
+            }
+            for (ci, cce) in self.cces.iter().enumerate().take(2) {
+                if cce.coupled {
+                    eprintln!(
+                        "frame {} cce{ci}: point={} num_coupled={} targets={:?} gains0..6={:?} coeff_rms={:.2} out_rms={:.4} corr_ch0={:.4}",
+                        self.frame_count,
+                        cce.coupling_point,
+                        cce.num_coupled,
+                        &cce.ty[..=cce.num_coupled],
+                        &cce.gain[..6],
+                        {
+                            let s: f64 = cce.state.coeffs.iter().take(1024).map(|&x| (x * x) as f64).sum();
+                            (s / 1024.0).sqrt()
+                        },
+                        {
+                            let s: f64 = cce.state.out.iter().take(1024).map(|&x| (x * x) as f64).sum();
+                            (s / 1024.0).sqrt()
+                        },
+                        {
+                            let n: f64 = cce.state.out.iter().zip(self.channels_state[0].out.iter()).take(1024)
+                                .map(|(&a, &b)| (a as f64) * (b as f64)).sum();
+                            let na: f64 = cce.state.out.iter().take(1024).map(|&x| (x * x) as f64).sum();
+                            let nb: f64 = self.channels_state[0].out.iter().take(1024).map(|&x| (x * x) as f64).sum();
+                            if na > 0.0 && nb > 0.0 { n / (na * nb).sqrt() } else { 0.0 }
+                        }
+                    );
+                }
+            }
+        }
+        if std::env::var_os("FATE_TRACE").is_some() && self.frame_count < 6 {
+            for ch in 0..self.channels {
+                let rms: f64 = self.channels_state[ch]
+                    .out
+                    .iter()
+                    .take(1024)
+                    .map(|&x| (x * x) as f64)
+                    .sum::<f64>()
+                    .sqrt();
+                eprintln!(
+                    "frame {} ch {ch}: out_rms={rms:.4} coeffs_rms={:.4}",
+                    self.frame_count,
+                    self.channels_state[ch]
+                        .coeffs
+                        .iter()
+                        .take(1024)
+                        .map(|&x| (x * x) as f64)
+                        .sum::<f64>()
+                        .sqrt()
+                );
+            }
+        }
         // Interleave into staging. For the fixed channel configurations the
         // output follows the WAV channel order: the bitstream carries
         // front-center first, while the convention is front pairs first
@@ -1086,6 +1199,9 @@ impl AacDecoder {
                 8 => Order::Borrowed(&[1, 2, 0, 7, 5, 6, 3, 4]),
                 _ => Order::Element,
             }
+        } else if self.ps_signaled && block_count == 1 && decoded_count == 1 && decoded[0].ch == 0 {
+            // HE-AACv2: the single mono SCE synthesizes to a stereo pair.
+            Order::Borrowed(&[0, 1])
         } else {
             Order::Element
         };
@@ -1330,13 +1446,20 @@ impl AacDecoder {
         }
         let gains: &[f32] = &self.cces[cce_idx].gain[gain_offset..gain_end];
         let dst = &mut self.channels_state[target_ch].coeffs;
+        // The CCE's window layout governs (reference `apply_dependent_
+        // coupling` iterates the CCE's groups/sfbs), and the window base
+        // ACCUMULATES across window groups: each group's windows live at
+        // `sum(group_len[..g]) * 128` in the 1024-sample coefficient
+        // array. Forgetting that advance used to pile every group's
+        // coupling onto the first window group on EIGHT_SHORT frames.
         let mut idx = 0usize;
+        let mut window_base = 0usize;
         for group_len_g in group_len.iter().take(num_groups) {
             for i in 0..max_sfb {
                 if band_types[idx] != ZERO_BT {
                     let gain = gains[idx];
                     for group in 0..*group_len_g {
-                        let base = group * 128 + offsets[i] as usize;
+                        let base = (window_base + group) * 128 + offsets[i] as usize;
                         let len = (offsets[i + 1] - offsets[i]) as usize;
                         for k in 0..len {
                             dst[base + k] += gain * src[base + k];
@@ -1345,6 +1468,7 @@ impl AacDecoder {
                 }
                 idx += 1;
             }
+            window_base += *group_len_g;
         }
     }
 
@@ -1569,7 +1693,14 @@ impl AacDecoder {
                 out_slot += 1;
             }
         }
-    }
+            if std::env::var_os("FATE_TRACE").is_some() {
+            eprintln!(
+                "PCE computed: len={} out={:?}",
+                self.pce_plan_len,
+                &self.pce_out_order[..self.channels.max(1)]
+            );
+        }
+}
 
     /// decode_ics_info (ISO/IEC 14496-3 Table 4.5).
     fn decode_ics_info(
@@ -1633,8 +1764,14 @@ impl AacDecoder {
         let state = &mut self.channels_state[ch];
         state.kb_window_prev = state.kb_window_cur;
         state.kb_window_cur = shape;
+        if std::env::var_os("FATE_TRACE").is_some() {
+            eprintln!(
+                "ics_info ch={ch} seq={sequence} groups={} max_sfb={}",
+                info.num_window_groups, info.max_sfb
+            );
+        }
         Ok(info)
-    }
+}
 
     /// individual_channel_stream: global_gain, [ics_info when not a
     /// common-window channel], section_data, scale_factor_data,
@@ -1653,8 +1790,21 @@ impl AacDecoder {
         };
         self.decode_band_types(br, ch, &win)?;
         self.decode_scalefactors(br, ch, global_gain, &win)?;
+        if std::env::var_os("FATE_TRACE").is_some() {
+            eprintln!(
+                "RUSF ch={ch} gg={global_gain} sfo={:?} bt={:?}",
+                &self.channels_state[ch].sfo[..10],
+                &self.channels_state[ch].band_type[..6]
+            );
+            let c: Vec<f32> = self.channels_state[ch].coeffs[..40].to_vec();
+            eprintln!("RUCOEF ch={ch}: {:?}", c);
+        }
         let pulse = self.decode_optional_tools(br, ch, &win)?;
         self.decode_spectral(br, ch, &win, pulse.as_ref())?;
+        if std::env::var_os("FATE_TRACE").is_some() {
+            let c: Vec<f32> = self.channels_state[ch].coeffs[..40].to_vec();
+            eprintln!("RUCOEF ch={ch}: {:?}", c);
+        }
         Ok(win)
     }
 
@@ -2274,14 +2424,6 @@ impl Decoder for AacDecoder {
                 }
             }
         }
-        let channels = self.channels;
-        if buffer.len() % channels != 0 {
-            return Err(CadenceError::InvalidFormat(format!(
-                "buffer length {} is not a multiple of the channel count {}",
-                buffer.len(),
-                channels
-            )));
-        }
         let mut written = 0usize;
         while written < buffer.len() {
             if self.staged_pos >= self.staged.len() {
@@ -2293,6 +2435,17 @@ impl Decoder for AacDecoder {
                     Err(e) => return Err(e),
                 }
             }
+            // Re-read per iteration: an in-band PS flip during the frame
+            // just decoded may have changed the channel count (mono HE-AAC
+            // reconfigured as stereo output).
+            let channels = self.channels;
+            if channels == 0 || buffer.len() % channels != 0 {
+                return Err(CadenceError::InvalidFormat(format!(
+                    "buffer length {} is not a multiple of the channel count {}",
+                    buffer.len(),
+                    channels
+                )));
+            }
             let available = self.staged.len() - self.staged_pos;
             let take = (buffer.len() - written).min(available);
             buffer[written..written + take]
@@ -2300,7 +2453,7 @@ impl Decoder for AacDecoder {
             self.staged_pos += take;
             written += take;
         }
-        Ok(written / channels)
+        Ok(written / self.channels)
     }
 }
 

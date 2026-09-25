@@ -263,6 +263,33 @@ impl CeltEncoder {
         self.encode_frame_impl(pcm, bytes_per_frame, None)
     }
 
+    /// Fallible counterpart to [`Self::encode_frame`] for callers that need
+    /// explicit PCM validation. Rejects non-finite samples and values outside
+    /// the normalized `[-1.0, 1.0]` range before mutating encoder state.
+    pub fn try_encode_frame(
+        &mut self,
+        pcm: &[f32],
+        bytes_per_frame: usize,
+    ) -> crate::Result<Vec<u8>> {
+        let expected = self.frame_len() * self.channels;
+        if pcm.len() != expected {
+            return Err(crate::CadenceError::InvalidFormat(format!(
+                "CELT PCM frame has {} samples; expected {expected} for {} channels",
+                pcm.len(),
+                self.channels
+            )));
+        }
+        if pcm
+            .iter()
+            .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+        {
+            return Err(crate::CadenceError::InvalidFormat(
+                "CELT PCM samples must be finite and within [-1, 1]".to_string(),
+            ));
+        }
+        Ok(self.encode_frame(pcm, bytes_per_frame))
+    }
+
     /// Test-only hook: forces `is_transient` to `force` instead of running
     /// [`detect_transient`], so tests can compare identical content encoded
     /// via the short-block vs. long-block path (the budget gate above

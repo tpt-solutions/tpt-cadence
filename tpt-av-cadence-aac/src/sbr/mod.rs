@@ -17,7 +17,8 @@
 pub mod dsp;
 pub mod freq;
 pub mod parse;
-pub(crate) mod ps;
+pub mod ps;
+pub mod ps_synth;
 mod ps_tables;
 pub mod qmf;
 pub mod tables;
@@ -174,6 +175,13 @@ pub struct Sbr {
     /// Persistent PS parameter state. Stereo synthesis is not yet applied,
     /// but parsing is retained so malformed PS cannot corrupt SBR framing.
     pub(crate) ps: ps::ParametricStereo,
+    /// Persistent PS synthesis state (decorrelation delays, mixing
+    /// coefficient history, hybrid filterbank scratch).
+    pub(crate) ps_synth: ps_synth::PsSynthesis,
+    /// True when the container signals HE-AACv2 (explicit AOT 29 or the
+    /// reference decoder's first-in-band-PS flip for mono streams): the
+    /// single decoded core channel is synthesized to a stereo pair.
+    pub(crate) ps_output: bool,
 }
 
 /// `ff_exp2fi`: exact power of two.
@@ -229,6 +237,8 @@ impl Sbr {
             qmf_analysis_z: Box::new([0.0; 320]),
             y1_scratch: Some(Box::new([[(0.0, 0.0); 64]; 38])),
             ps: ps::ParametricStereo::new(),
+            ps_synth: ps_synth::PsSynthesis::new(),
+            ps_output: false,
         };
         sbr.turnoff();
         sbr.data[0].synthesis_filterbank_samples_offset = SBR_SYNTHESIS_BUF_SIZE - (1280 - 128);
@@ -240,6 +250,8 @@ impl Sbr {
     pub fn turnoff(&mut self) {
         self.start = false;
         self.ready_for_dequant = false;
+        self.ps.disable();
+        self.ps_synth.reset();
         self.kx[1] = 32;
         self.m[1] = 0;
         self.data[0].e_a[1] = -1;
@@ -866,7 +878,25 @@ impl Sbr {
             self.x_gen(ch);
         }
 
-        for ch in 0..nch {
+        // Parametric Stereo (reference ff_sbr_apply): a mono core element
+        // under HE-AACv2 signaling synthesizes the right channel from the
+        // left in the QMF domain; until the first PS header arrives the
+        // mono frame is simply duplicated.
+        let mut out_nch = nch;
+        if self.ps_output && nch == 1 {
+            if self.ps.start {
+                let top = self.kx[1] + self.m[1];
+                let (l, r) = self.x.split_at_mut(1);
+                self.ps_synth
+                    .apply(&self.ps, &mut l[0][..], &mut r[0][..], top);
+            } else {
+                let (l, r) = self.x.split_at_mut(1);
+                r[0][..].copy_from_slice(&l[0][..]);
+            }
+            out_nch = 2;
+        }
+
+        for ch in 0..out_nch {
             // `out` likewise no longer needs a stack local: qmf_synthesis
             // can write its 2048 samples straight into `core_out[ch]`,
             // which is already sized for them.

@@ -8,6 +8,28 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 ## [Unreleased]
 
 ### Added
+- HE-AACv2 Parametric Stereo synthesis (QMF-domain PS stage ported from the
+  reference decoder implementation, FFmpeg `aacps.c`/`aacpsdsp_template.c`):
+  hybrid analysis/synthesis filterbank, transient-aware all-pass
+  decorrelation, IID/ICC mixing with IPD/OPD phase smoothing, and the
+  reference's end-of-frame envelope fix-ups. Streams flagged HE-AACv2
+  (ASC AOT 29) now open as stereo with the doubled SBR rate instead of
+  being rejected, and mono ADTS/raw-AOT-2 streams flip to stereo output on
+  their first in-band SBR payload (the reference decoder's "treating HE-AAC
+  mono as stereo" behavior) — until a PS header arrives the mono channel
+  is duplicated, exactly like the reference. Component-level verification
+  compares the Rust port against a standalone build of FFmpeg's
+  `ff_ps_apply` (generated tables value-for-value, per-stage pipeline
+  state, and final L/R output on four parameter scenarios; fixtures in
+  `tpt-av-cadence-aac/tests/data/ps_oracle/`), and a new end-to-end
+  fixture (`ps_tone.aac` encoded with a from-source libfdk-aac build)
+  decodes at 98.4 dB whole-stream SNR (82-139 dB per frame) against
+  FFmpeg's PS-capable decode.
+- Opus CELT encoder hardening: `CeltEncoder::try_encode_frame` for
+  callers that want explicit PCM validation (length, finiteness, [-1, 1]
+  range), `OggOpusEncoder::encode` now rejects non-finite/out-of-range
+  samples with a precise error, and encoding after `finish()` is rejected.
+  `finish()` is idempotent.
 - Non-publishing release preparation: `tools/release_prep.py` validates workspace
   metadata and can generate a local version/changelog patch; the manual
   `release-prep` workflow uploads that patch as an artifact and never commits,
@@ -41,12 +63,48 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   tuning, reservoir borrowing, short blocks, and stereo coupling remain out of
   scope.
 
+### Fixed
+- The SBR extension parser matched the wrong extension id for Parametric
+  Stereo (1 instead of the normative 2), so in-band PS payloads were never
+  decoded at all; every previous PS test wrote the same wrong id, so the
+  bug was invisible until a real HE-AACv2 stream was decoded.
+- The PS parameter Huffman decoder assigned canonical codes by symbol
+  value within each code length, but the normative codebooks (and FFmpeg's
+  `ff_vlc_init_from_lengths`) assign them in table order — several PS
+  codebooks list same-length symbols out of numeric order, so every
+  long-codeword parameter decoded incorrectly. Only the all-zero-codeword
+  unit tests had exercised this path before.
+- PS per-envelope delta flags (`bs_dt`) were consumed even when their
+  parameter family (IID/ICC) was disabled, shifting every subsequent read
+  in the payload; the reference only reads them for enabled families.
+- ICC parameters rejected only values above 7 but accepted negatives; the
+  reference rejects negative accumulated ICC (unsigned compare). IPD/OPD
+  deltas now wrap modulo 8 (reference `MASK` 0x07) instead of failing on
+  values above the old 5-bit cap, and their read no longer caps at 9 bits
+  (the codebooks contain codes up to 14/17 bits — long codewords used to
+  fail the whole PS payload).
+- The end-of-frame reference fix-ups were missing: a fake final envelope
+  is now appended whenever the parameter run ends before the last QMF
+  slot (so synthesis-time interpolation covers the whole frame), and
+  20/34-band mode history (`is34bands`/`is34bands_old`) is recomputed at
+  end-of-frame from both the IID and ICC modes instead of only inside the
+  IID header.
+- Reserved SBR extension payloads used `read_bits(count)` with the full
+  remaining bit count, hitting a >32-bit debug assertion (and mis-
+  skipping in release builds) on any HE-AAC stream whose FIL element
+  carried non-SBR extended data.
+- `OggOpusEncoder::finish()` was not idempotent (a second call or drop
+  path could rewrite EOS bookkeeping).
+
 ### Known limitations (tracked in `todo.md`)
-- Parametric Stereo is not synthesized: PS IID/ICC/IPD/OPD parameters are now
-  parsed and validated in the SBR extension path, including nested PS
-  extensions, but output currently falls back to mono. Explicit AOT 29
-  signaling is parsed but rejected by the decoder. Explicit HE-AAC AOT 5 ASC
-  signaling is supported.
+- Parametric Stereo synthesis is implemented (see Added above). HE-AACv2
+  with explicit AOT 29 signaling decodes as stereo, and mono HE-AAC
+  streams with in-band PS flip to stereo; a from-source libfdk-aac
+  end-to-end fixture decodes at 98.4 dB whole-stream SNR against FFmpeg
+  (per-frame 82-139 dB). Explicit HE-AAC AOT 5 streams whose SBR payloads
+  contain PS data still keep mono output (the container explicitly said
+  "no PS", matching the reference decoder's behavior of ignoring PS in
+  that configuration).
 - Four AAC FATE multichannel conformance items (CCE/PCE coupling) decode at
   reduced fidelity (2-53 dB) pending a coupling/PCE-interaction root cause.
   The previous stereo and 5.1/7.1 SBR context bugs are fixed; HE-AAC/SBR

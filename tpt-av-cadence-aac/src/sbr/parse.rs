@@ -562,10 +562,11 @@ fn read_sbr_data(sbr: &mut Sbr, br: &mut SbrBitReader, vlc: &SbrVlc, id_aac: usi
             num_bits_left -= 2;
             let ext_id = br.bits(2);
             match ext_id {
-                1 => {
-                    // EXTENSION_ID_PS: retain and validate the parameter
-                    // payload. PS stereo synthesis is not wired yet, so
-                    // current output remains the safe mono fallback.
+                2 => {
+                    // EXTENSION_ID_PS (reference enum value 2): parse and
+                    // validate the parameter payload; synthesis runs from
+                    // this state whenever the stream is flagged HE-AACv2
+                    // (AOT 29 or the in-band mono flip).
                     num_bits_left -= super::ps::ParametricStereo::decode(
                         &mut sbr.ps,
                         br,
@@ -573,7 +574,10 @@ fn read_sbr_data(sbr: &mut Sbr, br: &mut SbrBitReader, vlc: &SbrVlc, id_aac: usi
                     ) as i32;
                 }
                 _ => {
-                    br.bits(num_bits_left as u32);
+                    // Reserved extension: bs_fill_bits. The count can be
+                    // far larger than one read_bits() call accepts, so
+                    // skip rather than read.
+                    br.br.skip_bits(num_bits_left.max(0) as usize);
                     num_bits_left = 0;
                 }
             }

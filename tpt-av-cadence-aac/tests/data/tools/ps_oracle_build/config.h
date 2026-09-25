@@ -1,0 +1,22 @@
+// Minimal fake config.h for the standalone PS oracle build.
+#define ARCH_ARM 0
+#define ARCH_AARCH64 0
+#define ARCH_RISCV 0
+#define ARCH_X86 0
+#define ARCH_X86_32 0
+#define ARCH_X86_64 0
+#define HAVE_MMX 0
+#define HAVE_MMXEXT 0
+#define HAVE_SSE 0
+#define HAVE_SSE2 0
+#define HAVE_SSE3 0
+#define HAVE_SSE4 0
+#define HAVE_AVX 0
+#define HAVE_AVX2 0
+#define HAVE_NEON 0
+#define HAVE_INLINE_ASM 0
+#define HAVE_SIMD_ALIGN_32 0
+#define HAVE_SIMD_ALIGN_64 0
+#define HAVE_FAST_UNALIGNED 1
+#define CONFIG_FLOAT 1
+#define USE_FIXED 0

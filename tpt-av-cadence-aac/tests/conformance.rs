@@ -169,19 +169,20 @@ fn explicit_he_aac_config_activates_sbr_output_rate() {
 }
 
 #[test]
-fn explicit_heaacv2_config_rejects_unsupported_ps_synthesis() {
-    // AOT 29, 44.1 kHz core, explicit 48 kHz output. Metadata parsing
-    // succeeds, but the decoder must not silently downmix the PS result.
+fn explicit_heaacv2_config_opens_as_stereo_ps_output() {
+    // AOT 29, 44.1 kHz core, explicit 48 kHz output. The decoder opens
+    // with the doubled output rate and a stereo channel count even though
+    // the core configuration is mono: the single core channel is
+    // synthesized to a stereo pair by the QMF-domain PS stage.
     let asc = tpt_av_cadence_aac::AudioSpecificConfig::parse(&[0xea, 0x09, 0x94, 0x00]).unwrap();
     assert!(asc.ps_signaled);
-    let result = tpt_av_cadence_aac::AacDecoder::from_config(
+    let decoder = tpt_av_cadence_aac::AacDecoder::from_config(
         &asc,
         Box::new(std::io::Cursor::new(Vec::new())),
-    );
-    assert!(matches!(
-        result,
-        Err(tpt_av_cadence_core::CadenceError::UnsupportedFeature(_))
-    ));
+    )
+    .unwrap();
+    assert_eq!(decoder.info().sample_rate, 48_000);
+    assert_eq!(decoder.info().channels, 2);
 }
 
 fn push_bits(out: &mut Vec<u8>, acc: &mut (u32, u32), value: u32, n: u32) {
@@ -1018,4 +1019,257 @@ fn check_within(
         ));
     }
     Ok(())
+}
+
+struct PsOracleCase {
+    name: &'static str,
+    iid_quant: bool,
+    nr_iid: usize,
+    icc_mode: usize,
+    nr_icc: usize,
+    nr_ipdopd: usize,
+    ipdopd: bool,
+    num_env: usize,
+    borders: [i32; 6],
+    top: usize,
+    seed: u32,
+    switch34: Option<usize>,
+    is34: bool,
+}
+
+const PS_ORACLE_CASES: [PsOracleCase; 4] = [
+    PsOracleCase {
+        name: "a_20band_ipd_last",
+        iid_quant: true,
+        nr_iid: 20,
+        icc_mode: 3,
+        nr_icc: 20,
+        nr_ipdopd: 11,
+        ipdopd: true,
+        num_env: 2,
+        borders: [-1, 16, 31, 0, 0, 0],
+        top: 64,
+        seed: 12345,
+        switch34: None,
+        is34: false,
+    },
+    PsOracleCase {
+        name: "b_34band_ipd_last",
+        iid_quant: true,
+        nr_iid: 34,
+        icc_mode: 5,
+        nr_icc: 34,
+        nr_ipdopd: 17,
+        ipdopd: true,
+        num_env: 1,
+        borders: [-1, 31, 0, 0, 0, 0],
+        top: 52,
+        seed: 98765,
+        switch34: None,
+        is34: true,
+    },
+    PsOracleCase {
+        name: "c_10band_baseline_last",
+        iid_quant: false,
+        nr_iid: 10,
+        icc_mode: 1,
+        nr_icc: 10,
+        nr_ipdopd: 5,
+        ipdopd: false,
+        num_env: 4,
+        borders: [-1, 7, 15, 23, 31, 0],
+        top: 64,
+        seed: 55555,
+        switch34: None,
+        is34: false,
+    },
+    PsOracleCase {
+        name: "d_modeswitch_last",
+        iid_quant: true,
+        nr_iid: 20,
+        icc_mode: 3,
+        nr_icc: 20,
+        nr_ipdopd: 11,
+        ipdopd: true,
+        num_env: 2,
+        borders: [-1, 16, 31, 0, 0, 0],
+        top: 48,
+        seed: 424242,
+        switch34: Some(3),
+        is34: false,
+    },
+];
+
+fn ps_oracle_lcg(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+    (((*state >> 8) & 0xFFFFFF) as f32 / 16777215.0) * 2.0 - 1.0
+}
+
+fn ps_oracle_fill_frame(seed: u32) -> Box<[[(f32, f32); 64]; 38]> {
+    let mut st = seed;
+    let mut x = Box::new([[(0.0f32, 0.0f32); 64]; 38]);
+    for slot in x.iter_mut() {
+        for band in slot.iter_mut() {
+            *band = (ps_oracle_lcg(&mut st), ps_oracle_lcg(&mut st));
+        }
+    }
+    x
+}
+
+fn ps_oracle_setup(ps: &mut tpt_av_cadence_aac::sbr::ps::ParametricStereo, c: &PsOracleCase) {
+    ps.start = true;
+    ps.enable_iid = true;
+    ps.iid_quant = c.iid_quant;
+    ps.nr_iid_par = c.nr_iid;
+    ps.enable_icc = true;
+    ps.icc_mode = c.icc_mode;
+    ps.nr_icc_par = c.nr_icc;
+    ps.enable_ext = c.ipdopd;
+    ps.enable_ipdopd = c.ipdopd;
+    ps.nr_ipdopd_par = c.nr_ipdopd;
+    ps.num_env = c.num_env;
+    ps.border_position = c.borders;
+    ps.is34bands = c.is34;
+    // The reference harness keeps is34bands_old at its pre-run value; the
+    // mode-switch case therefore re-triggers the band-change reset on
+    // every post-switch frame exactly like the oracle.
+    ps.is34bands_old = c.switch34.is_none() && c.is34;
+    for e in 0..c.num_env {
+        for b in 0..c.nr_iid {
+            ps.iid_par[e][b] = ((7 * b + 5 * e) % 15) as i8 - 7;
+        }
+        for b in 0..c.nr_icc {
+            ps.icc_par[e][b] = ((b + e) % 8) as i8;
+        }
+        for b in 0..c.nr_ipdopd {
+            ps.ipd_par[e][b] = ((3 * b + e) % 8) as i8;
+            ps.opd_par[e][b] = ((5 * b + 2 * e) % 8) as i8;
+        }
+    }
+}
+
+#[test]
+fn ps_synthesis_matches_ffmpeg_reference_on_all_oracle_cases() {
+    // The oracle dumps (tests/data/ps_oracle/*.f32) come from a standalone
+    // build of FFmpeg n7.1's ff_ps_apply fed with deterministic synthetic
+    // QMF input (LCG seed per case, 8 frames); the last frame's L/R is
+    // compared. Slots 32..37 are excluded: ff_ps_apply synthesizes the 32
+    // new slots only, and the oracle's R buffer is zero there while the
+    // harness fill is not.
+    use tpt_av_cadence_aac::sbr::ps::ParametricStereo;
+    use tpt_av_cadence_aac::sbr::ps_synth::PsSynthesis;
+
+    let expected_len = 2 * 38 * 64 * 2;
+    for case in &PS_ORACLE_CASES {
+        let mut ps = ParametricStereo::new();
+        ps_oracle_setup(&mut ps, case);
+        let mut synth = PsSynthesis::new();
+        let mut l = ps_oracle_fill_frame(case.seed);
+        let mut r = ps_oracle_fill_frame(0);
+        for i in 0..8u32 {
+            l = ps_oracle_fill_frame(case.seed + i * 7919);
+            if let Some(f) = case.switch34 {
+                ps.is34bands = i >= f as u32;
+            }
+            synth.apply(&ps, &mut l[..], &mut r[..], case.top);
+        }
+        let dump = std::fs::read(
+            data_dir()
+                .join("ps_oracle")
+                .join(format!("{}.f32", case.name)),
+        )
+        .unwrap();
+        let expected: Vec<f32> = dump
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(expected.len(), expected_len);
+
+        let mut worst = 0.0f64;
+        for plane in 0..2 {
+            for (s, slot) in l.iter().enumerate().take(32) {
+                for (k, b) in slot.iter().enumerate() {
+                    let v = if plane == 0 { b.0 } else { b.1 };
+                    let e = expected[plane * 38 * 64 + s * 64 + k];
+                    worst = worst.max(((v - e) as f64).abs());
+                }
+            }
+        }
+        for plane in 0..2 {
+            for (s, slot) in r.iter().enumerate().take(32) {
+                for (k, b) in slot.iter().enumerate() {
+                    let v = if plane == 0 { b.0 } else { b.1 };
+                    let e = expected[2 * 38 * 64 + plane * 38 * 64 + s * 64 + k];
+                    worst = worst.max(((v - e) as f64).abs());
+                }
+            }
+        }
+        assert!(
+            worst <= 2e-4,
+            "{}: worst per-element |diff| {worst:.4e} exceeds 2e-4",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn heaacv2_ps_stream_matches_reference_decode() {
+    // Real end-to-end fixture: 1 s HE-AACv2 (AOT 29 core content: mono SCE
+    // + SBR + in-band PS), encoded with libfdk-aac from a deterministic
+    // stereo two-tone WAV at the 24 kHz core rate (see
+    // tests/data/tools/ps_fixture_gen.c). The ADTS header does not signal
+    // PS: the decoder must flip to stereo on the first in-band SBR
+    // payload and synthesize the PS stereo image, matching FFmpeg's
+    // decode of the same file at the usual >80 dB conformance gate.
+    let mut decoder = AacDecoder::from_source(Box::new(
+        File::open(data_dir().join("ps_tone.aac")).unwrap(),
+    ))
+    .unwrap();
+    let mut out = Vec::new();
+    let mut buf = vec![0.0f32; 2048];
+    loop {
+        let frames = decoder.decode(&mut buf).unwrap();
+        if frames == 0 {
+            break;
+        }
+        let channels = decoder.info().channels as usize;
+        out.extend_from_slice(&buf[..frames * channels]);
+    }
+    assert_eq!(decoder.info().channels, 2, "in-band PS must flip to stereo");
+    assert_eq!(
+        decoder.info().sample_rate,
+        24_000,
+        "SBR doubles the 12 kHz core"
+    );
+
+    let reference = std::fs::read(data_dir().join("ps_tone_ref.f32")).unwrap();
+    let expected: Vec<f32> = reference
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        out.len(),
+        expected.len(),
+        "decoded length must match FFmpeg's"
+    );
+
+    let n = out.len();
+    let mut sig = 0.0f64;
+    let mut err = 0.0f64;
+    let mut peak = 0.0f64;
+    for i in 0..n {
+        sig += (out[i] as f64) * (out[i] as f64);
+        let d = out[i] as f64 - expected[i] as f64;
+        err += d * d;
+        peak = peak.max(d.abs());
+    }
+    let snr = 10.0 * (sig / err).log10();
+    assert!(
+        snr > 80.0,
+        "HE-AACv2 PS decode SNR {snr:.2} dB must exceed 80 dB"
+    );
+    assert!(
+        peak <= 1e-2,
+        "HE-AACv2 PS decode peak error {peak:.2e} must stay under 1e-2"
+    );
 }

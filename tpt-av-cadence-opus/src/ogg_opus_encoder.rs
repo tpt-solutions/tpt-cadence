@@ -146,7 +146,7 @@ impl<W: Write> OggOpusEncoder<W> {
         let n = FRAME_LEN * self.channels as usize;
         let packet = self
             .celt
-            .encode_frame(&self.pending[..n], self.bytes_per_frame);
+            .try_encode_frame(&self.pending[..n], self.bytes_per_frame)?;
         self.pending.drain(..n);
         self.emitted_samples += FRAME_LEN as i64;
         if let Some(prev) = self.buffered_packet.take() {
@@ -163,12 +163,27 @@ impl<W: Write> OggOpusEncoder<W> {
 
 impl<W: Write + Send> Encoder for OggOpusEncoder<W> {
     fn encode(&mut self, samples: &[f32]) -> Result<usize> {
+        if self.finished {
+            return Err(CadenceError::InvalidFormat(
+                "cannot encode samples after finish()".to_string(),
+            ));
+        }
         let channels = self.channels as usize;
         if samples.len() % channels != 0 {
             return Err(CadenceError::InvalidFormat(format!(
                 "sample count {} is not a multiple of the channel count {}",
                 samples.len(),
                 channels
+            )));
+        }
+        if let Some((index, _sample)) = samples
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, sample)| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+        {
+            return Err(CadenceError::InvalidFormat(format!(
+                "sample {index} is outside the finite [-1, 1] PCM range"
             )));
         }
         self.pending.extend_from_slice(samples);

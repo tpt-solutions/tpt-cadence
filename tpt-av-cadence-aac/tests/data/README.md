@@ -61,3 +61,42 @@ float comparison, not bit-exact equality.
   `multichannel_he_aac_sbr_matches_reference_on_every_channel` (gated at
   >80 dB per channel; measured ~117-133 dB post-fix) and `todo.md`'s AAC
   SBR session log.
+
+- `ps_tone.aac` / `ps_tone_ref.f32` — 1 s HE-AACv2 (Parametric Stereo)
+  ADTS stream, 32 kbps, encoded with a from-source `libfdk-aac` v2.0.2
+  build (mingw-w64 GCC, same toolchain convention as the SBR fixtures
+  above) from a deterministic stereo two-tone (440/660 Hz, 0.8 L/R level
+  tilt) at the 24 kHz core rate; generator source in
+  `tools/ps_fixture_gen.c`. The ADTS header carries channel
+  configuration 1 (mono SCE) and a 12 kHz core rate — PS presence is only
+  discoverable in-band, which is exactly the case this fixture locks in:
+  the decoder must flip to stereo on the first in-band SBR payload and
+  synthesize the PS stereo image. `ps_tone_ref.f32` is FFmpeg's decode of
+  the same file as raw interleaved f32le (2023-12-28 gyan.dev full
+  build). See `tests/conformance.rs`'s
+  `heaacv2_ps_stream_matches_reference_decode` (gated at >80 dB;
+  measured 98.4 dB whole-stream, 82-139 dB per frame).
+
+- `ps_oracle/` — reference dumps from a standalone build of FFmpeg
+  n7.1's Parametric Stereo synthesis (`ff_ps_apply`) and parameter
+  parser (`ff_ps_read_data`), used to verify the Rust port at the
+  component level without needing an encoder:
+  - `table_*.f32` — every generated PS table (allpass fractions, phase
+    rotation, HA/HB mixing LUTs, pd smoothing, hybrid filter prototypes),
+    dumped from `ps_tableinit()` and compared value-for-value against the
+    Rust table generator (exact except HB, which differs by ≤1 f32 ulp
+    between libms).
+  - `a_20band_ipd_last.f32`, `b_34band_ipd_last.f32`,
+    `c_10band_baseline_last.f32`, `d_modeswitch_last.f32` — last-frame
+    L/R QMF output for four parameter scenarios (20-band fine with
+    ipd/opd, 34-band, 10-band coarse baseline without ipd/opd, and a
+    live 20→34 band-mode switch), each 8 frames of deterministic
+    pseudo-random QMF input. Compared per-element (≤2e-4; most values
+    bit-exact).
+  - `stages_case_a.bin` — per-stage pipeline state (after hybrid
+    analysis, after decorrelation, after stereo processing, per frame)
+    for case A, used to localize any future regression to a single
+    synthesis stage.
+  Build sources (stub headers + instrumented `aacps.c` copy + harnesses)
+  in `tools/ps_oracle_build/`, `tools/ps_harness.c`,
+  `tools/ps_read_oracle.c`.

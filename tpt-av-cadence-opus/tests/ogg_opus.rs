@@ -4,10 +4,26 @@
 //! replay), and — against the official vectors, when available — bit-exact
 //! end-to-end decode of a SILK-only vector muxed into Ogg pages.
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
+use std::sync::{Arc, Mutex};
 
 use tpt_av_cadence_core::{Encoder, FormatReader};
 use tpt_av_cadence_opus::{OggOpusEncoder, OggOpusReader, OpusHead};
+
+struct CountingWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test-side Ogg muxer (the container crate deliberately exposes only the
@@ -624,6 +640,61 @@ fn ogg_opus_encoder_empty_stream_still_produces_a_valid_container() {
     }
     let pcm = decode_all(&out, 960);
     assert_eq!(pcm.len(), 0, "no samples were ever encoded");
+}
+
+#[test]
+fn ogg_opus_encoder_finish_is_idempotent() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let mut enc = OggOpusEncoder::new(
+        CountingWriter {
+            bytes: Arc::clone(&bytes),
+        },
+        48_000,
+        1,
+        64_000,
+    )
+    .unwrap();
+    enc.encode(&[0.0; 960]).unwrap();
+    enc.finish().unwrap();
+    let after_first = bytes.lock().unwrap().len();
+    enc.finish().unwrap();
+    assert_eq!(bytes.lock().unwrap().len(), after_first);
+    drop(enc);
+    let pcm = decode_all(&bytes.lock().unwrap(), 960);
+    assert_eq!(pcm.len(), 960);
+}
+
+#[test]
+fn celt_encoder_checked_api_rejects_invalid_pcm() {
+    let mut enc = tpt_av_cadence_opus::celt::encoder::CeltEncoder::new(1, 3);
+    let pcm = vec![0.0; enc.frame_len()];
+    assert!(enc.try_encode_frame(&pcm, 160).is_ok());
+    let mut invalid = pcm.clone();
+    invalid[0] = f32::NAN;
+    assert!(enc.try_encode_frame(&invalid, 160).is_err());
+    invalid[0] = 1.01;
+    assert!(enc.try_encode_frame(&invalid, 160).is_err());
+    assert!(enc.try_encode_frame(&pcm[..pcm.len() - 1], 160).is_err());
+    assert!(enc.try_encode_frame(&pcm, 160).is_ok());
+}
+
+#[test]
+fn ogg_opus_encoder_rejects_invalid_pcm_values() {
+    let mut out = Vec::new();
+    let mut enc = OggOpusEncoder::new(&mut out, 48_000, 1, 64_000).unwrap();
+    assert!(enc.encode(&[f32::NAN]).is_err());
+    assert!(enc.encode(&[f32::INFINITY]).is_err());
+    assert!(enc.encode(&[1.01]).is_err());
+    assert!(enc.encode(&[-1.01]).is_err());
+    assert!(enc.encode(&[-1.0, 0.0, 1.0]).is_ok());
+}
+
+#[test]
+fn ogg_opus_encoder_rejects_encode_after_finish() {
+    let mut out = Vec::new();
+    let mut enc = OggOpusEncoder::new(&mut out, 48_000, 1, 64_000).unwrap();
+    enc.finish().unwrap();
+    assert!(enc.encode(&[0.0; 4]).is_err());
 }
 
 #[test]
