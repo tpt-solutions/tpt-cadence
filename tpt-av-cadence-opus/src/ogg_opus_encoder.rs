@@ -8,12 +8,15 @@
 //! reduced feature set" convention the FLAC/MP3 encoders use:
 //!
 //! - **48 kHz input only** (CELT's native rate; no resampling), **mono or
-//!   stereo**, **CELT-only fullband, CBR, 20 ms frames** — exactly the
+//!   stereo**, **CELT-only fullband, 20 ms frames** — exactly the
 //!   scope [`CeltEncoder`] itself implements today (see its module doc
 //!   comment for the full accounting: transient/TF handling, joint
 //!   mid/side stereo coding, and analysis-driven intensity stereo for the
 //!   high bands of channel-similar content are supported; SILK/hybrid
-//!   encoding and VBR are not).
+//!   encoding is not). Rate control is CBR ([`OggOpusEncoder::new`]) or
+//!   loudness-adaptive constrained VBR ([`OggOpusEncoder::new_vbr`]); the
+//!   container output is identical in shape either way — only the audio
+//!   packet sizes vary.
 //! - **RFC 7845 pre-skip = 120 samples**: this encoder's CELT analysis/
 //!   synthesis path has one 120-sample MDCT overlap of algorithmic delay.
 //!   Audio-page granules include that delay, and the final granule is
@@ -57,6 +60,11 @@ pub struct OggOpusEncoder<W: Write> {
     sink: W,
     channels: u16,
     bytes_per_frame: usize,
+    /// VBR mode: `bytes_per_frame` is the *average* per-frame budget and
+    /// each frame's actual budget is derived from its loudness (see
+    /// [`CeltEncoder::encode_frame_vbr`]); `false` = CBR at exactly
+    /// `bytes_per_frame`.
+    vbr: bool,
     celt: CeltEncoder,
     page_writer: OggPageWriter,
     /// Interleaved PCM awaiting a full `FRAME_LEN`-sample frame.
@@ -85,7 +93,29 @@ impl<W: Write> OggOpusEncoder<W> {
     /// (converted to a fixed per-20ms-frame byte budget — very low
     /// bitrates that would round down to an unusably small frame budget
     /// are rejected).
-    pub fn new(mut sink: W, sample_rate: u32, channels: u16, bitrate_bps: u32) -> Result<Self> {
+    pub fn new(sink: W, sample_rate: u32, channels: u16, bitrate_bps: u32) -> Result<Self> {
+        Self::new_impl(sink, sample_rate, channels, bitrate_bps, false)
+    }
+
+    /// VBR counterpart to [`OggOpusEncoder::new`]: `bitrate_bps` becomes
+    /// the *average* bitrate and each 20 ms frame's actual budget adapts to
+    /// its loudness relative to the preceding ~200 ms (constrained to
+    /// [max(20, base/3), 3×base] bytes per frame, so peaks stay bounded).
+    /// RFC 7845 has no VBR flag — the container output is identical in
+    /// shape; only the audio packet sizes vary. Over steady content the
+    /// derived budgets converge to the base, so the long-term average
+    /// tracks the requested bitrate.
+    pub fn new_vbr(sink: W, sample_rate: u32, channels: u16, bitrate_bps: u32) -> Result<Self> {
+        Self::new_impl(sink, sample_rate, channels, bitrate_bps, true)
+    }
+
+    fn new_impl(
+        mut sink: W,
+        sample_rate: u32,
+        channels: u16,
+        bitrate_bps: u32,
+        vbr: bool,
+    ) -> Result<Self> {
         if sample_rate != SAMPLE_RATE {
             return Err(CadenceError::InvalidFormat(format!(
                 "Ogg Opus encoder supports only {SAMPLE_RATE} Hz input, got {sample_rate}"
@@ -129,6 +159,7 @@ impl<W: Write> OggOpusEncoder<W> {
             sink,
             channels,
             bytes_per_frame,
+            vbr,
             celt: CeltEncoder::new(channels as usize, LM),
             page_writer,
             pending: Vec::with_capacity(FRAME_LEN * channels as usize),
@@ -145,9 +176,13 @@ impl<W: Write> OggOpusEncoder<W> {
     /// previously buffered first, as a non-final page).
     fn emit_frame(&mut self) -> Result<()> {
         let n = FRAME_LEN * self.channels as usize;
-        let packet = self
-            .celt
-            .try_encode_frame(&self.pending[..n], self.bytes_per_frame)?;
+        let packet = if self.vbr {
+            self.celt
+                .try_encode_frame_vbr(&self.pending[..n], self.bytes_per_frame)?
+        } else {
+            self.celt
+                .try_encode_frame(&self.pending[..n], self.bytes_per_frame)?
+        };
         self.pending.drain(..n);
         self.emitted_samples += FRAME_LEN as i64;
         if let Some(prev) = self.buffered_packet.take() {

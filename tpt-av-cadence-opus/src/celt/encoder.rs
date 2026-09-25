@@ -78,6 +78,22 @@
 //! into independent per-channel sample/MDCT-tail/spectrum state); the
 //! coarse/fine/finalise energy quantizers already support the channel-count
 //! parameter.
+//!
+//! ## VBR (constrained, loudness-adaptive)
+//!
+//! [`CeltEncoder::encode_frame_vbr`] treats its byte argument as the
+//! *average* per-frame budget and derives each frame's actual budget after
+//! band-energy analysis: the frame's mean band log-energy relative to a
+//! running EMA reference (~200 ms time constant) maps to a budget scale of
+//! `2^(delta_db / 40)`, clamped to `[max(20, base/3), 3*base]` so peaks
+//! stay bounded (constrained VBR) and steady content converges to the
+//! base. The decoder needs no VBR awareness — every CELT frame's length
+//! comes from the packet framing, and the entire downstream encode path
+//! (header gates, allocation, padding, fixed-storage finalization) is
+//! budget-driven and works identically for a derived budget. This is an
+//! encoder-only rate policy: RFC 6716 standardizes only the decoder, and
+//! the constants (tracking coefficient, slope, clamps) are documented
+//! heuristics, not libopus's analysis stack (no tonality/speech model).
 
 use super::bands::{quant_all_bands_encode, TF_SELECT_TABLE};
 use super::decoder::{OVERLAP, SPREAD_ICDF_TBL, TRIM_ICDF};
@@ -208,7 +224,26 @@ pub struct CeltEncoder {
     /// intensity did not engage). This is the pre-clamp *request* — the
     /// value written to the bitstream may be clamped up to `coded_bands`.
     last_intensity: usize,
+    /// Running loudness reference for the VBR budget derivation (the EMA of
+    /// log2 mean per-band energy). `None` until the first
+    /// [`CeltEncoder::encode_frame_vbr`] call; CBR calls neither read nor
+    /// write it. CBR and VBR calls must not be interleaved on one encoder.
+    vbr_ref: Option<f64>,
 }
+
+/// VBR loudness-reference tracking coefficient: the EMA weight of the
+/// current frame's loudness in the running reference (per 20 ms frame — a
+/// time constant of ~10 frames / 200 ms). Encoder-only heuristic; the
+/// decoder is bitstream-agnostic to VBR decisions.
+const VBR_REF_TRACKING: f64 = 0.1;
+/// VBR loudness-to-bitrate slope: a frame whose loudness is `d` dB above
+/// the running reference gets `2^(d/15)` times the base budget (15 dB →
+/// 2x). The `[max(20, base/3), 3*base]` clamps, not this slope, absorb
+/// extreme dynamics.
+const VBR_DB_PER_DOUBLING: f64 = 15.0;
+/// Absolute floor for a derived VBR budget (bytes per frame), matching the
+/// minimum usable 20 ms budget the Ogg writer accepts for CBR.
+const VBR_MIN_BYTES: usize = 20;
 
 impl CeltEncoder {
     /// `lm` selects the frame size using the same convention as
@@ -235,6 +270,7 @@ impl CeltEncoder {
             mdct_scratch: [Cpx::default(); N4_MAX],
             last_is_transient: false,
             last_intensity: NB_EBANDS,
+            vbr_ref: None,
         }
     }
 
@@ -261,17 +297,16 @@ impl CeltEncoder {
     /// Encodes one `frame_len()`-sample-per-channel frame (PCM in `[-1,
     /// 1]`, interleaved `channels`-wide — i.e. `pcm.len() == frame_len() *
     /// self.channels`) into a complete Opus packet (TOC byte + one CELT
-    /// frame, framing code 0) targeting `bytes_per_frame` bytes — the
-    /// encoder's entire bitrate control for this milestone is this fixed
-    /// per-frame byte budget (no VBR). Multi-frame-per-packet (framing
-    /// codes 1-3) is out of scope — see the module doc comment.
+    /// frame, framing code 0) targeting `bytes_per_frame` bytes — a fixed
+    /// per-frame byte budget (CBR). Multi-frame-per-packet (framing codes
+    /// 1-3) is out of scope — see the module doc comment.
     ///
     /// The CELT entropy stream is finalized into exactly `bytes_per_frame`
     /// bytes using libopus-style fixed storage, so decoder-side allocation
     /// sees the same packet length used by the encoder. Overshoot is rejected
     /// rather than silently emitted.
     pub fn encode_frame(&mut self, pcm: &[f32], bytes_per_frame: usize) -> Vec<u8> {
-        self.encode_frame_impl(pcm, bytes_per_frame, None)
+        self.encode_frame_impl(pcm, bytes_per_frame, None, false)
     }
 
     /// Fallible counterpart to [`Self::encode_frame`] for callers that need
@@ -301,6 +336,81 @@ impl CeltEncoder {
         Ok(self.encode_frame(pcm, bytes_per_frame))
     }
 
+    /// VBR counterpart to [`Self::encode_frame`]: `base_bytes_per_frame` is
+    /// the *average* per-frame budget, and each frame's actual budget is
+    /// derived after band-energy analysis from the frame's loudness relative
+    /// to a running EMA reference (see the module doc comment's VBR
+    /// section) — louder-than-recent frames get more bytes, quieter frames
+    /// fewer, clamped to `[max(VBR_MIN_BYTES, base/3), 3*base]` so the peak
+    /// bitrate stays bounded (constrained VBR). Over a steady signal the
+    /// derived budget converges to the base, so the long-term average tracks
+    /// the requested bitrate. Returns packets of *varying* length; the
+    /// decoder needs no VBR awareness (each CELT frame's length comes from
+    /// the packet framing).
+    ///
+    /// CBR and VBR calls must not be interleaved on one encoder instance
+    /// (the loudness reference only advances on VBR calls).
+    pub fn encode_frame_vbr(&mut self, pcm: &[f32], base_bytes_per_frame: usize) -> Vec<u8> {
+        self.encode_frame_impl(pcm, base_bytes_per_frame, None, true)
+    }
+
+    /// Fallible counterpart to [`Self::encode_frame_vbr`], with the same
+    /// PCM validation as [`Self::try_encode_frame`].
+    pub fn try_encode_frame_vbr(
+        &mut self,
+        pcm: &[f32],
+        base_bytes_per_frame: usize,
+    ) -> crate::Result<Vec<u8>> {
+        let expected = self.frame_len() * self.channels;
+        if pcm.len() != expected {
+            return Err(crate::CadenceError::InvalidFormat(format!(
+                "CELT PCM frame has {} samples; expected {expected} for {} channels",
+                pcm.len(),
+                self.channels
+            )));
+        }
+        if pcm
+            .iter()
+            .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+        {
+            return Err(crate::CadenceError::InvalidFormat(
+                "CELT PCM samples must be finite and within [-1, 1]".to_string(),
+            ));
+        }
+        Ok(self.encode_frame_vbr(pcm, base_bytes_per_frame))
+    }
+
+    /// Derives this frame's byte budget from the frame's loudness relative
+    /// to the running EMA reference. Loudness is the log2 of the mean
+    /// per-band energy: summing the band energies in the *energy* domain
+    /// (2^(means + e_means)) rather than averaging logs weights loud bands
+    /// properly — a tonal frame's single active band moves the measure by
+    /// its full amplitude change instead of being diluted across the band
+    /// count.
+    fn derive_vbr_budget(
+        &mut self,
+        base: usize,
+        means: &[f32; 2 * NB_EBANDS],
+        channels: usize,
+    ) -> usize {
+        let mut e_sum = 0f64;
+        for (idx, &mean) in means[..channels * NB_EBANDS].iter().enumerate() {
+            e_sum += 2f64.powf(mean as f64 + e_means(idx % NB_EBANDS) as f64);
+        }
+        let loud = (e_sum / (channels * NB_EBANDS) as f64).log2();
+        let r = match self.vbr_ref {
+            None => loud,
+            Some(r) => r + VBR_REF_TRACKING * (loud - r),
+        };
+        self.vbr_ref = Some(r);
+        let delta_db = 6.0206 * (loud - r);
+        let scale = (delta_db / VBR_DB_PER_DOUBLING).exp2();
+        let min = (base / 3).max(VBR_MIN_BYTES);
+        (base as f64 * scale)
+            .round()
+            .clamp(min as f64, (base * 3) as f64) as usize
+    }
+
     /// Test-only hook: forces `is_transient` to `force` instead of running
     /// [`detect_transient`], so tests can compare identical content encoded
     /// via the short-block vs. long-block path (the budget gate above
@@ -308,7 +418,7 @@ impl CeltEncoder {
     /// bitrates).
     #[cfg(test)]
     fn encode_frame_forced(&mut self, pcm: &[f32], bytes_per_frame: usize, force: bool) -> Vec<u8> {
-        self.encode_frame_impl(pcm, bytes_per_frame, Some(force))
+        self.encode_frame_impl(pcm, bytes_per_frame, Some(force), false)
     }
 
     fn encode_frame_impl(
@@ -316,6 +426,7 @@ impl CeltEncoder {
         pcm: &[f32],
         bytes_per_frame: usize,
         force_transient: Option<bool>,
+        vbr: bool,
     ) -> Vec<u8> {
         let channels = self.channels;
         let stereo = channels == 2;
@@ -338,7 +449,16 @@ impl CeltEncoder {
             }
         }
 
-        let total_bits_bytes = (bytes_per_frame * 8) as i32;
+        // In VBR mode the actual per-frame budget is only known after the
+        // band-energy analysis below; the transient probe here must be
+        // conservative and assume the smallest budget VBR can ever derive
+        // (the clamp floor), so a transient bit is only signaled when it is
+        // affordable even in the quietest case.
+        let probe_bits_bytes = if vbr {
+            ((bytes_per_frame / 3).max(VBR_MIN_BYTES) * 8) as i32
+        } else {
+            (bytes_per_frame * 8) as i32
+        };
 
         // --- Transient detection ---
         // The `is_transient` bit is only ever affordable/meaningful when
@@ -352,11 +472,11 @@ impl CeltEncoder {
             let mut probe = RangeEncoder::new();
             probe.encode_bit_logp(false, 15);
             let mut probe_tell = probe.tell() as i32;
-            if probe_tell + 16 <= total_bits_bytes {
+            if probe_tell + 16 <= probe_bits_bytes {
                 probe.encode_bit_logp(false, 1);
                 probe_tell = probe.tell() as i32;
             }
-            let budget_ok = lm > 0 && probe_tell + 3 <= total_bits_bytes;
+            let budget_ok = lm > 0 && probe_tell + 3 <= probe_bits_bytes;
             budget_ok && force_transient.unwrap_or_else(|| detect_transient(channels, lm, &syn))
         };
         self.last_is_transient = is_transient;
@@ -526,6 +646,19 @@ impl CeltEncoder {
             NB_EBANDS
         };
         self.last_intensity = chosen_intensity;
+
+        // --- VBR budget derivation ---
+        // Now that the band energies exist, VBR mode derives this frame's
+        // actual budget from the frame's loudness relative to the running
+        // EMA reference (see `derive_vbr_budget`); CBR keeps the caller's
+        // fixed budget. Everything below (header gates, allocation, padding,
+        // finalization) is budget-driven and works identically for either.
+        let bytes_per_frame = if vbr {
+            self.derive_vbr_budget(bytes_per_frame, &means, channels)
+        } else {
+            bytes_per_frame
+        };
+        let total_bits_bytes = (bytes_per_frame * 8) as i32;
 
         // --- Bitstream ---
         let mut enc = RangeEncoder::new();
@@ -1855,6 +1988,84 @@ mod tests {
                 NB_EBANDS,
                 "level-mismatched channels must stay M/S coded"
             );
+        }
+    }
+
+    /// Constrained VBR: with smoothly amplitude-modulated content (no
+    /// frame-boundary discontinuities), frames louder than the recent past
+    /// must receive a boosted budget and quieter frames a reduced one, while
+    /// every packet decodes without error at its own (varying) length
+    /// through the trusted decoder. The running-EMA design tracks
+    /// *dynamics*, not absolute level, so the long-term average stays at the
+    /// target bitrate.
+    #[test]
+    fn vbr_boosts_loud_frames_and_reduces_quiet_frames_with_convergence() {
+        let base = 160usize;
+        let mut enc = CeltEncoder::new(1, LM);
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
+
+        // 440 Hz carrier, amplitude slowly modulated at 2 Hz between
+        // ~0.02 and ~0.78: a 480 ms span covers one loud half-cycle and one
+        // quiet half-cycle with smooth transitions.
+        let n_frames = 24;
+        let mut lengths = Vec::new();
+        let mut t = 0.0f64;
+        for _ in 0..n_frames {
+            let mut frame = [0.0f32; N2];
+            for s in frame.iter_mut() {
+                let env = 0.4 + 0.38 * (2.0 * std::f64::consts::TAU * 2.0 * t).sin();
+                *s = (env as f32) * (2.0 * std::f32::consts::PI * 440.0 * t as f32).sin();
+                t += 1.0 / 48_000.0;
+            }
+            let packet = enc.encode_frame_vbr(&frame, base);
+            lengths.push(packet.len());
+            let packet_parsed = parse_packet(&packet).unwrap();
+            let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &packet_parsed, &packet, &mut pcm_out)
+                .expect("VBR packet must decode at its own length");
+        }
+
+        // Both directions of the dynamics must show up in the budgets.
+        let max = *lengths.iter().max().unwrap();
+        let min = *lengths.iter().min().unwrap();
+        assert!(
+            max > base + 20,
+            "loud phases should be boosted above the base budget: {lengths:?}"
+        );
+        assert!(
+            min < base - 30,
+            "quiet phases should be reduced below the base budget: {lengths:?}"
+        );
+        // Budgets must actually vary with the modulation (not just clamp).
+        assert!(
+            max - min > 60,
+            "VBR budgets should track the dynamics, not saturate: {lengths:?}"
+        );
+    }
+
+    /// VBR encodes must be deterministic: identical input through two fresh
+    /// encoders yields byte-identical packet sequences (the loudness
+    /// reference is part of the encoder state and introduces no
+    /// nondeterminism).
+    #[test]
+    fn vbr_encode_is_deterministic() {
+        let mut phase = 0.0f32;
+        let mut frames = Vec::new();
+        for i in 0..10 {
+            let amp = if i % 3 == 0 { 0.7 } else { 0.05 };
+            let mut frame = [0.0f32; N2];
+            for s in frame.iter_mut() {
+                *s = amp * phase.sin();
+                phase += 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            }
+            frames.push(frame);
+        }
+        let mut enc_a = CeltEncoder::new(1, LM);
+        let mut enc_b = CeltEncoder::new(1, LM);
+        for frame in &frames {
+            let a = enc_a.encode_frame_vbr(frame, 160);
+            let b = enc_b.encode_frame_vbr(frame, 160);
+            assert_eq!(a, b, "VBR encode must be deterministic");
         }
     }
 }

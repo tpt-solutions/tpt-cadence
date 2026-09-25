@@ -763,3 +763,79 @@ fn celt_encoder_cbr_stays_within_requested_budget() {
         }
     }
 }
+/// VBR through the container: a dynamics-bearing signal encoded with
+/// `new_vbr` must (a) round-trip through the real Ogg decoder to exactly the
+/// input sample count (pre-skip/end-trim are length-agnostic to varying
+/// packet sizes), and (b) actually vary its audio packet sizes — the same
+/// content through the CBR constructor produces same-size packets and a
+/// different total payload.
+#[test]
+fn ogg_opus_encoder_vbr_round_trips_and_varies_packet_sizes() {
+    let sample_rate = 48_000u32;
+    // AM tone: 440 Hz carrier, 2 Hz modulation envelope, ~494 ms — a
+    // non-multiple of the 960-sample frame so end-trim is exercised too.
+    let n_samples = 960 * 10 + 137;
+    let mut original = Vec::with_capacity(n_samples);
+    for i in 0..n_samples {
+        let t = i as f64 / 48_000.0;
+        let env = 0.4 + 0.38 * (2.0 * std::f64::consts::TAU * 2.0 * t).sin();
+        original.push((env as f32) * (2.0 * std::f32::consts::PI * 440.0 * t as f32).sin());
+    }
+
+    let encode = |vbr: bool| -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = if vbr {
+                OggOpusEncoder::new_vbr(&mut out, sample_rate, 1, 64_000).unwrap()
+            } else {
+                OggOpusEncoder::new(&mut out, sample_rate, 1, 64_000).unwrap()
+            };
+            enc.encode(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        out
+    };
+
+    let vbr_bytes = encode(true);
+    let cbr_bytes = encode(false);
+
+    // Both variants decode to exactly the input sample count.
+    for (label, data) in [("vbr", &vbr_bytes), ("cbr", &cbr_bytes)] {
+        let pcm = decode_all(data, 960);
+        assert_eq!(pcm.len(), n_samples, "{label}: decoded sample count");
+    }
+
+    // Page payload lengths, walking the known Ogg page layout. The first
+    // two pages are the OpusHead and OpusTags headers; every later page
+    // carries exactly one audio packet (the encoder's one-packet-per-page
+    // convention), so the payload length IS the packet length.
+    let page_payloads = |data: &[u8]| -> Vec<usize> {
+        let mut payloads = Vec::new();
+        let mut pos = 0usize;
+        while pos + 27 <= data.len() && &data[pos..pos + 4] == b"OggS" {
+            let segments = data[pos + 26] as usize;
+            let seg_table = &data[pos + 27..pos + 27 + segments];
+            let len = seg_table.iter().map(|&s| s as usize).sum();
+            payloads.push(len);
+            pos += 27 + segments + len;
+        }
+        payloads
+    };
+
+    let cbr_pages = page_payloads(&cbr_bytes);
+    let vbr_pages = page_payloads(&vbr_bytes);
+    assert!(
+        cbr_pages.len() > 2 && vbr_pages.len() > 2,
+        "expected audio pages"
+    );
+    let cbr_audio = &cbr_pages[2..];
+    let vbr_audio = &vbr_pages[2..];
+    assert!(
+        cbr_audio.iter().all(|&len| len == cbr_audio[0]),
+        "CBR audio packets should all be the same size: {cbr_audio:?}"
+    );
+    assert!(
+        vbr_audio.iter().any(|&len| len != vbr_audio[0]),
+        "VBR audio packets should vary in size: {vbr_audio:?}"
+    )
+}
