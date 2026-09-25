@@ -23,6 +23,10 @@ use crate::tables;
 use crate::tns::{self, Tns};
 
 const MAX_CHANNELS: usize = 8;
+/// Internal state slot used while decoding or synthesizing a CCE. CCEs may
+/// occur after ordinary channel elements in a raw_data_block, so they must
+/// never borrow an output channel as temporary storage.
+const CCE_SCRATCH_CHANNEL: usize = MAX_CHANNELS;
 /// Channel count per ISO/IEC 14496-3 channel configuration (Table 1.4).
 /// Configuration 0 is PCE-configured (count declared in-band); note
 /// configuration 7 ("7.1") carries EIGHT channels.
@@ -96,6 +100,8 @@ struct ChannelState {
 /// targets and per-band gains (reference `ChannelCoupling`).
 const MAX_CCE_TARGETS: usize = 8;
 struct CouplingChannel {
+    /// CCE element_instance_tag; persistent state is keyed by this tag.
+    instance_tag: u8,
     state: ChannelState,
     /// Window info of the CCE's own ICS (gain index layout).
     window: WindowInfo,
@@ -132,6 +138,19 @@ impl ChannelState {
             kb_window_prev: false,
             window_seq_prev: ONLY_LONG,
         }
+    }
+
+    fn copy_from(&mut self, other: &Self) {
+        self.coeffs.copy_from_slice(&other.coeffs);
+        self.out.copy_from_slice(&other.out);
+        self.saved.copy_from_slice(&other.saved);
+        self.band_type.copy_from_slice(&other.band_type);
+        self.sfo.copy_from_slice(&other.sfo);
+        self.sf.copy_from_slice(&other.sf);
+        self.tns = other.tns.clone();
+        self.kb_window_cur = other.kb_window_cur;
+        self.kb_window_prev = other.kb_window_prev;
+        self.window_seq_prev = other.window_seq_prev;
     }
 }
 
@@ -191,6 +210,7 @@ struct BlockElem {
     ch: usize,
     win: WindowInfo,
     is_cpe: bool,
+    element_type: u8,
     tag: u8,
 }
 
@@ -459,11 +479,12 @@ impl AacDecoder {
             HuffmanTable::new(&tables::SCALEFACTOR_BITS, &codes)?
         };
 
-        // Channel state exists for every possible channel: with channel
-        // configuration 0 the count is only known once the first in-band
-        // PCE arrives, so `channels` starts at 0 and is upgraded then.
-        let mut channels_state = Vec::with_capacity(MAX_CHANNELS);
-        for _ in 0..MAX_CHANNELS {
+        // Channel state exists for every possible output channel plus one
+        // private CCE scratch slot. With channel configuration 0 the public
+        // count is only known once the first in-band PCE arrives, so
+        // `channels` starts at 0 and is upgraded then.
+        let mut channels_state = Vec::with_capacity(MAX_CHANNELS + 1);
+        for _ in 0..=CCE_SCRATCH_CHANNEL {
             channels_state.push(ChannelState::new());
         }
 
@@ -538,6 +559,7 @@ impl AacDecoder {
             dump_blocks: std::env::var_os("AAC_DUMP_BLOCKS").is_some(),
             cces: (0..4)
                 .map(|_| CouplingChannel {
+                    instance_tag: 0,
                     state: ChannelState::new(),
                     window: WindowInfo::placeholder(sf_index),
                     coupling_point: 0,
@@ -761,6 +783,7 @@ impl AacDecoder {
             ch: 0,
             win: WindowInfo::placeholder(self.sf_index),
             is_cpe: false,
+            element_type: SCE as u8,
             tag: 0,
         }; MAX_CHANNELS];
         let mut block_count = 0usize;
@@ -803,6 +826,7 @@ impl AacDecoder {
                             ch,
                             win,
                             is_cpe: false,
+                            element_type: id as u8,
                             tag: tag as u8,
                         };
                         block_count += 1;
@@ -878,6 +902,7 @@ impl AacDecoder {
                             ch: ch_l,
                             win,
                             is_cpe: true,
+                            element_type: CPE as u8,
                             tag: tag as u8,
                         };
                         block_count += 1;
@@ -885,6 +910,7 @@ impl AacDecoder {
                             ch: ch_r,
                             win: win_r,
                             is_cpe: true,
+                            element_type: CPE as u8,
                             tag: tag as u8,
                         };
                         block_count += 1;
@@ -1016,6 +1042,7 @@ impl AacDecoder {
             ch: 0,
             win: WindowInfo::placeholder(self.sf_index),
             is_cpe: false,
+            element_type: SCE as u8,
             tag: 0,
         }; MAX_CHANNELS];
         let mut decoded_count = 0usize;
@@ -1055,9 +1082,11 @@ impl AacDecoder {
                 (cce.coupling_point, cce.window)
             };
             if self.cces[i].coupled && point == 3 {
-                std::mem::swap(&mut self.channels_state[0], &mut self.cces[i].state);
-                self.imdct_and_window(0, &win);
-                std::mem::swap(&mut self.channels_state[0], &mut self.cces[i].state);
+                self.channels_state[CCE_SCRATCH_CHANNEL].copy_from(&self.cces[i].state);
+                self.imdct_and_window(CCE_SCRATCH_CHANNEL, &win);
+                self.cces[i]
+                    .state
+                    .copy_from(&self.channels_state[CCE_SCRATCH_CHANNEL]);
             }
         }
         for el in &decoded[..decoded_count] {
@@ -1261,14 +1290,16 @@ impl AacDecoder {
     /// The spectrum is consumed by coupling application, not windowed
     /// (except for after-IMDCT coupling, which consumes time samples).
     fn decode_cce(&mut self, br: &mut BitReader) -> Result<(), CadenceError> {
-        let _instance_tag = br.read_bits(4);
+        let instance_tag = br.read_bits(4) as u8;
         let slot = (0..self.cces.len())
-            .find(|&i| !self.cces[i].coupled)
+            .find(|&i| !self.cces[i].coupled && self.cces[i].instance_tag == instance_tag)
+            .or_else(|| (0..self.cces.len()).find(|&i| !self.cces[i].coupled))
             .ok_or_else(|| {
                 CadenceError::UnsupportedFeature(
                     "more coupling channels in one block than supported".to_string(),
                 )
             })?;
+        self.cces[slot].instance_tag = instance_tag;
         {
             let cce = &mut self.cces[slot];
             cce.coupled = true;
@@ -1293,12 +1324,16 @@ impl AacDecoder {
             cce.num_gain = num_gain;
         }
 
-        // The CCE's own individual channel stream, decoded through a spare
-        // channel slot (state swapped in and back out).
-        std::mem::swap(&mut self.channels_state[0], &mut self.cces[slot].state);
-        let win = self.decode_ics(br, 0, false, None);
-        std::mem::swap(&mut self.channels_state[0], &mut self.cces[slot].state);
+        // The CCE's own individual channel stream, decoded through a private
+        // scratch state seeded from this CCE. This preserves its overlap
+        // history while never displacing an output channel decoded earlier in
+        // the block.
+        self.channels_state[CCE_SCRATCH_CHANNEL].copy_from(&self.cces[slot].state);
+        let win = self.decode_ics(br, CCE_SCRATCH_CHANNEL, false, None);
         let win = win?;
+        self.cces[slot]
+            .state
+            .copy_from(&self.channels_state[CCE_SCRATCH_CHANNEL]);
         self.cces[slot].window = win;
 
         // Coupling gains. Target 0 carries a unit gain; later targets are
@@ -1383,7 +1418,7 @@ impl AacDecoder {
     /// element at `point` (0/1: dependent, spectral; 3: independent,
     /// time-domain), mirroring the reference dispatcher's gain indexing.
     fn apply_coupling(&mut self, target: &BlockElem, point: u8) {
-        let target_ty = if target.is_cpe { CPE as u8 } else { SCE as u8 };
+        let target_ty = target.element_type;
         for ci in 0..self.cces.len() {
             let (coupled, cce_point) = (self.cces[ci].coupled, self.cces[ci].coupling_point);
             if !coupled || cce_point != point {
@@ -1617,21 +1652,26 @@ impl AacDecoder {
             }
             return;
         }
-        // WAV position bits per class row: leading single, wide pair,
-        // inner pair. FRONT: FC | FLOC FROC | FL FR; SIDE/BACK:
-        // (center unused) | SL SR | BL BR BC; LFE: LFE, LFE2.
-        const FRONT: [i64; 6] = [4, 64, 128, 1, 2, 0];
-        const SIDE: [i64; 6] = [0, 512, 1024, 16, 32, 256];
-        const LFE_ROW: [i64; 6] = [8, 1032, 0, 0, 0, 0];
+        // AVChannel bit values used by FFmpeg's `ff_aac_channel_map`, in
+        // assignment order. Zero is AV_CHAN_NONE/UNUSED and therefore is a
+        // sentinel, not a sortable channel position.
+        const FRONT: [i64; 6] = [4, 64, 128, 1, 2, 0]; // FC FLC FRC FL FR -
+        const SIDE: [i64; 6] = [0, 512, 1024, 0, 0, 0]; // - SL SR - - -
+        const BACK: [i64; 6] = [0, 0, 0, 16, 32, 256]; // - - - BL BR BC
+        const LFE_ROW: [i64; 6] = [8, 1 << 34, 0, 0, 0, 0];
 
         let mut positions = [0i64; MAX_CHANNELS];
         let mut entry = 0usize;
         for (ci, count) in self.pce_class_counts.iter().enumerate() {
             let row = match ci {
                 0 => FRONT,
-                1 | 2 => SIDE,
+                1 => SIDE,
+                2 => BACK,
                 _ => LFE_ROW,
             };
+            if entry + *count > self.pce_plan_len {
+                break;
+            }
             let mut nb = 0usize;
             for k in 0..*count {
                 nb += 1 + usize::from(self.pce_plan_type[entry + k] == PCE_CPE);
@@ -1643,25 +1683,24 @@ impl AacDecoder {
                 entry += *count;
                 continue;
             }
-            let mut j = 0usize;
-            while nb & 1 == 1 && entry < self.pce_plan_len {
-                positions[entry] = row[j];
+
+            // FFmpeg assign_channels: use a real leading center when one
+            // exists; side/back have no leading center, so their first pair
+            // starts at row index 1 (side) or 3 (back).
+            if row[0] != 0 && nb & 1 == 1 {
+                positions[entry] = row[0];
                 entry += 1;
                 nb -= 1;
-                if row[j] == 0 {
-                    break;
-                }
-                j = if ci != 1 && nb <= 3 { 3 } else { 1 };
             }
-            j = j.min(4);
-            while nb >= 2 && entry + 1 < self.pce_plan_len.max(MAX_CHANNELS) && j + 1 < row.len() {
-                if row[j] < 0 || row[j + 1] < 0 {
-                    break; // NONE sentinel: no more positions in this class
+            let mut j = if ci != 1 && nb <= 3 { 3 } else { 1 };
+            while nb >= 2 && entry < self.pce_plan_len && j + 1 < row.len() {
+                if row[j] == 0 || row[j + 1] == 0 {
+                    break;
                 }
                 if self.pce_plan_type[entry] == PCE_CPE {
                     positions[entry] = row[j] | row[j + 1];
                     entry += 1;
-                } else if entry + 1 < self.pce_plan_len.max(MAX_CHANNELS) {
+                } else if entry + 1 < self.pce_plan_len {
                     positions[entry] = row[j];
                     positions[entry + 1] = row[j + 1];
                     entry += 2;
@@ -1670,6 +1709,10 @@ impl AacDecoder {
                 }
                 j += 2;
                 nb -= 2;
+            }
+            if nb & 1 == 1 && entry < self.pce_plan_len {
+                positions[entry] = row[5];
+                entry += 1;
             }
         }
 
@@ -1701,8 +1744,13 @@ impl AacDecoder {
         }
         if self.fate_trace {
             eprintln!(
-                "PCE computed: len={} out={:?}",
+                "PCE computed: len={} classes={:?} types={:?} tags={:?} chans={:?} positions={:?} out={:?}",
                 self.pce_plan_len,
+                self.pce_class_counts,
+                &self.pce_plan_type[..self.pce_plan_len],
+                &self.pce_plan_tag[..self.pce_plan_len],
+                &self.pce_plan_chan[..self.pce_plan_len],
+                &positions[..self.pce_plan_len],
                 &self.pce_out_order[..self.channels.max(1)]
             );
         }
