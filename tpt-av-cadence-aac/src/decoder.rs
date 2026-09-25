@@ -1020,19 +1020,19 @@ impl AacDecoder {
                                     id_type as usize,
                                 );
                                 sbr.ps_output = self.ps_signaled;
-                                if !self.ps_known
-                                    && !self.ps_signaled
-                                    && self.channels == 1
-                                    && id_type == 0
-                                {
-                                    // First in-band SBR payload in a mono
-                                    // stream whose container did not
-                                    // explicitly configure PS: the
-                                    // reference decoder treats the stream
-                                    // as HE-AACv2 and reconfigures its
-                                    // output as stereo ("treating HE-AAC
-                                    // mono as stereo"). Until a PS header
-                                    // actually arrives, synthesis
+                                if !self.ps_signaled && id_type == 0 && self.channels <= 2 {
+                                    // Implicit parametric stereo: a stream
+                                    // whose container configures one or two
+                                    // channels but whose blocks carry a
+                                    // single SCE with SBR is HE-AACv2
+                                    // ("stereo with SCE" in the reference:
+                                    // it reconfigures the output as stereo
+                                    // and flags implicit PS). `ps_known`
+                                    // (ASC-carried SBR without a PS flag)
+                                    // does not block this — the reference
+                                    // upgrades the config to implicit PS on
+                                    // the SCE sighting regardless. Until a
+                                    // PS header actually arrives, synthesis
                                     // duplicates the mono channel.
                                     self.ps_signaled = true;
                                     sbr.ps_output = true;
@@ -1358,6 +1358,17 @@ impl AacDecoder {
                 for i in 0..frame_len {
                     for el in &decoded[..decoded_count] {
                         self.staged.push(self.channels_state[el.ch].out[i]);
+                        // An SCE expanded to stereo by parametric stereo
+                        // synthesizes a second output channel: stage it
+                        // after the mono one so the caller's interleaving
+                        // matches the reported channel count.
+                        if self.ps_signaled
+                            && self.sbr_output_active
+                            && !el.is_cpe
+                            && el.ch + 1 < self.channels
+                        {
+                            self.staged.push(self.channels_state[el.ch + 1].out[i]);
+                        }
                     }
                 }
             }
