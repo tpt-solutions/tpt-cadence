@@ -10,9 +10,9 @@
 //! - **48 kHz input only** (CELT's native rate; no resampling), **mono or
 //!   stereo**, **CELT-only fullband, CBR, 20 ms frames** — exactly the
 //!   scope [`CeltEncoder`] itself implements today (see its module doc
-//!   comment for the full accounting: transient/TF handling and dual-stereo
-//!   independent per-channel coding are supported; SILK/hybrid encoding,
-//!   VBR, and M/S or intensity stereo coupling are not).
+//!   comment for the full accounting: transient/TF handling and joint
+//!   mid/side stereo coding are supported; SILK/hybrid encoding, VBR, and
+//!   intensity stereo are not).
 //! - **RFC 7845 pre-skip = 120 samples**: this encoder's CELT analysis/
 //!   synthesis path has one 120-sample MDCT overlap of algorithmic delay.
 //!   Audio-page granules include that delay, and the final granule is
