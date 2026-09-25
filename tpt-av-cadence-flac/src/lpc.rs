@@ -31,6 +31,34 @@ pub fn restore_fixed(block: &mut [i32], order: usize) {
     }
 }
 
+/// Computes a bounded first-order LPC predictor from integer samples.
+///
+/// FLAC's general LPC syntax is fully supported by the decoder; this encoder
+/// intentionally starts with a stable first-order coefficient derived from
+/// normalized autocorrelation. The returned coefficient is already quantized
+/// for the requested shift and is suitable for direct bitstream emission.
+pub fn analyze_lpc(samples: &[i32], order: usize, shift: u32) -> Vec<i64> {
+    if order == 0 || samples.len() <= order {
+        return vec![0; order];
+    }
+    debug_assert_eq!(
+        order, 1,
+        "the FLAC encoder currently searches first-order LPC only"
+    );
+    let mut energy = 0i128;
+    let mut correlation = 0i128;
+    for i in 1..samples.len() {
+        energy += samples[i] as i128 * samples[i] as i128;
+        correlation += samples[i] as i128 * samples[i - 1] as i128;
+    }
+    if energy == 0 {
+        return vec![0];
+    }
+    let scale = 1i128 << shift;
+    let coefficient = ((correlation * scale) / energy).clamp(-(1i128 << 14), (1i128 << 14) - 1);
+    vec![coefficient as i64]
+}
+
 /// Applies the general LPC predictor with the given quantized coefficients
 /// and right-shift.
 pub fn restore_lpc(block: &mut [i32], coefs: &[i64], shift: u32) {
@@ -80,6 +108,15 @@ mod tests {
         let mut block = vec![0, 1, 8, 27, 0, 0, 0];
         restore_fixed(&mut block, 4);
         assert_eq!(block, vec![0, 1, 8, 27, 64, 125, 216]);
+    }
+
+    #[test]
+    fn analyze_first_order_lpc_tracks_correlation() {
+        let samples = vec![10, 20, 40, 80, 160, 320];
+        let coefficients = analyze_lpc(&samples, 1, 12);
+        assert_eq!(coefficients.len(), 1);
+        assert!(coefficients[0] > 0);
+        assert!(coefficients[0] < (1i64 << 14));
     }
 
     #[test]

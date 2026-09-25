@@ -362,30 +362,12 @@ fn interp_bits2pulses(
     })
 }
 
-/// Encode-side counterpart of [`interp_bits2pulses`]. Everything here is
-/// deterministic given the same inputs *except* the three points where the
-/// decoder consults the bitstream (per-band skip bit, intensity index,
-/// dual-stereo bit) — those aren't normative encoder behavior (RFC 6716
-/// only specifies the decoder), so this uses the simplest defensible
-/// policy for a first working encoder: never skip a band while there's a
-/// real skip decision to make (matches `dec.decode_bit_logp(1)? == true`
-/// unconditionally), and never use *intensity* stereo coupling (`intensity`
-/// is pushed past every coded band, i.e. `intensity == coded_bands` when
-/// stereo, so the `i >= intensity` branch in `compute_theta`/`quant_band_stereo`
-/// never triggers). For stereo, `dual_stereo` is always signaled `true`
-/// instead of `false`: per `quant_all_bands`/`quant_band_stereo` (decode
-/// side), `dual_stereo == true` is what selects *independent* per-channel
-/// band coding (two separate `quant_band` calls, one per channel) rather
-/// than the joint mid/side (`quant_band_stereo`) path — so "no coupling"
-/// for this encoder's chosen stereo policy (independent per-channel, no
-/// M/S, no intensity stereo — see `todo.md`) means `dual_stereo = true`,
-/// not `false`. Mono (`c == 1`) is unaffected (`intensity_rsv`/
-/// `dual_stereo_rsv` are always 0 when `c != 2`, per `compute_bits1_bits2`).
-/// Skipping bands *can* still happen mechanically when a band's bit budget
-/// doesn't clear `thresh[j]` at all (no bit is spent in that case either
-/// direction, so encoder and decoder agree automatically). A smarter
-/// policy (actually choosing to trade off bands/intensity coupling for
-/// quality, or implementing M/S) is future work — see `todo.md`.
+/// Encode-side counterpart of [`interp_bits2pulses`]. The only encoder-specific
+/// decisions are the skip policy and the stereo mode. This implementation does
+/// not skip a band when a skip decision is available, and selects joint
+/// mid/side coding for stereo (`dual_stereo == false`) without intensity
+/// coupling. Mono is unaffected because the stereo parameters are not reserved
+/// for one channel.
 ///
 /// Verified bit-for-bit against [`interp_bits2pulses`] (same `pulses`,
 /// `ebits`, `fine_priority`, and [`Allocation`] fields) in `tests` below.
@@ -500,10 +482,9 @@ fn interp_bits2pulses_encode(
     }
     debug_assert!(coded_bands > start);
 
-    // Code the intensity and dual stereo parameters. Policy: no intensity
-    // coupling (push `intensity` past every coded band) but `dual_stereo =
-    // true` for stereo (independent per-channel coding — see doc comment
-    // above).
+    // Code the intensity and dual stereo parameters. The encoder uses joint
+    // mid/side coding for stereo (`dual_stereo == false`) and does not use
+    // intensity coupling.
     let intensity: usize = if intensity_rsv > 0 {
         let value = (coded_bands - start) as u32;
         enc.encode_uint(value, (coded_bands + 1 - start) as u32);
@@ -515,9 +496,9 @@ fn interp_bits2pulses_encode(
         total += dual_stereo_rsv;
         dual_stereo_rsv = 0;
     }
-    let dual_stereo = dual_stereo_rsv > 0;
+    let dual_stereo = false;
     if dual_stereo_rsv > 0 {
-        enc.encode_bit_logp(true, 1);
+        enc.encode_bit_logp(false, 1);
     }
 
     // Allocate the remaining bits.

@@ -127,6 +127,7 @@ fn demux_aac_mp4(path: &Path) -> (Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+#[ignore = "manual diagnostic harness; requires AAC_FATE_SAMPLES_DIR and ffmpeg"]
 fn forensics() {
     let dir = std::env::var_os("AAC_FATE_SAMPLES_DIR")
         .map(PathBuf::from)
@@ -135,11 +136,9 @@ fn forensics() {
     let mp4 = dir.join(format!("{name}.mp4"));
     let (asc_bytes, samples) = demux_aac_mp4(&mp4);
     let asc = tpt_av_cadence_aac::AudioSpecificConfig::parse(&asc_bytes).unwrap();
-    let mut decoder = tpt_av_cadence_aac::AacDecoder::from_config(
-        &asc,
-        Box::new(std::io::Cursor::new(samples)),
-    )
-    .unwrap();
+    let mut decoder =
+        tpt_av_cadence_aac::AacDecoder::from_config(&asc, Box::new(std::io::Cursor::new(samples)))
+            .unwrap();
     let mut pcm: Vec<f32> = Vec::new();
     let mut buf = vec![0.0f32; 6720];
     loop {
@@ -175,7 +174,11 @@ fn forensics() {
                 sig += a * a;
                 err += (a - b) * (a - b);
             }
-            let snr = if err > 0.0 { 10.0 * (sig / err).log10() } else { 999.0 };
+            let snr = if err > 0.0 {
+                10.0 * (sig / err).log10()
+            } else {
+                999.0
+            };
             if snr < 60.0 {
                 eprintln!("frame {f} ch {ch}: SNR {snr:.1} dB");
                 if first_bad.is_none() {
@@ -205,7 +208,11 @@ fn forensics() {
                     dot += (pcm[f * frame + i * channels + a] as f64)
                         * (reference[f * frame + i * channels + b] as f64);
                 }
-                let c = if ra > 0.0 && rb > 0.0 { dot / (ra * rb) } else { 0.0 };
+                let c = if ra > 0.0 && rb > 0.0 {
+                    dot / (ra * rb)
+                } else {
+                    0.0
+                };
                 row.push_str(&format!("c{c:+.2} "));
             }
             eprintln!("ours ch{a} (rms {ra:.3}): {row}");

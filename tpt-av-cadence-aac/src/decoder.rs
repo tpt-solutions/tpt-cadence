@@ -294,6 +294,10 @@ pub struct AacDecoder {
     /// in-band SBR payload (reference `m4ac.ps == -1`).
     ps_known: bool,
 
+    /// Cached developer diagnostics, initialized during construction and never
+    /// queried through the environment on the real-time decode path.
+    fate_trace: bool,
+    dump_blocks: bool,
     /// M/S decision bits for the current common-window CPE (512 entries).
     ms_mask: Box<[bool]>,
     frame_buf: Box<[u8]>,
@@ -530,6 +534,8 @@ impl AacDecoder {
             sbr_rate_doubled: false,
             ps_signaled: false,
             ps_known: false,
+            fate_trace: std::env::var_os("FATE_TRACE").is_some(),
+            dump_blocks: std::env::var_os("AAC_DUMP_BLOCKS").is_some(),
             cces: (0..4)
                 .map(|_| CouplingChannel {
                     state: ChannelState::new(),
@@ -624,7 +630,7 @@ impl AacDecoder {
                     // developer-set env var, never triggered by bitstream
                     // content, so the unwraps below are outside the
                     // real-time/no-panic contract for untrusted input.
-                    if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
+                    if self.dump_blocks {
                         use std::io::Write;
                         let nbits = consumed;
                         let nbytes = nbits.div_ceil(8);
@@ -777,8 +783,12 @@ impl AacDecoder {
                     ));
                 }
                 let id = br.read_bits(3);
-                if std::env::var_os("FATE_TRACE").is_some() {
-                    eprintln!("frame {} element id={id} bitpos={}", self.frame_count, br.pos());
+                if self.fate_trace {
+                    eprintln!(
+                        "frame {} element id={id} bitpos={}",
+                        self.frame_count,
+                        br.pos()
+                    );
                 }
                 match id {
                     SCE | LFE => {
@@ -882,11 +892,7 @@ impl AacDecoder {
                     }
                     CCE => self.decode_cce(br)?,
                     FIL => {
-                        let fil_start_bit = if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
-                            br.pos()
-                        } else {
-                            0
-                        };
+                        let fil_start_bit = if self.dump_blocks { br.pos() } else { 0 };
                         let mut count = br.read_bits(4) as usize;
                         if count == 15 {
                             count = 14 + br.read_bits(8) as usize;
@@ -964,7 +970,7 @@ impl AacDecoder {
                                     self.staged_pos = 0;
                                 }
                                 self.sbr_output_active = true;
-                                if std::env::var_os("AAC_DUMP_BLOCKS").is_some() {
+                                if self.dump_blocks {
                                     FIL_SPANS.with(|s| {
                                         s.borrow_mut()
                                             .push((fil_start_bit, payload_start + payload_bits))
@@ -1116,7 +1122,7 @@ impl AacDecoder {
             }
         }
 
-        if std::env::var_os("FATE_TRACE").is_some() && self.frame_count < 6 {
+        if self.fate_trace && self.frame_count < 6 {
             for (i, el) in decoded[..decoded_count].iter().enumerate() {
                 eprintln!(
                     "frame {} decoded[{i}]: ch={} is_cpe={} tag={}",
@@ -1151,7 +1157,7 @@ impl AacDecoder {
                 }
             }
         }
-        if std::env::var_os("FATE_TRACE").is_some() && self.frame_count < 6 {
+        if self.fate_trace && self.frame_count < 6 {
             for ch in 0..self.channels {
                 let rms: f64 = self.channels_state[ch]
                     .out
@@ -1693,14 +1699,14 @@ impl AacDecoder {
                 out_slot += 1;
             }
         }
-            if std::env::var_os("FATE_TRACE").is_some() {
+        if self.fate_trace {
             eprintln!(
                 "PCE computed: len={} out={:?}",
                 self.pce_plan_len,
                 &self.pce_out_order[..self.channels.max(1)]
             );
         }
-}
+    }
 
     /// decode_ics_info (ISO/IEC 14496-3 Table 4.5).
     fn decode_ics_info(
@@ -1764,14 +1770,14 @@ impl AacDecoder {
         let state = &mut self.channels_state[ch];
         state.kb_window_prev = state.kb_window_cur;
         state.kb_window_cur = shape;
-        if std::env::var_os("FATE_TRACE").is_some() {
+        if self.fate_trace {
             eprintln!(
                 "ics_info ch={ch} seq={sequence} groups={} max_sfb={}",
                 info.num_window_groups, info.max_sfb
             );
         }
         Ok(info)
-}
+    }
 
     /// individual_channel_stream: global_gain, [ics_info when not a
     /// common-window channel], section_data, scale_factor_data,
@@ -1790,7 +1796,7 @@ impl AacDecoder {
         };
         self.decode_band_types(br, ch, &win)?;
         self.decode_scalefactors(br, ch, global_gain, &win)?;
-        if std::env::var_os("FATE_TRACE").is_some() {
+        if self.fate_trace {
             eprintln!(
                 "RUSF ch={ch} gg={global_gain} sfo={:?} bt={:?}",
                 &self.channels_state[ch].sfo[..10],
@@ -1801,7 +1807,7 @@ impl AacDecoder {
         }
         let pulse = self.decode_optional_tools(br, ch, &win)?;
         self.decode_spectral(br, ch, &win, pulse.as_ref())?;
-        if std::env::var_os("FATE_TRACE").is_some() {
+        if self.fate_trace {
             let c: Vec<f32> = self.channels_state[ch].coeffs[..40].to_vec();
             eprintln!("RUCOEF ch={ch}: {:?}", c);
         }

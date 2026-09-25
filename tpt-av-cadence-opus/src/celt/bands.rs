@@ -494,12 +494,18 @@ fn compute_theta_encode(
     bs: usize,
     b0: usize,
     lm: i32,
+    stereo: bool,
     fill: &mut u32,
 ) -> SplitCtx {
     let i = ctx.i;
     let pulse_cap = LOGN400[i] as i32 + lm * (1 << BITRES);
-    let offset = (pulse_cap >> 1) - QTHETA_OFFSET;
-    let qn = compute_qn(n, *b, offset, pulse_cap, false);
+    let offset = (pulse_cap >> 1)
+        - if stereo && n == 2 {
+            QTHETA_OFFSET_TWOPHASE
+        } else {
+            QTHETA_OFFSET
+        };
+    let qn = compute_qn(n, *b, offset, pulse_cap, stereo);
 
     let tell = enc.tell_frac();
     let mut level = 0i32;
@@ -522,9 +528,17 @@ fn compute_theta_encode(
         let theta_q14 = theta * (2.0 / std::f64::consts::PI) * 16384.0;
         level = (theta_q14 * qn as f64 / 16384.0).round() as i32;
         level = level.clamp(0, qn);
-        if b0 > 1 {
-            // Uniform pdf, matching `compute_theta`'s `b0 > 1 || stereo`
-            // decode branch exactly (`dec.decode_uint((qn + 1) as u32)`).
+        if stereo && n > 2 {
+            let p0 = 3i32;
+            let x0_level = qn / 2;
+            let ft = p0 * (x0_level + 1) + x0_level;
+            let (fl, fh) = if level <= x0_level {
+                (p0 * level, p0)
+            } else {
+                ((x0_level + 1) * p0 + level - x0_level - 1, p0)
+            };
+            enc.encode(fl as u32, (fl + fh) as u32, ft as u32);
+        } else if stereo || b0 > 1 {
             enc.encode_uint(level as u32, (qn + 1) as u32);
         } else {
             encode_theta_triangular(enc, qn, level);
@@ -876,7 +890,8 @@ fn quant_partition_encode(
         }
         let b2 = (b_blocks + 1) >> 1;
 
-        let sctx = compute_theta_encode(ctx, enc, n2, &mut b, x0, x1, b2, b0, lm2, &mut fill);
+        let sctx =
+            compute_theta_encode(ctx, enc, n2, &mut b, x0, x1, b2, b0, lm2, false, &mut fill);
         let imid = (1.0f32 / 32768.0) * sctx.imid as f32;
         let iside = (1.0f32 / 32768.0) * sctx.iside as f32;
         let mut delta = sctx.delta;
@@ -1274,6 +1289,163 @@ fn quant_band_encode<'a>(
         }
     }
     cm & ((1u32 << b_final) - 1)
+}
+
+/// Encode-side counterpart of [`quant_band_stereo`] for bands with more than
+/// two coefficients. The decoder consumes theta followed by the mid and side
+/// quantizers; this function emits the same sequence and then reconstructs the
+/// normalized left/right pair with `stereo_merge`.
+#[allow(clippy::too_many_arguments)]
+fn quant_band_stereo_encode<'a>(
+    ctx: &mut BandCtx,
+    enc: &mut RangeEncoder,
+    x: &mut [f32],
+    y: &mut [f32],
+    n: usize,
+    b: i32,
+    b_blocks: usize,
+    lowband: Option<&'a mut [f32]>,
+    lm: i32,
+    lowband_out: Option<&mut [f32]>,
+    lowband_scratch: Option<&'a mut [f32]>,
+    fill: u32,
+    htmp: &mut [f32],
+    iy: &mut [i32],
+) -> u32 {
+    if n == 1 {
+        quant_band_n1_encode(ctx, enc, x, lowband_out);
+        quant_band_n1_encode(ctx, enc, y, None);
+        return 1;
+    }
+    let mut b = b;
+    let mut fill = fill;
+    let split = compute_theta_encode(
+        ctx, enc, n, &mut b, x, y, b_blocks, b_blocks, lm, true, &mut fill,
+    );
+    let mid = split.imid as f32 / 32768.0;
+    let side = split.iside as f32 / 32768.0;
+    ctx.remaining_bits -= split.qalloc;
+    if n == 2 {
+        let side_bits = if split.itheta != 0 && split.itheta != 16384 {
+            1 << BITRES
+        } else {
+            0
+        };
+        let mid_bits = b - side_bits;
+        let swap = split.itheta > 8192;
+        let (x2, y2): (&mut [f32], &mut [f32]) = if swap { (y, x) } else { (x, y) };
+        let sign_positive = x2[0] * y2[0] + x2[1] * y2[1] >= 0.0;
+        if side_bits > 0 {
+            enc.write_raw_bits(u32::from(!sign_positive), 1);
+        }
+        let cm = quant_band_encode(
+            ctx,
+            enc,
+            x2,
+            n,
+            mid_bits,
+            b_blocks,
+            lowband,
+            lm,
+            lowband_out,
+            Q15ONE,
+            lowband_scratch,
+            fill,
+            htmp,
+            iy,
+        );
+        y2[0] = if sign_positive { x2[1] } else { -x2[1] };
+        y2[1] = if sign_positive { -x2[0] } else { x2[0] };
+        let a = x[0] * mid;
+        x[0] = a - y[0] * side;
+        y[0] += a;
+        let a = x[1] * mid;
+        x[1] = a - y[1] * side;
+        y[1] += a;
+        return cm;
+    }
+    let mut mbits = 0.max(b.min((b - split.delta) / 2));
+    let mut sbits = b - mbits;
+    let rebalance = ctx.remaining_bits;
+    let (mid_cm, side_cm) = if mbits >= sbits {
+        let mid_cm = quant_band_encode(
+            ctx,
+            enc,
+            x,
+            n,
+            mbits,
+            b_blocks,
+            lowband,
+            lm,
+            lowband_out,
+            Q15ONE,
+            lowband_scratch,
+            fill,
+            htmp,
+            iy,
+        );
+        let rebalance = mbits - (rebalance - ctx.remaining_bits);
+        if rebalance > 3 << BITRES && split.itheta != 0 {
+            sbits += rebalance - (3 << BITRES);
+        }
+        let side_cm = quant_band_encode(
+            ctx,
+            enc,
+            y,
+            n,
+            sbits,
+            b_blocks,
+            None,
+            lm,
+            None,
+            side,
+            None,
+            fill >> b_blocks,
+            htmp,
+            iy,
+        );
+        (mid_cm, side_cm)
+    } else {
+        let side_cm = quant_band_encode(
+            ctx,
+            enc,
+            y,
+            n,
+            sbits,
+            b_blocks,
+            None,
+            lm,
+            None,
+            side,
+            None,
+            fill >> b_blocks,
+            htmp,
+            iy,
+        );
+        let rebalance = sbits - (rebalance - ctx.remaining_bits);
+        if rebalance > 3 << BITRES && split.itheta != 16384 {
+            mbits += rebalance - (3 << BITRES);
+        }
+        let mid_cm = quant_band_encode(
+            ctx,
+            enc,
+            x,
+            n,
+            mbits,
+            b_blocks,
+            lowband,
+            lm,
+            lowband_out,
+            Q15ONE,
+            lowband_scratch,
+            fill,
+            htmp,
+            iy,
+        );
+        (mid_cm, side_cm)
+    };
+    stereo_merge(x, y, mid);
+    mid_cm | side_cm
 }
 
 /// `quant_band_stereo`: decodes one band for the stereo case.
@@ -1788,31 +1960,10 @@ pub(crate) fn quant_all_bands(
     Ok(())
 }
 
-/// Encode-side counterpart of [`quant_all_bands`], **scoped to non-hybrid
-/// frames** with, for stereo, a deliberately simplified policy: independent
-/// per-channel band coding only (`dual_stereo` always effectively `true`,
-/// no mid/side (`quant_band_stereo`-equivalent) joint coding, no intensity
-/// stereo) — see the "stereo encoder policy" note in `todo.md`. This
-/// matches what [`super::rate::compute_allocation_encode`] now signals
-/// (`dual_stereo == true`, `intensity` pushed past every coded band) for
-/// `c == 2`, so the `stereo && !dual_stereo` joint arm in [`quant_all_bands`]
-/// (decode side) never triggers for any band this encoder actually spends
-/// bits on; the handful of trailing zero-bit bands where the decoder's own
-/// `dual_stereo && i == intensity` switch *would* flip it off cost zero
-/// bits either way (the switch only changes which of two structurally
-/// different zero-bit-consuming reconstructions the decoder performs, not
-/// how many bits it reads), so this function doesn't need to replicate that
-/// arm at all — every stereo band always goes through two independent
-/// [`quant_band_encode`] calls, mirroring [`quant_all_bands`]'s
-/// `dual_stereo` arm exactly (including its `b / 2` per-channel bit split).
-///
-/// What's shared with the decoder: the per-band bit budget arithmetic
-/// (`balance`/`b` from `pulses`/`total_bits`), the lowband-folding
-/// bookkeeping (`lowband_offset`, `effective_lowband`, the fold-source
-/// aliasing/overlap-snapshot logic — all pure index/slice management, no
-/// bitstream I/O), and the collapse-mask propagation between bands. The
-/// only encoder-specific piece is calling [`quant_band_encode`] instead of
-/// [`quant_band`].
+/// Encode-side counterpart of [`quant_all_bands`] for CELT-only frames. For
+/// stereo, `dual_stereo == false` selects the joint M/S path; mono retains
+/// the existing single-band path. The allocation policy is supplied by the
+/// caller so the signal and the emitted band layout cannot diverge.
 ///
 /// `x`/`norm`/`scratch`/`htmp`/`iy`/`collapse_masks` have the same shapes
 /// and roles as in [`quant_all_bands`]: `x` is `n_total` samples per channel
@@ -1826,6 +1977,7 @@ pub(crate) fn quant_all_bands_encode(
     end: usize,
     x: &mut [f32],
     stereo: bool,
+    dual_stereo: bool,
     collapse_masks: &mut [u8],
     pulses: &[i32],
     short_blocks: bool,
@@ -1942,7 +2094,40 @@ pub(crate) fn quant_all_bands_encode(
         let out = if last { None } else { Some((out_off, n)) };
         let mut scratch_opt = if last { None } else { Some(&mut scratch[..]) };
 
-        if stereo {
+        if stereo && !dual_stereo {
+            let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
+                (Some(eff), Some((o, _)), scratch) if eff + n > o => {
+                    let sc = scratch.expect("overlap folding needs scratch");
+                    sc[..n].copy_from_slice(&norm0[eff..eff + n]);
+                    (Some(&mut sc[..]), Some(&mut norm0[o..]), None)
+                }
+                (Some(eff), Some((o, _)), scratch) => {
+                    let (l, r) = norm0.split_at_mut(o);
+                    (Some(&mut l[eff..]), Some(&mut r[..]), scratch)
+                }
+                (Some(eff), None, scratch) => (Some(&mut norm0[eff..]), None, scratch),
+                (None, Some((o, _)), scratch) => (None, Some(&mut norm0[o..]), scratch),
+                (None, None, scratch) => (None, None, scratch),
+            };
+            let cm = quant_band_stereo_encode(
+                &mut ctx,
+                enc,
+                x_band,
+                y_band.unwrap(),
+                n,
+                b,
+                b_blocks0,
+                lb,
+                lm as i32,
+                out_s,
+                scr,
+                x_cm | y_cm,
+                htmp,
+                iy,
+            );
+            x_cm = cm;
+            y_cm = cm;
+        } else if stereo {
             let (lb, out_s, scr) = match (effective_lowband, out, scratch_opt.as_deref_mut()) {
                 (Some(eff), Some((o, _)), scratch) if eff + n > o => {
                     let sc = scratch.expect("overlap folding needs scratch");
@@ -2478,6 +2663,7 @@ mod encode_tests {
             end,
             &mut x_enc,
             false,
+            true,
             &mut collapse_masks_enc,
             &alloc.pulses,
             false,
@@ -2624,6 +2810,7 @@ mod encode_tests {
             end,
             &mut x_enc,
             true,
+            false,
             &mut collapse_masks_enc,
             &alloc.pulses,
             false,
@@ -2680,8 +2867,8 @@ mod encode_tests {
 
         assert_eq!(alloc.pulses, dec_alloc.pulses, "pulse allocation mismatch");
         assert!(
-            alloc.alloc.dual_stereo,
-            "encoder policy must signal dual_stereo=true for stereo"
+            !alloc.alloc.dual_stereo,
+            "encoder policy must signal dual_stereo=false for stereo"
         );
         assert_eq!(x_enc, x_dec, "final spectrum mismatch");
         assert_eq!(

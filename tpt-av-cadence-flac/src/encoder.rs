@@ -4,10 +4,8 @@
 //!
 //! - Fixed blocksize only (a single common block size for every full frame;
 //!   the final frame of a stream may be shorter). No block-switching.
-//! - Subframe types: CONSTANT, VERBATIM, and FIXED (predictor orders 0-4).
-//!   General LPC (Levinson-Durbin analysis) subframes are **not**
-//!   implemented — a natural stretch goal, but fixed predictors alone are a
-//!   complete, spec-compliant, always-lossless encoder.
+//! - Subframe types: CONSTANT, VERBATIM, FIXED (predictor orders 0-4), and
+//!   bounded first-order LPC selected by an autocorrelation estimate.
 //! - Partitioned Rice residual coding, always using the Rice2 (5-bit
 //!   parameter) coding method for simplicity, with a partition-order search
 //!   (capped) and a per-partition optimal-parameter search, including the
@@ -338,6 +336,16 @@ fn compute_fixed_residual(samples: &[i32], order: usize, out: &mut Vec<i32>) {
     }
 }
 
+/// Computes the residual for a quantized first-order LPC predictor.
+fn compute_lpc_residual(samples: &[i32], coefficient: i64, shift: u32, out: &mut Vec<i32>) {
+    out.clear();
+    out.extend_from_slice(samples);
+    for i in 1..samples.len() {
+        let prediction = (coefficient.wrapping_mul(samples[i - 1] as i64) >> shift) as i32;
+        out[i] = samples[i].wrapping_sub(prediction);
+    }
+}
+
 /// Encodes one subframe (one channel's worth of one block).
 fn encode_subframe(bw: &mut BitWriter, samples: &[i32], bps: u16, scratch: &mut Vec<i32>) {
     bw.push(0, 1); // padding
@@ -372,7 +380,25 @@ fn encode_subframe(bw: &mut BitWriter, samples: &[i32], bps: u16, scratch: &mut 
     let fixed_cost = best_order as u64 * bps as u64 + 2 /* method */ + residual_cost;
     let verbatim_cost = samples.len() as u64 * bps as u64;
 
-    if fixed_cost <= verbatim_cost {
+    const LPC_SHIFT: u32 = 12;
+    const LPC_PRECISION: u32 = 15;
+    let lpc_coefficients = lpc::analyze_lpc(samples, 1, LPC_SHIFT);
+    let lpc_coefficient = lpc_coefficients[0];
+    compute_lpc_residual(samples, lpc_coefficient, LPC_SHIFT, scratch);
+    let lpc_residual: Vec<i32> = scratch[1..].to_vec();
+    debug_assert_eq!(lpc_residual.len() + 1, samples.len());
+    let (lpc_po, lpc_plans, lpc_residual_cost) = plan_residual(&lpc_residual, samples.len(), 1);
+    let lpc_cost = bps as u64 + 4 + 5 + LPC_PRECISION as u64 + 2 + lpc_residual_cost;
+
+    if lpc_cost < fixed_cost && lpc_cost < verbatim_cost {
+        bw.push(0b100000, 6); // LPC, order 1
+        bw.push(0, 1); // no wasted bits
+        bw.push_signed(samples[0] as i64, bps as u32);
+        bw.push((LPC_PRECISION - 1) as u64, 4);
+        bw.push_signed(LPC_SHIFT as i64, 5);
+        bw.push_signed(lpc_coefficient, LPC_PRECISION);
+        write_residual(bw, &lpc_residual, samples.len(), 1, lpc_po, &lpc_plans);
+    } else if fixed_cost <= verbatim_cost {
         bw.push(0b001000 | best_order as u64, 6); // FIXED, order in low 3 bits
         bw.push(0, 1); // no wasted bits
         for &w in &samples[..best_order] {

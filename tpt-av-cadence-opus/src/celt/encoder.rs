@@ -61,25 +61,14 @@
 //!
 //! ## Stereo (this session)
 //!
-//! Stereo policy: **independent per-channel band coding only** — no
-//! mid/side (M/S) coupling, no intensity stereo. Concretely, this means
-//! [`super::rate::compute_allocation_encode`] always signals `dual_stereo =
-//! true` and pushes `intensity` past every coded band when `channels == 2`
-//! (see that module's doc comment for why `dual_stereo == true`, not
-//! `false`, is what selects independent coding on the decode side), and
-//! [`quant_all_bands_encode`] always takes the two-independent-`quant_band_encode`-calls
-//! path per band rather than a joint mid/side path (which this crate does
-//! not implement encode-side at all). This is a legitimate, simpler-first
-//! RFC-legal choice (RFC 6716 only specifies the decoder, which already
-//! supports both `dual_stereo` policies), not a shortcut that produces an
-//! invalid bitstream — see `todo.md` for the reasoning and for
-//! M/S/intensity-stereo as explicit future work. Pre-emphasis, the MDCT
-//! analysis, and the per-band energy split all now run once per channel
+//! Stereo policy: **joint mid/side (M/S) band coding for stereo** — no
+//! intensity stereo. The allocation encoder signals `dual_stereo = false`
+//! for stereo, and the band quantizer emits the decoder-compatible theta
+//! split followed by mid/side quantization and reconstruction. Pre-emphasis,
+//! the MDCT analysis, and the per-band energy split all run once per channel
 //! (deinterleaving `channels`-wide input PCM into independent per-channel
 //! sample/MDCT-tail/spectrum state); the coarse/fine/finalise energy
-//! quantizers already supported a channel-count parameter before this
-//! session (verified stereo-tested in `quant_bands.rs` already) and needed
-//! no changes.
+//! quantizers already support the channel-count parameter.
 
 use super::bands::{quant_all_bands_encode, TF_SELECT_TABLE};
 use super::decoder::{OVERLAP, SPREAD_ICDF_TBL, TRIM_ICDF};
@@ -612,6 +601,7 @@ impl CeltEncoder {
             NB_EBANDS,
             &mut x_spec[..channels * n2],
             stereo,
+            alloc.alloc.dual_stereo,
             &mut collapse_masks[..NB_EBANDS * channels],
             &alloc.pulses,
             is_transient,
