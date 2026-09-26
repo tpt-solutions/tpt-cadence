@@ -94,7 +94,19 @@ impl ParametricStereo {
             *self = candidate;
             br.br.pos() - start
         } else {
-            self.disable();
+            // Reference error path (ff_ps_read_data `err:` label): the
+            // partially parsed state PERSISTS — enable flags, band modes,
+            // and envelope geometry survive the failed parse — while
+            // `start` clears and every parameter array is zeroed. Resetting
+            // the whole struct instead would make later header-less frames
+            // consume a different number of parameter bits than the
+            // reference desynchronizing PS until the next header.
+            candidate.start = false;
+            candidate.iid_par = [[0; MAX_PAR]; MAX_ENV];
+            candidate.icc_par = [[0; MAX_PAR]; MAX_ENV];
+            candidate.ipd_par = [[0; MAX_PAR]; MAX_ENV];
+            candidate.opd_par = [[0; MAX_PAR]; MAX_ENV];
+            *self = candidate;
             br.br.set_pos(start + bits_left);
             bits_left
         }
@@ -107,10 +119,7 @@ impl ParametricStereo {
             if self.enable_iid {
                 let mode = br.bits(3) as usize;
                 if mode > 5 {
-                    {
-                        eprintln!("FAIL at line {}", line!());
-                        return false;
-                    }
+                    return false;
                 }
                 self.nr_iid_par = [10, 20, 34, 10, 20, 34][mode];
                 self.iid_quant = mode > 2;
@@ -120,10 +129,7 @@ impl ParametricStereo {
             if self.enable_icc {
                 self.icc_mode = br.bits(3) as usize;
                 if self.icc_mode > 5 {
-                    {
-                        eprintln!("FAIL at line {}", line!());
-                        return false;
-                    }
+                    return false;
                 }
                 self.nr_icc_par = [10, 20, 34, 10, 20, 34][self.icc_mode];
             }
@@ -137,10 +143,7 @@ impl ParametricStereo {
             for env in 1..=self.num_env {
                 self.border_position[env] = br.bits(5) as i32;
                 if self.border_position[env] < self.border_position[env - 1] {
-                    {
-                        eprintln!("FAIL at line {}", line!());
-                        return false;
-                    }
+                    return false;
                 }
             }
         } else {
@@ -172,10 +175,7 @@ impl ParametricStereo {
                     dt == 1,
                     7 + 8 * i32::from(self.iid_quant),
                 ) {
-                    {
-                        eprintln!("FAIL at line {}", line!());
-                        return false;
-                    }
+                    return false;
                 }
             }
         } else {
@@ -195,10 +195,7 @@ impl ParametricStereo {
                     dt == 1,
                     7,
                 ) {
-                    {
-                        eprintln!("FAIL at line {}", line!());
-                        return false;
-                    }
+                    return false;
                 }
             }
         } else {
@@ -214,14 +211,8 @@ impl ParametricStereo {
                 let extension_id = br.bits(2) as usize;
                 if extension_id == 0 {
                     let Some(consumed) = read_extension(br, self) else {
-                        {
-                            eprintln!("FAIL at line {}", line!());
-                            return false;
-                        }
+                        return false;
                     };
-                    if std::env::var_os("PS_TEST_TRACE").is_some() {
-                        eprintln!("ext consumed={consumed} count_before={count}");
-                    }
                     count -= 2 + consumed as i32;
                 } else {
                     br.br.skip_bits((count - 2) as usize);
@@ -229,10 +220,7 @@ impl ParametricStereo {
                 }
             }
             if count < 0 {
-                {
-                    eprintln!("FAIL at line {}", line!());
-                    return false;
-                }
+                return false;
             }
             if count > 0 {
                 br.br.skip_bits(count as usize);
@@ -268,8 +256,13 @@ impl ParametricStereo {
             self.border_position[self.num_env] = (QMF_SLOTS - 1) as i32;
         }
         self.is34bands_old = self.is34bands;
-        self.is34bands = (self.enable_iid && self.nr_iid_par == 34)
-            || (self.enable_icc && self.nr_icc_par == 34);
+        // The reference only re-derives the 20/34-band mode when either
+        // parameter family is enabled; a payload disabling both keeps the
+        // previous mode (and therefore keeps synthesis band mapping too).
+        if self.enable_iid || self.enable_icc {
+            self.is34bands = (self.enable_iid && self.nr_iid_par == 34)
+                || (self.enable_icc && self.nr_icc_par == 34);
+        }
         if header {
             self.start = true;
         }
@@ -280,14 +273,12 @@ impl ParametricStereo {
 fn read_extension(br: &mut SbrBitReader<'_>, ps: &mut ParametricStereo) -> Option<usize> {
     let start = br.br.pos();
     ps.enable_ipdopd = br.bit();
-    if std::env::var_os("PS_TEST_TRACE").is_some() {
-        eprintln!(
-            "read_extension: enable_ipdopd={} num_env={}",
-            ps.enable_ipdopd, ps.num_env
-        );
-    }
     if ps.enable_ipdopd {
         for env in 0..ps.num_env {
+            // Each phase family carries its OWN per-envelope dt flag
+            // (reference read_ps_data: `dt = get_bits1(gb); read_ipdopd_data(
+            // ipd ...); dt = get_bits1(gb); read_ipdopd_data(opd ...)`), so
+            // two bits are consumed per envelope even when the flags match.
             let dt = usize::from(br.bit());
             if !read_params(
                 br,
@@ -299,7 +290,11 @@ fn read_extension(br: &mut SbrBitReader<'_>, ps: &mut ParametricStereo) -> Optio
                 ps.num_env_old,
                 dt == 1,
                 7,
-            ) || !read_params(
+            ) {
+                return None;
+            }
+            let dt = usize::from(br.bit());
+            if !read_params(
                 br,
                 &mut ps.opd_par,
                 ps.nr_ipdopd_par,

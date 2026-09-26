@@ -22,6 +22,11 @@ pub struct AudioSpecificConfig {
     /// are shaped by this plan; the channel count is its summed channel
     /// total.
     pub program_config: Option<AacPcePlan>,
+    /// GASpecificConfig `frameLengthFlag`: true selects the 960/120-sample
+    /// transform instead of 1024/128. Explicit HE-AAC signaling combined
+    /// with this flag is downgraded to core-rate output (the reference
+    /// decoder drops SBR/PS for short frames).
+    pub frame_length_short: bool,
 }
 
 /// A parsed program config element: `(element type, tag)` entries in
@@ -104,17 +109,25 @@ impl AudioSpecificConfig {
                     "HE-AAC extension sampling frequency index is reserved".to_string(),
                 ));
             }
-            let config = Self {
+            let mut config = Self {
                 object_type,
                 sampling_frequency_index: core_index,
                 channel_configuration,
                 extension_sampling_frequency_index: Some(extension_index),
                 ps_signaled: object_type == 29,
                 program_config: None,
+                frame_length_short: false,
             };
             config.core_sample_rate()?;
             config.sample_rate()?;
-            read_ga_specific_config(&mut br)?;
+            config.frame_length_short = read_ga_specific_config(&mut br)?;
+            // The reference drops SBR/PS for short frames ("SBR with 960
+            // frame length" is a missing feature there too), falling back to
+            // core-rate output; mirror that instead of rejecting.
+            if config.frame_length_short {
+                config.extension_sampling_frequency_index = None;
+                config.ps_signaled = false;
+            }
             // sbrPresentFlag is signalled as zero to indicate explicit
             // backwards-compatible SBR signaling. A value of one means the
             // stream explicitly says SBR is absent, contradicting AOT 5/29.
@@ -133,7 +146,7 @@ impl AudioSpecificConfig {
         }
         let sampling_frequency_index = br.read_bits(4) as u8;
         let channel_configuration = br.read_bits(4) as u8;
-        read_ga_specific_config(&mut br)?;
+        let frame_length_short = read_ga_specific_config(&mut br)?;
 
         let program_config = if channel_configuration == 0 {
             Some(parse_program_config_element(&mut br)?)
@@ -148,6 +161,7 @@ impl AudioSpecificConfig {
             extension_sampling_frequency_index: None,
             ps_signaled: false,
             program_config,
+            frame_length_short,
         })
     }
 }
@@ -161,12 +175,11 @@ fn read_audio_object_type(br: &mut crate::bitreader::BitReader<'_>) -> u8 {
     }
 }
 
-fn read_ga_specific_config(br: &mut crate::bitreader::BitReader<'_>) -> Result<()> {
-    if br.read_bits(1) != 0 {
-        return Err(CadenceError::UnsupportedFeature(
-            "960/480-sample frames are not supported".to_string(),
-        ));
-    }
+/// Reads the GASpecificConfig header; returns `frameLengthFlag` (true =
+/// 960/120-sample transform). `dependsOnCoreCoder` and the extension flag
+/// stay unsupported.
+fn read_ga_specific_config(br: &mut crate::bitreader::BitReader<'_>) -> Result<bool> {
+    let frame_length_short = br.read_bits(1) != 0;
     if br.read_bits(1) != 0 {
         return Err(CadenceError::UnsupportedFeature(
             "dependsOnCoreCoder is not supported".to_string(),
@@ -177,7 +190,7 @@ fn read_ga_specific_config(br: &mut crate::bitreader::BitReader<'_>) -> Result<(
             "ASC extension flag is not supported".to_string(),
         ));
     }
-    Ok(())
+    Ok(frame_length_short)
 }
 
 const PCE_SCE: u8 = 0;
@@ -318,6 +331,27 @@ mod tests {
         assert_eq!(config.sampling_frequency_index, 4);
         assert_eq!(config.extension_sampling_frequency_index, None);
         assert!(!config.ps_signaled);
+        assert!(!config.frame_length_short);
+        assert_eq!(config.sample_rate().unwrap(), 44_100);
+    }
+
+    #[test]
+    fn parses_960_frame_length_flag() {
+        // AOT 2, 44.1 kHz, mono, frameLengthFlag=1.
+        let config = AudioSpecificConfig::parse(&[0x12, 0x0C]).unwrap();
+        assert!(config.frame_length_short);
+        assert_eq!(config.sample_rate().unwrap(), 44_100);
+    }
+
+    #[test]
+    fn explicit_heaac_with_short_frames_downgrades_to_core_rate() {
+        // AOT 5, 44.1 kHz core, mono, extension 44.1 kHz, SBR extension
+        // type, frameLengthFlag=1. The reference drops SBR/PS for short
+        // frames, so the effective output rate is the core rate.
+        let config = AudioSpecificConfig::parse(&[0x2A, 0x0A, 0x16, 0x00]).unwrap();
+        assert!(config.frame_length_short);
+        assert!(!config.ps_signaled);
+        assert_eq!(config.extension_sampling_frequency_index, None);
         assert_eq!(config.sample_rate().unwrap(), 44_100);
     }
 }

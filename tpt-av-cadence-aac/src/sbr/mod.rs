@@ -250,8 +250,9 @@ impl Sbr {
     pub fn turnoff(&mut self) {
         self.start = false;
         self.ready_for_dequant = false;
-        self.ps.disable();
-        self.ps_synth.reset();
+        // NOTE: the reference's sbr_turnoff leaves the Parametric Stereo
+        // context untouched (its parameter/synthesis state is only gated by
+        // ps.start at apply time), so PS survives an SBR turnoff here too.
         self.kx[1] = 32;
         self.m[1] = 0;
         self.data[0].e_a[1] = -1;

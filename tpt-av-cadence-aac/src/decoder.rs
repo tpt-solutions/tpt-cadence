@@ -125,11 +125,21 @@ struct CouplingChannel {
 }
 
 impl ChannelState {
-    fn new() -> Self {
+    /// `frame_len` is the transform length (960/1024). SBR doubles the
+    /// output, but SBR never runs on 960-frame streams, so `out` holds
+    /// `2 * frame_len` there and `frame_len` otherwise. Coefficients keep
+    /// the fixed 8x128 short-window stride of the reference layout (long
+    /// windows simply use the first `frame_len`).
+    fn new(frame_len: usize) -> Self {
+        let out_len = if frame_len == 960 {
+            frame_len
+        } else {
+            2 * frame_len
+        };
         ChannelState {
             coeffs: vec![0.0; 1024].into_boxed_slice(),
-            out: vec![0.0; 2048].into_boxed_slice(),
-            saved: vec![0.0; 512].into_boxed_slice(),
+            out: vec![0.0; out_len].into_boxed_slice(),
+            saved: vec![0.0; frame_len / 2].into_boxed_slice(),
             band_type: vec![0u8; 512].into_boxed_slice(),
             sfo: vec![0i32; 512].into_boxed_slice(),
             sf: vec![0.0f32; 512].into_boxed_slice(),
@@ -156,7 +166,7 @@ impl ChannelState {
 
 /// Window parameters resolved from ics_info (shared by a common-window CPE).
 #[derive(Clone, Copy)]
-struct WindowInfo {
+pub struct WindowInfo {
     sequence: u8,
     num_windows: usize,
     num_window_groups: usize,
@@ -164,10 +174,11 @@ struct WindowInfo {
     max_sfb: usize,
     num_swb: usize,
     sf_index: usize,
+    frame_len: usize,
 }
 
 impl WindowInfo {
-    fn placeholder(sf_index: usize) -> Self {
+    fn placeholder(frame_len: usize, sf_index: usize) -> Self {
         WindowInfo {
             sequence: ONLY_LONG,
             num_windows: 1,
@@ -176,14 +187,21 @@ impl WindowInfo {
             max_sfb: 0,
             num_swb: 0,
             sf_index,
+            frame_len,
         }
     }
 
     fn swb_offsets(&self) -> &'static [u16] {
+        let (short, long): (&tables::SwbOffsetTable, &tables::SwbOffsetTable) =
+            if self.frame_len == 960 {
+                (&tables::SWB_OFFSET_120, &tables::SWB_OFFSET_960)
+            } else {
+                (&tables::SWB_OFFSET_128, &tables::SWB_OFFSET_1024)
+            };
         let table = if self.sequence == EIGHT_SHORT {
-            tables::SWB_OFFSET_128[self.sf_index]
+            short[self.sf_index]
         } else {
-            tables::SWB_OFFSET_1024[self.sf_index]
+            long[self.sf_index]
         };
         table.unwrap_or(&[])
     }
@@ -235,6 +253,10 @@ pub struct AacDecoder {
     /// The stream's fixed channel configuration value (0 = PCE-configured).
     channel_configuration: u8,
     sf_index: usize,
+    /// Transform length: 1024, or 960 when the ASC's `frameLengthFlag` is
+    /// set (short windows then use 120 instead of 128). ADTS cannot signal
+    /// the short transform, so it is always 1024 there.
+    frame_len: usize,
     /// Header of the first ADTS frame, consumed during open.
     pending_header: Option<[u8; 7]>,
     frame_count: u64,
@@ -378,6 +400,7 @@ impl AacDecoder {
             first.sampling_frequency_index as usize,
             false,
             None,
+            1024,
         )?;
         decoder.pending_header = Some(header);
         Ok(decoder)
@@ -395,6 +418,10 @@ impl AacDecoder {
         source: Box<dyn ByteSource>,
     ) -> Result<Self, CadenceError> {
         let sample_rate = config.sample_rate()?;
+        // frameLengthFlag selects the 960/120 transform. The reference
+        // decoder drops SBR (and PS) for short frames, so those streams stay
+        // at the core rate.
+        let frame_len = if config.frame_length_short { 960 } else { 1024 };
         let mut decoder = Self::open_with_params(
             BufferedSource::new(source, 8192),
             sample_rate,
@@ -402,16 +429,17 @@ impl AacDecoder {
             config.sampling_frequency_index as usize,
             true,
             config.program_config.as_ref(),
+            frame_len,
         )?;
         if config.program_config.is_some() {
             decoder.recompute_pce_out_order();
         }
-        if config.extension_sampling_frequency_index.is_some() {
+        if frame_len == 1024 && config.extension_sampling_frequency_index.is_some() {
             decoder.sbr_output_active = true;
             decoder.sbr_rate_doubled = true;
         }
         decoder.ps_known = true;
-        decoder.ps_signaled = config.ps_signaled;
+        decoder.ps_signaled = frame_len == 1024 && config.ps_signaled;
         if config.ps_signaled {
             // HE-AACv2: the mono core is synthesized to a stereo output.
             // The channel configuration is typically 1 (a single SCE); a
@@ -433,7 +461,9 @@ impl AacDecoder {
         sf_index: usize,
         raw_blocks: bool,
         asc_pce: Option<&crate::audio_specific::AacPcePlan>,
+        frame_len: usize,
     ) -> Result<Self, CadenceError> {
+        debug_assert!(frame_len == 1024 || frame_len == 960);
         // Channel count and initial PCE plan: an ASC-carried program
         // config element (channel configuration 0) fixes both at open.
         let (channels, pce_plan, pce_class_counts) = match asc_pce {
@@ -500,7 +530,7 @@ impl AacDecoder {
         // `channels` starts at 0 and is upgraded then.
         let mut channels_state = Vec::with_capacity(MAX_CHANNELS + 1);
         for _ in 0..=CCE_SCRATCH_CHANNEL {
-            channels_state.push(ChannelState::new());
+            channels_state.push(ChannelState::new(frame_len));
         }
 
         let mut info = StreamInfo::new(Format::Aac, sample_rate, channels as u16, 16);
@@ -515,6 +545,7 @@ impl AacDecoder {
             channels,
             channel_configuration,
             sf_index,
+            frame_len,
             pending_header: None,
             frame_count: 0,
             raw_blocks,
@@ -556,15 +587,15 @@ impl AacDecoder {
             channels_state,
             spectral_books,
             sf_book,
-            mdct_long: Mdct::new(1024),
-            mdct_short: Mdct::new(128),
-            win_long_kb: kbd_window(1024, 4.0).into_boxed_slice(),
-            win_long_sine: sine_window(1024).into_boxed_slice(),
-            win_short_kb: kbd_window(128, 6.0).into_boxed_slice(),
-            win_short_sine: sine_window(128).into_boxed_slice(),
-            synth: vec![0.0; 2048].into_boxed_slice(),
-            buf: vec![0.0; 1024].into_boxed_slice(),
-            temp: vec![0.0; 128].into_boxed_slice(),
+            mdct_long: Mdct::new(frame_len),
+            mdct_short: Mdct::new(frame_len / 8),
+            win_long_kb: kbd_window(frame_len, 4.0).into_boxed_slice(),
+            win_long_sine: sine_window(frame_len).into_boxed_slice(),
+            win_short_kb: kbd_window(frame_len / 8, 6.0).into_boxed_slice(),
+            win_short_sine: sine_window(frame_len / 8).into_boxed_slice(),
+            synth: vec![0.0; 2 * frame_len].into_boxed_slice(),
+            buf: vec![0.0; frame_len].into_boxed_slice(),
+            temp: vec![0.0; frame_len / 8].into_boxed_slice(),
             noise: NoiseGenerator::new(),
             sbr_by_channel: std::array::from_fn(|_| None),
             sbr_output_active: false,
@@ -576,8 +607,8 @@ impl AacDecoder {
             cces: (0..4)
                 .map(|_| CouplingChannel {
                     instance_tag: 0,
-                    state: ChannelState::new(),
-                    window: WindowInfo::placeholder(sf_index),
+                    state: ChannelState::new(frame_len),
+                    window: WindowInfo::placeholder(frame_len, sf_index),
                     coupling_point: 0,
                     num_coupled: 0,
                     ty: [0; MAX_CCE_TARGETS],
@@ -827,7 +858,7 @@ impl AacDecoder {
         // window info.
         let mut block_channels = [BlockElem {
             ch: 0,
-            win: WindowInfo::placeholder(self.sf_index),
+            win: WindowInfo::placeholder(self.frame_len, self.sf_index),
             is_cpe: false,
             element_type: SCE as u8,
             tag: 0,
@@ -980,6 +1011,12 @@ impl AacDecoder {
                         // extension_payload: extension_type(4) then payload.
                         let ext_type = br.read_bits(4);
                         match ext_type {
+                            13 | 14 if self.frame_len == 960 => {
+                                // 960-frame streams carry no SBR (the
+                                // reference skips the payload with a
+                                // "missing feature" note): leave the stream
+                                // at the core rate and ignore the element.
+                            }
                             13 | 14 => {
                                 // SBR extension (13 = plain, 14 = with CRC).
                                 let crc = ext_type == 14;
@@ -1090,7 +1127,7 @@ impl AacDecoder {
         // AFTER_IMDCT independent coupling acts on the time-domain output.
         let mut decoded = [BlockElem {
             ch: 0,
-            win: WindowInfo::placeholder(self.sf_index),
+            win: WindowInfo::placeholder(self.frame_len, self.sf_index),
             is_cpe: false,
             element_type: SCE as u8,
             tag: 0,
@@ -1319,7 +1356,11 @@ impl AacDecoder {
             Pce(&'a [u8]),
             Element,
         }
-        let frame_len = if self.sbr_output_active { 2048 } else { 1024 };
+        let frame_len = if self.sbr_output_active {
+            2 * self.frame_len
+        } else {
+            self.frame_len
+        };
         let order: Order = if self.pce_plan_len > 0 && block_count == self.channels {
             Order::Pce(&self.pce_out_order[..self.channels])
         } else if self.pce_plan_len == 0 && block_count == self.channels {
@@ -1923,6 +1964,7 @@ impl AacDecoder {
             max_sfb: 0,
             num_swb: 0,
             sf_index: self.sf_index,
+            frame_len: self.frame_len,
         };
 
         if sequence == EIGHT_SHORT {
@@ -1936,10 +1978,18 @@ impl AacDecoder {
                 }
             }
             info.num_windows = 8;
-            info.num_swb = tables::NUM_SWB_128[info.sf_index] as usize;
+            info.num_swb = if self.frame_len == 960 {
+                tables::NUM_SWB_120[info.sf_index]
+            } else {
+                tables::NUM_SWB_128[info.sf_index]
+            } as usize;
         } else {
             info.max_sfb = br.read_bits(6) as usize;
-            info.num_swb = tables::NUM_SWB_1024[info.sf_index] as usize;
+            info.num_swb = if self.frame_len == 960 {
+                tables::NUM_SWB_960[info.sf_index]
+            } else {
+                tables::NUM_SWB_1024[info.sf_index]
+            } as usize;
             // predictor_data_present: for non-Main profiles this signals
             // LTP data. The syntax must be consumed for alignment (lag 11
             // bits, coefficient 3 bits, one used-bit per scalefactor band
@@ -2426,6 +2476,10 @@ impl AacDecoder {
     /// short↔short, with special handling inside EIGHT_SHORT).
     #[allow(clippy::needless_range_loop)]
     fn imdct_and_window(&mut self, ch: usize, win: &WindowInfo) {
+        let fl = self.frame_len; // full transform (960/1024)
+        let hl = fl / 2; // long overlap lap (480/512)
+        let fs = fl / 8; // short transform (120/128)
+        let sh = fs / 2; // short overlap lap (60/64)
         let seq_cur = win.sequence;
         let Self {
             channels_state,
@@ -2467,20 +2521,22 @@ impl AacDecoder {
 
         // IMDCT into the half-length buf layout: with y the natural
         // 2M-point synthesis, buf[i] = y[M/2−1−i] and buf[M/2+i] = −y[M+i].
+        // Short windows keep the fixed 128-coefficient input stride of the
+        // reference layout in both transform lengths, writing fs output.
         if seq_cur != EIGHT_SHORT {
-            mdct_long.imdct(coeffs, synth);
-            for i in 0..512 {
-                buf[i] = synth[511 - i];
-                buf[512 + i] = -synth[1024 + i];
+            mdct_long.imdct(&coeffs[..fl], synth);
+            for i in 0..hl {
+                buf[i] = synth[hl - 1 - i];
+                buf[hl + i] = -synth[fl + i];
             }
         } else {
             let mut y = [0.0f32; 256];
             for w in 0..8 {
-                mdct_short.imdct(&coeffs[w * 128..w * 128 + 128], &mut y);
-                let b = w * 128;
-                for i in 0..64 {
-                    buf[b + i] = y[63 - i];
-                    buf[b + 64 + i] = -y[128 + i];
+                mdct_short.imdct(&coeffs[w * 128..w * 128 + fs], &mut y);
+                let b = w * fs;
+                for i in 0..sh {
+                    buf[b + i] = y[sh - 1 - i];
+                    buf[b + sh + i] = -y[fs + i];
                 }
             }
         }
@@ -2488,35 +2544,71 @@ impl AacDecoder {
         let long_lap = (seq_prev == ONLY_LONG || seq_prev == LONG_STOP)
             && (seq_cur == ONLY_LONG || seq_cur == LONG_START);
         if long_lap {
-            vector_fmul_window(out, saved, buf, lwindow_prev, 512);
+            vector_fmul_window(out, saved, buf, lwindow_prev, hl);
         } else {
-            out[..448].copy_from_slice(&saved[..448]);
+            out[..hl - sh].copy_from_slice(&saved[..hl - sh]);
 
             if seq_cur == EIGHT_SHORT {
-                vector_fmul_window(&mut out[448..], &saved[448..], buf, swindow_prev, 64);
-                vector_fmul_window(&mut out[448 + 128..], &buf[64..], &buf[128..], swindow, 64);
-                vector_fmul_window(&mut out[448 + 256..], &buf[192..], &buf[256..], swindow, 64);
-                vector_fmul_window(&mut out[448 + 384..], &buf[320..], &buf[384..], swindow, 64);
-                vector_fmul_window(temp, &buf[448..], &buf[512..], swindow, 64);
-                out[448 + 512..448 + 576].copy_from_slice(&temp[..64]);
+                vector_fmul_window(
+                    &mut out[hl - sh..],
+                    &saved[hl - sh..],
+                    buf,
+                    swindow_prev,
+                    sh,
+                );
+                for w in 1..4 {
+                    vector_fmul_window(
+                        &mut out[hl - sh + w * fs..],
+                        &buf[w * fs - sh..],
+                        &buf[w * fs..],
+                        swindow,
+                        sh,
+                    );
+                }
+                vector_fmul_window(temp, &buf[3 * fs + sh..], &buf[4 * fs..], swindow, sh);
+                out[hl - sh + 4 * fs..hl - sh + 4 * fs + sh].copy_from_slice(&temp[..sh]);
             } else {
-                vector_fmul_window(&mut out[448..], &saved[448..], buf, swindow_prev, 64);
-                out[576..1024].copy_from_slice(&buf[64..512]);
+                vector_fmul_window(
+                    &mut out[hl - sh..],
+                    &saved[hl - sh..],
+                    buf,
+                    swindow_prev,
+                    sh,
+                );
+                out[hl + sh..fl].copy_from_slice(&buf[sh..hl]);
             }
         }
 
         // Buffer update.
         if seq_cur == EIGHT_SHORT {
-            saved[..64].copy_from_slice(&temp[64..128]);
-            vector_fmul_window(&mut saved[64..], &buf[576..], &buf[640..], swindow, 64);
-            vector_fmul_window(&mut saved[192..], &buf[704..], &buf[768..], swindow, 64);
-            vector_fmul_window(&mut saved[320..], &buf[832..], &buf[896..], swindow, 64);
-            saved[448..512].copy_from_slice(&buf[960..1024]);
+            saved[..sh].copy_from_slice(&temp[sh..2 * sh]);
+            vector_fmul_window(
+                &mut saved[sh..],
+                &buf[4 * fs + sh..],
+                &buf[5 * fs..],
+                swindow,
+                sh,
+            );
+            vector_fmul_window(
+                &mut saved[3 * sh..],
+                &buf[5 * fs + sh..],
+                &buf[6 * fs..],
+                swindow,
+                sh,
+            );
+            vector_fmul_window(
+                &mut saved[5 * sh..],
+                &buf[6 * fs + sh..],
+                &buf[7 * fs..],
+                swindow,
+                sh,
+            );
+            saved[hl - sh..hl].copy_from_slice(&buf[fl - sh..fl]);
         } else if seq_cur == LONG_START {
-            saved[..448].copy_from_slice(&buf[512..960]);
-            saved[448..512].copy_from_slice(&buf[960..1024]);
+            saved[..hl - sh].copy_from_slice(&buf[hl..fl - sh]);
+            saved[hl - sh..hl].copy_from_slice(&buf[fl - sh..fl]);
         } else {
-            saved.copy_from_slice(&buf[512..1024]);
+            saved.copy_from_slice(&buf[hl..fl]);
         }
     }
 

@@ -918,6 +918,9 @@ fn fate_conformance_corpus() {
     let mut failures = Vec::new();
     for name in [
         "al04_44",
+        // frameLengthFlag=1 (960/120-sample transform); reference decoder
+        // drops SBR for short frames, and so do we.
+        "al04sf_48",
         "al05_44",
         "al06_44",
         "al07_96",
@@ -1017,6 +1020,93 @@ fn check_within(
         ));
     }
     Ok(())
+}
+
+/// The two official ISO/IEC HE-AACv2 (SBR + Parametric Stereo) conformance
+/// items mirrored in FFmpeg's FATE suite (`al_sbr_ps_04_new`,
+/// `al_sbr_ps_06_new`). Both are AAC-LC 16 kHz with a PCE-declared mono SCE
+/// in the ASC and no explicit SBR/PS signaling: the decoder must discover
+/// the in-band SBR payload (doubling output to 32 kHz), flip to implicit
+/// parametric stereo on the first SBR FIL, and synthesize the second
+/// channel. Compared against FFmpeg's own MP4 decode at the decoder's
+/// NATIVE output rate (asking FFmpeg to resample would garbage the
+/// reference for exactly the same wideband-SBR reason the multichannel
+/// corpus never passes `-ac`).
+///
+/// Gates: `al_sbr_ps_04_new` sits at ~129 dB (per-frame worst ~109 dB) and
+/// passes the standard gate. `al_sbr_ps_06_new` carries a known one-frame
+/// residual (frame ~189 of 212, peak ~1e-2, both channels — a transient
+/// PS-state divergence at the 20→34-band mode switch; every other frame is
+/// ≥109 dB and frames where either decoder outputs digital silence differ
+/// only at ~1e-6), so its whole-stream SNR lands at ~56 dB; the gate pins
+/// that from below.
+#[test]
+fn fate_heaacv2_ps_streams_match_reference() {
+    let dir = match std::env::var_os("AAC_FATE_SAMPLES_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            eprintln!("skipping HE-AACv2 PS corpus: AAC_FATE_SAMPLES_DIR not set");
+            return;
+        }
+    };
+    let mut failures = Vec::new();
+    for (name, gate) in [
+        ("al_sbr_ps_04_new", (100.0, 1e-5)),
+        ("al_sbr_ps_06_new", (50.0, 1.1e-2)),
+    ] {
+        let mp4 = dir.join(format!("{name}.mp4"));
+        if !mp4.exists() {
+            failures.push(format!("missing FATE sample {}", mp4.display()));
+            continue;
+        }
+        let (asc_bytes, samples) = demux_aac_mp4(&mp4);
+        let asc = tpt_av_cadence_aac::AudioSpecificConfig::parse(&asc_bytes).unwrap();
+        let mut decoder = tpt_av_cadence_aac::AacDecoder::from_config(
+            &asc,
+            Box::new(std::io::Cursor::new(samples)),
+        )
+        .unwrap();
+        let mut pcm = Vec::new();
+        let mut buf = vec![0.0f32; 6720];
+        loop {
+            let frames = decoder.decode(&mut buf).unwrap();
+            if frames == 0 {
+                break;
+            }
+            let channels = usize::from(decoder.info().channels);
+            pcm.extend_from_slice(&buf[..frames * channels]);
+        }
+        assert_eq!(
+            decoder.info().sample_rate,
+            32_000,
+            "{name} SBR-doubled rate"
+        );
+        assert_eq!(decoder.info().channels, 2, "{name} PS-expanded stereo");
+        let out_rate = decoder.info().sample_rate;
+        let reference =
+            match tpt_av_cadence_test_utils::reference::decode_with_ffmpeg(&mp4, out_rate, 2) {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push(format!("{name}: ffmpeg reference failed: {e}"));
+                    continue;
+                }
+            };
+        if pcm.len() != reference.len() {
+            failures.push(format!(
+                "{name}: length {} vs reference {}",
+                pcm.len(),
+                reference.len()
+            ));
+            continue;
+        }
+        if let Err(e) = check_within(&pcm, &reference, gate.0, gate.1) {
+            failures.push(format!("{name}: {e}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "HE-AACv2 PS corpus failures: {failures:#?}"
+    );
 }
 
 struct PsOracleCase {
