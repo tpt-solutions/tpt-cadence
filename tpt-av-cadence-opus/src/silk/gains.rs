@@ -154,6 +154,84 @@ pub(crate) fn gains_dequant(
     *prev_ind = prev as i8;
 }
 
+/// `silk_lin2log` (`silk/lin2log.c`): approximation of
+/// `log2(in) * 128` — inverse of [`log2lin`], used by the encoder's gain
+/// quantizer (`silk/gain_quant.c`).
+///
+/// Bit-exact port including the `silk_CLZ_FRAC` inline (`frac_Q7` = the 7
+/// bits after the leading one; the reference computes it via
+/// `ROR32(in, 24 - lz) & 0x7f`, which equals the shift form below for
+/// every positive input).
+pub(crate) fn lin2log(in_lin: i32) -> i32 {
+    debug_assert!(in_lin > 0);
+    let lz = in_lin.leading_zeros() as i32;
+    let frac_q7 = ((in_lin << lz) >> 24) & 0x7f;
+    smlawb(frac_q7, frac_q7 * (128 - frac_q7), 179) + ((31 - lz) << 7)
+}
+
+/// `silk_gains_quant` (`silk/gain_quant.c`): quantizes subframe gains to
+/// the transmitted indices — the encoder half that [`gains_dequant`]
+/// inverts bit-exactly.
+///
+/// `gain_q16` is both input and output: it arrives with the desired
+/// unquantized gains and is overwritten with the quantized ones (the
+/// reference's in-place contract). `prev_ind` threads the persistent
+/// `LastGainIndex` state. Hysteresis rounds towards the previous
+/// quantized gain, and the double-step delta mapping of
+/// [`gains_dequant`] is mirrored exactly.
+pub(crate) fn gains_quant(
+    ind: &mut [i8; MAX_NB_SUBFR],
+    gain_q16: &mut [i32; MAX_NB_SUBFR],
+    prev_ind: &mut i8,
+    conditional: bool,
+    nb_subfr: usize,
+) {
+    let mut prev = i32::from(*prev_ind);
+    for k in 0..nb_subfr {
+        /* Convert to log scale, scale, floor() */
+        let mut ix = smulwb(SCALE_Q16, lin2log(gain_q16[k]) - OFFSET);
+
+        /* Round towards previous quantized gain (hysteresis) */
+        if ix < prev {
+            ix += 1;
+        }
+        ix = ix.clamp(0, N_LEVELS_QGAIN - 1);
+
+        /* Compute delta indices and limit */
+        if k == 0 && !conditional {
+            /* Full index */
+            ix = ix.clamp(prev + MIN_DELTA_GAIN_QUANT, N_LEVELS_QGAIN - 1);
+            prev = ix;
+        } else {
+            /* Delta index */
+            ix -= prev;
+
+            /* Double the quantization step size for large gain increases,
+             * so that the max gain level can be reached */
+            let double_step_size_threshold = 2 * MAX_DELTA_GAIN_QUANT - N_LEVELS_QGAIN + prev;
+            if ix > double_step_size_threshold {
+                ix = double_step_size_threshold + ((ix - double_step_size_threshold + 1) >> 1);
+            }
+            ix = ix.clamp(MIN_DELTA_GAIN_QUANT, MAX_DELTA_GAIN_QUANT);
+
+            /* Accumulate deltas */
+            if ix > double_step_size_threshold {
+                prev = (prev + ix * 2 - double_step_size_threshold).min(N_LEVELS_QGAIN - 1);
+            } else {
+                prev += ix;
+            }
+
+            /* Shift to make non-negative */
+            ix -= MIN_DELTA_GAIN_QUANT;
+        }
+
+        ind[k] = ix as i8;
+        /* Scale and convert to linear scale */
+        gain_q16[k] = log2lin((smulwb(INV_SCALE_Q16, prev) + OFFSET).min(LOG_GAIN_MAX_Q7));
+    }
+    *prev_ind = prev as i8;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,74 +525,14 @@ mod tests {
         }
     }
 
-    /// `silk_lin2log` (`silk/lin2log.c`), test-only so the encoder-side
-    /// round trip can run; includes the `silk_CLZ_FRAC` inline
-    /// (`frac_Q7` = the 7 bits after the leading one). The reference
-    /// computes it via `ROR32(in, 24 - lz) & 0x7f`, which equals the
-    /// shift form below for every positive input.
-    fn lin2log(in_lin: i32) -> i32 {
-        debug_assert!(in_lin > 0);
-        let lz = in_lin.leading_zeros() as i32;
-        let frac_q7 = ((in_lin << lz) >> 24) & 0x7f;
-        smlawb(frac_q7, frac_q7 * (128 - frac_q7), 179) + ((31 - lz) << 7)
-    }
-
-    /// Test-only port of the encoder-side `silk_gains_quant`
-    /// (`silk/gain_quant.c`): scalar quantization with hysteresis,
-    /// delta coding with the double-step mapping, and the same final
-    /// Q16 conversion the decoder applies. The round trip asserts that
-    /// `gains_dequant` inverts it bit-exactly.
-    fn gains_quant(
-        ind: &mut [i8; MAX_NB_SUBFR],
-        gain_q16: &mut [i32; MAX_NB_SUBFR],
-        prev_ind: &mut i8,
-        conditional: bool,
-        nb_subfr: usize,
-    ) {
-        let mut prev = i32::from(*prev_ind);
-        for k in 0..nb_subfr {
-            /* Convert to log scale, scale, floor() */
-            let mut ix = smulwb(SCALE_Q16, lin2log(gain_q16[k]) - OFFSET);
-
-            /* Round towards previous quantized gain (hysteresis) */
-            if ix < prev {
-                ix += 1;
-            }
-            ix = ix.clamp(0, N_LEVELS_QGAIN - 1);
-
-            /* Compute delta indices and limit */
-            if k == 0 && !conditional {
-                /* Full index */
-                ix = ix.clamp(prev + MIN_DELTA_GAIN_QUANT, N_LEVELS_QGAIN - 1);
-                prev = ix;
-            } else {
-                /* Delta index */
-                ix -= prev;
-
-                /* Double the quantization step size for large gain
-                 * increases, so that the max gain level can be reached */
-                let double_step_size_threshold = 2 * MAX_DELTA_GAIN_QUANT - N_LEVELS_QGAIN + prev;
-                if ix > double_step_size_threshold {
-                    ix = double_step_size_threshold + ((ix - double_step_size_threshold + 1) >> 1);
-                }
-                ix = ix.clamp(MIN_DELTA_GAIN_QUANT, MAX_DELTA_GAIN_QUANT);
-
-                /* Accumulate deltas */
-                if ix > double_step_size_threshold {
-                    prev = (prev + ix * 2 - double_step_size_threshold).min(N_LEVELS_QGAIN - 1);
-                } else {
-                    prev += ix;
-                }
-
-                /* Shift to make non-negative */
-                ix -= MIN_DELTA_GAIN_QUANT;
-            }
-
-            ind[k] = ix as i8;
-            /* Scale and convert to linear scale */
-            gain_q16[k] = log2lin((smulwb(INV_SCALE_Q16, prev) + OFFSET).min(LOG_GAIN_MAX_Q7));
-        }
-        *prev_ind = prev as i8;
+    /// `lin2log`'s sanity literals (exact powers of two have a zero
+    /// fractional part).
+    #[test]
+    fn lin2log_reference_literals() {
+        assert_eq!(lin2log(65536), 2048);
+        assert_eq!(lin2log(1 << 17), 2176);
+        // 1.25·2^16: frac_Q7 = 32, parabolic correction +8 → 2048 + 40.
+        assert_eq!(lin2log(81920), 2088);
     }
 
     /// `dequant(quant(gains)) == gains` bit-exactly, across random
@@ -522,13 +540,6 @@ mod tests {
     /// sequenced frames so the cross-frame state is exercised.
     #[test]
     fn encoder_decoder_round_trip() {
-        // Sanity literals for the test-only lin2log port (exact powers
-        // of two have a zero fractional part).
-        assert_eq!(lin2log(65536), 2048);
-        assert_eq!(lin2log(1 << 17), 2176);
-        // 1.25·2^16: frac_Q7 = 32, parabolic correction +8 → 2048 + 40.
-        assert_eq!(lin2log(81920), 2088);
-
         let mut rng = XorShift(0x5EED_1A17);
         for _ in 0..200 {
             let nb_subfr = if rng.below(2) == 0 {

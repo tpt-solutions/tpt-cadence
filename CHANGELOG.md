@@ -8,6 +8,38 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 ## [Unreleased]
 
 ### Added
+- SILK encoder foundation (`tpt-av-cadence-opus`): `SilkEncoder` encodes
+  mono 10/20 ms frames at 8/12/16 kHz internal rate into VBR SILK
+  payloads, closing the first half of the last major Opus encoder gap.
+  Bitstream layer is an exact port of the reference encoder
+  (`silk_encode_indices` incl. the VAD/LBRR prologue,
+  `silk_encode_pulses` with the min-bits rate-level search,
+  `silk_gains_quant` + `silk_lin2log`, `silk_NLSF_encode` with the 4-state
+  `silk_NLSF_del_dec_quant` trellis, `silk_VQ_WMat_EC` +
+  `silk_quant_LTP_gains`, the `silk_control_SNR` rate tables, and an exact
+  fixed-point `silk_A2NLSF`). The excitation is produced by a closed-loop
+  forward NSQ that evaluates candidate quantization indices through the
+  decoder's own `decode_core` arithmetic (seed-dithered excitation, LTP
+  prediction over the re-whitened state, gain/LPC synthesis), so the
+  encoder's simulated reconstruction and the real `SilkDecoder` output
+  are bit-identical across frames — pinned by round-trip tests at all
+  four bandwidth/frame-size combinations, with SNR gates on synthetic
+  tonal/speech/noise material and a bitrate-control sweep. Analysis
+  simplifications vs libopus are documented in the module docs: no
+  noise-shaping filter or warping, autocorrelation+Schur LPC in place of
+  Burg, full-resolution correlation pitch search without lookahead, no
+  LBRR/DTX/FEC/stereo, and single-frame payloads (Opus/Ogg packetization
+  of SILK frames and hybrid mode are the next steps).
+- 960/120-sample transform support (GASpecificConfig `frameLengthFlag=1`),
+  the last frame-length family used by real AAC-LC streams: the decoder now
+  sizes its MDCT, KBD/sine windows, overlap-add geometry, and
+  scalefactor-band tables (FFmpeg `ff_aac_num_swb_960`/`_120`,
+  `ff_swb_offset_960`/`_120`) from the flag, keeping the reference layout's
+  fixed 8×128 short-window coefficient stride. Explicit HE-AAC signaling
+  combined with short frames downgrades to core-rate output (the reference
+  drops SBR/PS there, and in-band SBR payloads are ignored), matching its
+  behavior. Verified against the FATE `al04sf_48` conformance item at
+  128.6 dB SNR (peak 3.6e-7) with a per-frame gate in the conformance suite.
 - HE-AACv2 Parametric Stereo synthesis (QMF-domain PS stage ported from the
   reference decoder implementation, FFmpeg `aacps.c`/`aacpsdsp_template.c`):
   hybrid analysis/synthesis filterbank, transient-aware all-pass
@@ -95,6 +127,28 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   carried non-SBR extended data.
 - `OggOpusEncoder::finish()` was not idempotent (a second call or drop
   path could rewrite EOS bookkeeping).
+- PS IPD/OPD parameters shared a single per-envelope delta flag, but the
+  normative bitstream carries a SEPARATE `bs_dt` bit for OPD after the IPD
+  parameters of each envelope. Every HE-AACv2 payload carrying phase data
+  therefore decoded its OPD table from misaligned bits, and payloads whose
+  extension-length accounting overflowed failed validation entirely —
+  disabling PS and duplicating mono until the next PS header, which
+  desynchronized phase rendering for all header-less frames in between.
+  This was the root cause of the `al_sbr_ps_04_new` FATE conformance item
+  decoding a 12-frame region as uncorrelated garbage; that stream now
+  decodes at 129.2 dB whole-stream SNR against FFmpeg (peak error 2.2e-7).
+- A failed PS payload parse reset the entire `ParametricStereo` state; the
+  reference (`ff_ps_read_data`'s error path) keeps the partially parsed
+  header — enable flags, band modes, and envelope geometry survive — and
+  only clears `start` and zeroes the parameter arrays. The full reset made
+  later header-less frames consume a different number of parameter bits
+  than the reference, sustaining desync until the next PS header.
+- `Sbr::turnoff` reset the Parametric Stereo context; the reference's
+  `sbr_turnoff` leaves PS untouched (synthesis is gated by `ps.start` at
+  apply time), so SBR-level turnoffs no longer destroy PS state.
+- The 20/34-band PS mode (`is34bands`) is now re-derived only when IID or
+  ICC is enabled, matching the reference; a payload disabling both families
+  keeps the previous synthesis band mapping.
 
 ### Known limitations (tracked in `todo.md`)
 - Parametric Stereo synthesis is implemented (see Added above). HE-AACv2
@@ -105,10 +159,17 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   contain PS data still keep mono output (the container explicitly said
   "no PS", matching the reference decoder's behavior of ignoring PS in
   that configuration).
-- Four AAC FATE multichannel conformance items (CCE/PCE coupling) decode at
-  reduced fidelity (2-53 dB) pending a coupling/PCE-interaction root cause.
-  The previous stereo and 5.1/7.1 SBR context bugs are fixed; HE-AAC/SBR
-  self-generated fixtures now reach roughly 117–133 dB SNR against FFmpeg.
+- All eight ISO/IEC AAC-LC FATE multichannel conformance items (CCE/PCE
+  coupling) now pass the standard conformance gates (al15 keeps a relaxed
+  peak bound for float-ulp noise-fill differences at 105.8 dB). The
+  HE-AAC/SBR self-generated fixtures reach roughly 117-133 dB SNR against
+  FFmpeg, and the official HE-AACv2 FATE items pass: `al_sbr_ps_04_new` at
+  129.2 dB (standard gate) and `al_sbr_ps_06_new` at 56.2 dB whole-stream —
+  every frame ≥109 dB except one frame (~1e-2 peak, both channels, a
+  transient PS-state divergence at the 20→34-band mode switch) plus
+  digital-silence frames where the decoders differ only at ~1e-6. The
+  960/120-frame (`frameLengthFlag=1`) transform is now supported too, and
+  its FATE item (`al04sf_48`) decodes at 128.6 dB.
 - The CELT-only Ogg Opus encoder's CBR storage/allocation mismatch is fixed:
   range-coded output now uses libopus-style fixed-size storage, including
   correct final carry flushing and partial raw-bit placement. Mono and stereo

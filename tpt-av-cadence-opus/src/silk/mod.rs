@@ -54,13 +54,31 @@
 //!   subframes, the 10th/16th-order LPC synthesis filter, and the Q0
 //!   output quantization.
 //!
-//! Future: `decoder` (Tier 4) — see todo.md.
+//! Encoder side (2026-09-26 foundation; see todo.md):
+//! - [`encode_indices`]/[`encode_pulses`]: bit-exact mirrors of the
+//!   decoder's side-info and excitation entropy coding.
+//! - [`gains`]/[`nlsf_quant`]/[`ltp_quant`]: encoder halves of the gain,
+//!   NLSF (`silk_NLSF_encode` + delayed-decision trellis) and LTP
+//!   (`silk_VQ_WMat_EC`/`silk_quant_LTP_gains`) quantizers.
+//! - [`lpc_analysis`]: float analysis kernels plus the exact
+//!   fixed-point `silk_A2NLSF`.
+//! - [`nsq`]: closed-loop forward NSQ running the decoder's own
+//!   arithmetic (bit-identical reconstruction).
+//! - [`encoder`]: the top-level [`encoder::SilkEncoder`] frame assembly
+//!   with the ported `control_SNR` rate tables.
 
 pub mod decode_indices;
 pub mod decoder;
+pub mod encode_indices;
+pub mod encode_pulses;
+pub mod encoder;
 pub mod excitation;
 pub mod gains;
+pub mod lpc_analysis;
+pub mod ltp_quant;
 pub mod nlsf;
+pub mod nlsf_quant;
+pub mod nsq;
 pub mod pitch;
 pub mod plc;
 pub mod resampler;

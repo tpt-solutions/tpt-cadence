@@ -1610,7 +1610,9 @@ Full review notes: `C:\Users\phill\.claude\plans\review-platform-for-bugs-compil
 1. **Gain sign, ruled out**: independent-coupling gains (`GET_GAIN(scale,gain) = powf(scale,-gain)`, `aac_defines.h`) are always positive in the reference too — the `sign` bit only affects the OTHER (dependent, per-band) coupling branch. Our port already matched this exactly; not a bug.
 2. **CCE target matching by tag vs. internal index — real bug, fixed but insufficient alone**: `apply_channel_coupling` (`aacdec.c`) matches a CCE's declared `id_select` against the loop variable `i` indexing `ac->che[type][i]`, and that array is populated by `che_configure(ac, ..., iid, ...)` where `iid = id_map[type][id]++` is a purely sequential per-type counter assigned while walking the elements in **sniffed output-position order** (post `sniff_channel_order`), not PCE declaration order and not the element's own bitstream tag. So a CCE's `id_select` is compared against this sequential index, not the target's real element_instance_tag — confirmed by reading `ff_aac_output_configure`/`assign_channels` end to end. Our `apply_coupling` compared against `target.tag` (the literal bitstream tag), which is spec-literal but not what the reference actually does. Added `pce_plan_iid` (computed in `recompute_pce_out_order` from the same position-sorted traversal used to build `pce_out_order`) and `pce_iid_for`, and `apply_coupling` now matches by this sniffed-order index for PCE-configured streams (default channel configurations are unaffected: no reordering happens, so `iid == tag` there already, matching the observed fact that al06/al07 — both default configs, not PCE — were untouched by the earlier session's fix). **Verified but inconclusive**: for al15 specifically, this is a pure relabeling between exactly two CPE targets (both the wide and the normal pair are still coupling targets either way, just via swapped `id_select` values), and since the bitstream's four non-unity coupling gains all happen to be bit-identical (`1.0905077`, i.e. `2^(1/8)`, for every target every frame in this file), the swap is numerically invisible — SNR unchanged to the reported decimal (al15 2.88 dB, al22 3.39 dB, both bit-identical to before). Kept anyway since it's a real, reference-confirmed semantic fix (matters whenever a stream has non-uniform per-target gains or more than 2 same-type targets, which al15 just doesn't exercise) — full test/clippy/fmt clean, zero regressions.
 **Actual residual likely lives elsewhere**: since swapping which physical channel receives which (identical) gain doesn't explain the leak, and coupling application itself is now verified correct end-to-end, the wide pair's own pre-coupling decode (its own spectral/Huffman/TNS/M-S decode as an ordinary CPE, independent of coupling) is the remaining suspect — AFTER_IMDCT coupling just adds two already-independent time-domain signals, so for FFmpeg's decode to land on exact zero, the wide pair's own IMDCT output must almost exactly cancel the added coupling signal by design (a deliberate encoder test of coupling bit-exactness), and any small discrepancy in decoding the wide pair's *own* bitstream content — not the coupling math — would leak through at full scale. Next step for a future session: compare the wide pair's own pre-coupling `out` (or `coeffs`) against an FFmpeg-internal dump (not just final PCM) to find the actual mismatch; the existing `fate_forensics.rs`/`FATE_TRACE=1` tooling from this session is reusable for that.
-- [ ] Broader ISO/IEC AAC conformance suite playback (all 8 FATE-mirrored al* vectors now pass at standard gates as of 2026-09-26; broader non-FATE ISO items still not integrated) **Survey of the rest of the FATE mirror (2026-09-26)**: no additional al* LC items exist on fate-suite.ffmpeg.org (al01-al03/al08-al13 are not mirrored — full ISO set remains unobtainable there). Other files probed: `al04sf_48` uses frameLengthFlag=1 (960/480-sample frames) — our decoder rejects it cleanly with UnsupportedFeature; 960-frame support is a real feature gap if ever needed. `aac-sce-in-stereo` (config-2 carrying a mono SCE) is unusable as an oracle: FFmpeg never writes its second output channel (per-run RMS varied 26→28→NaN→3.4e10 — stale pool memory), so comparisons are meaningless. `ct_faac-adts` is a demuxer robustness fixture (concatenated segments with mismatched ADTS headers: a MAIN-profile mono frame, an 8 kHz frame), not a decode conformance vector. `Fd_2_c1_Ms_*` use object type 42 (undecodable by the n6.1-era oracle itself). `ap05_48` is LTP (unsupported profile, correctly out of scope). ACTIONABLE OUTCOME: implicit parametric stereo now engages for config-2 (stereo-signaled) streams whose blocks carry a single SCE with SBR — matching the reference's "stereo with SCE" reconfigure — and the staging path emits the PS-expanded second channel under `Order::Element` (previously such streams staged one channel while reporting two, misaligning the caller's interleaving). OPEN: end-to-end PS fidelity — with PS synthesis running (PS headers parse, post-synthesis L/R diverge in the QMF domain), our `al_sbr_ps_06_new` output still shows ~0 correlation with FFmpeg's decode, i.e. a timing/parameter-plumbing defect in the end-to-end PS path remains (the PS module itself is oracle-verified at unit level). Note `al_sbr_ps_04_new` was never PCM-gated end-to-end either — same defect.
+- [x] Broader ISO/IEC AAC conformance suite playback (all 8 FATE-mirrored al* LC vectors PLUS the two HE-AACv2 PS items and the 960-frame al04sf_48 item now pass their gates as of 2026-09-26; broader non-FATE ISO items remain unobtainable — 480-sample LD/ELD frames are the only unsupported transform family, with no obtainable vectors) **Survey of the rest of the FATE mirror (2026-09-26)**: no additional al* LC items exist on fate-suite.ffmpeg.org (al01-al03/al08-al13 are not mirrored — full ISO set remains unobtainable there). Other files probed: `al04sf_48` uses frameLengthFlag=1 (960/480-sample frames) — our decoder rejects it cleanly with UnsupportedFeature; 960-frame support is a real feature gap if ever needed. `aac-sce-in-stereo` (config-2 carrying a mono SCE) is unusable as an oracle: FFmpeg never writes its second output channel (per-run RMS varied 26→28→NaN→3.4e10 — stale pool memory), so comparisons are meaningless. `ct_faac-adts` is a demuxer robustness fixture (concatenated segments with mismatched ADTS headers: a MAIN-profile mono frame, an 8 kHz frame), not a decode conformance vector. `Fd_2_c1_Ms_*` use object type 42 (undecodable by the n6.1-era oracle itself). `ap05_48` is LTP (unsupported profile, correctly out of scope). ACTIONABLE OUTCOME: implicit parametric stereo now engages for config-2 (stereo-signaled) streams whose blocks carry a single SCE with SBR — matching the reference's "stereo with SCE" reconfigure — and the staging path emits the PS-expanded second channel under `Order::Element` (previously such streams staged one channel while reporting two, misaligning the caller's interleaving). OPEN: end-to-end PS fidelity — with PS synthesis running (PS headers parse, post-synthesis L/R diverge in the QMF domain), our `al_sbr_ps_06_new` output still shows ~0 correlation with FFmpeg's decode, i.e. a timing/parameter-plumbing defect in the end-to-end PS path remains (the PS module itself is oracle-verified at unit level). Note `al_sbr_ps_04_new` was never PCM-gated end-to-end either — same defect. **RESOLVED (2026-09-26, continued Windows session) — the "~0 correlation" report was a harness artifact, and the real defects behind it are now fixed**: (0) the forensic comparison had been feeding FFmpeg's oracle `-ar 16000` (the ASC's CORE rate) while our decoder outputs the SBR-doubled 32 kHz, i.e. the "reference" was a half-rate resample of the true decode; at the native rate our output correlates +1.0000 with FFmpeg. All FATE reference decodes must pass the decoder's own output rate (`decoder.info().sample_rate`), never `asc.sample_rate()`, for SBR streams. With that fixed, THREE real bugs surfaced and were fixed: (1) `read_extension` consumed ONE per-envelope dt flag shared between IPD and OPD, but ISO/FFmpeg read a separate dt bit for OPD after IPD (`dt; read_ipdopd_data(ipd); dt; read_ipdopd_data(opd)`), so every payload carrying phase data decoded OPD from misaligned bits and larger payloads overflowed the `bs_extension` count check and were rejected — on `al_sbr_ps_04_new` the rejection cascaded (see (2)) into 12 frames of duplicated mono mid-stream (per-frame SNR down to -2.3 dB vs FFmpeg); now 129.21 dB whole-stream SNR, worst frame 109 dB, peak 2.2e-7. (2) A failed PS parse (`decode()`'s invalid branch) called `disable()`, wiping enable flags/band modes/envelope geometry; the reference error path keeps those partial header mutations, clears only `start`, and zeroes the parameter arrays. The full reset changed how many parameter bits later header-less frames consume, sustaining desync until the next PS header. (3) `Sbr::turnoff()` also reset the PS context; the reference's `sbr_turnoff` leaves PS untouched. Additionally `is34bands` is now re-derived only when IID or ICC is enabled (reference keeps the previous band mapping when a payload disables both), and the pre-existing `eprintln!("FAIL at line ...")` debug prints in the PS parser are removed. Both official HE-AACv2 FATE items are now PCM-gated in `tests/conformance.rs` (`fate_heaacv2_ps_streams_match_reference`, compared at the native 32 kHz output): `al_sbr_ps_04_new` at the standard gate (129.2 dB), `al_sbr_ps_06_new` at a reduced gate (56.2 dB whole-stream, peak 1.1e-2) — its per-frame profile is ≥109 dB everywhere except frame 189 of 212 (33.5 dB, peak ~1e-2, BOTH channels — PS synthesis reprocesses the left channel too, so a right-path state difference surfaces in both), where the parameter parse is verified IDENTICAL to FFmpeg's (per-code VLC trace diff against an instrumented FFmpeg n7.1 build: same symbols, same bit positions, same consumed count); the residual lives in carried PS synthesis state entering that frame, not in parsing. Both decoders also deviate from the official ISO `.s16` references (`al_sbr_ps_0x_ur.s16`) identically outside that frame (the ISO vectors dither digital-silence frames at ~1.5e-5 where modern decoders output exact zeros, and carry 16-bit quantization noise), and frames 159/160's low SNRs are ~1.5e-6-scale differences on digitally silent frames — inaudible and far below the 16-bit LSB. Remaining known gaps for this item: the one-frame `al_sbr_ps_06_new` residual only.
+
+**960/480-sample frame support — IMPLEMENTED (2026-09-26, same session, Windows host)**: `frameLengthFlag=1` (960/120-sample transform) no longer rejects the stream. `AudioSpecificConfig` carries the flag (`frame_length_short`); the decoder sizes its MDCT (960/120 — the direct cosine-table MDCT is size-agnostic), KBD/sine half-windows (960 α=4 / 120 α=6), overlap-add geometry (lap 480/60, saved copies 420/540 — all expressions of `frame_len`, verified against FFmpeg's `imdct_and_windowing_960` constants), and scalefactor-band tables (`NUM_SWB_960`/`_120`, `SWB_OFFSET_960_*`/`_120_*` transcribed from FFmpeg's aactab.c; TNS max bands reuse the 1024/128 tables exactly as the reference does). Short windows keep the reference layout's fixed 8×128 coefficient stride (only 120 coefficients consumed per window). Explicit HE-AAC signaling with short frames downgrades to core-rate output and in-band SBR payloads are skipped — both matching the reference, which drops SBR for 960-frame streams. Verified with the FATE `al04sf_48` item (mono 48 kHz, 386 frames): 128.60 dB SNR, peak 3.6e-7, now gated in `fate_conformance_corpus`. 480-sample frames (LD/ELD, object types 16/36) remain out of scope — different window shapes and transform machinery, no conformance vectors available.
 - [ ] MP3 ISO/IEC 11172-4 official conformance vectors still "not obtainable" — MP3 correctness rests solely on FFmpeg-oracle comparison
 - [x] Audit the 8 files containing `panic!(` workspace-wide to confirm none are reachable from untrusted decode() input paths (real-time-safety contract requires decode() to never panic) — see "Workspace-wide panic-safety audit (2026-09-22)" below
 - [x] Close out or remove the windowing/CCE-PCE TODO comment at `tpt-av-cadence-aac/src/decoder.rs:37` — the comment was stale (claimed "CCE/PCE rejected at parse time," but both have been fully implemented, with dedicated `decode_cce`/`decode_pce` handlers, since earlier AAC-LC sessions); replaced with a one-line note pointing at the real handlers
@@ -1699,8 +1701,99 @@ Verification: full workspace `cargo test --workspace` (every crate, 0 failed), `
 - [x] WAV/AIFF/PCM writers (near-trivial, no compression, zero patent surface) — see "WAV/AIFF/PCM writers (2026-09-22)" below
 - [x] FLAC encoder (royalty-free by design, well-specified reference encoder to port/adapt) — see "FLAC encoder (2026-09-22)" below
 - [ ] Vorbis encoder (royalty-free by design, higher effort — psychoacoustic model)
-- [ ] AAC encoder — **on hold**: Fraunhofer/VIA-LA patent pool primarily targets encoders; needs a licensing decision from the user before any implementation work
+- [ ] AAC encoder — **REJECTED, will not be implemented (user decision, 2026-09-26)**: Fraunhofer/VIA-LA patent pool primarily targets encoders and the user has ruled the encoder out outright; do not plan or start any AAC encoding work
 - [ ] MP3 encoder — core patents expired worldwide by 2017 (broadly considered safe), but confirm before shipping if there's commercial distribution. **Partial progress (2026-09-24):** `tpt-av-cadence-mp3::Mp3Encoder` emits valid, spec-compliant, bit-reservoir-free CBR and is independently FFmpeg-decodable. The analysis polyphase fill, forward MDCT/antialias/change-sign chain, Huffman pair orientation, count1 handling, MPEG-1 stereo side-info order, and synthesis state are regression-tested. Active mono and independent-stereo end-to-end fidelity gates now pass within the reduced flat-gain/no-reservoir scope. Remaining work is feature expansion: psychoacoustic tuning, bit-reservoir borrowing, short blocks, stereo coupling modes, and broader bit-allocation quality.
+
+### SILK encoder foundation — task breakdown (2026-09-26) — **LANDED this session (all 9 modules; see session log below the breakdown)**
+
+Scope for the SILK *encoding* half of the Opus encoder (the last major gap named in the
+item above), modeled on how the CELT encoder was built: a decodable, tested foundation
+first, then quality/feature iterations. Foundation scope: **mono, 10/20 ms frames, all
+three internal bandwidths (8/12/16 kHz), VBR payloads, no LBRR / DTX / FEC / stereo /
+hybrid**. Non-normative analysis may diverge from libopus; everything on the bitstream
+and decoder-state side must be exact.
+
+Modules (all under `tpt-av-cadence-opus/src/silk/`):
+
+1. `encode_indices.rs` — side-info encoder mirroring `decode_indices` symbol-for-symbol
+   (type/offset, gains, NLSF indices with escapes, interpolation factor, pitch
+   lag/contour/LTP, seed) plus the per-payload VAD/LBRR-flag prologue. (A test-side
+   mirror already exists in `decode_indices.rs`'s tests; this promotes and extends it.)
+2. `encode_pulses.rs` — promote `silk_encode_pulses`/`silk_shell_encoder`/
+   `silk_encode_signs` from `excitation.rs`'s tests into the module proper, plus the
+   reference's rate-level search using the `*_BITS_Q5` tables.
+3. `gains.rs` — promote `silk_gains_quant` + `silk_lin2log` from the module's tests.
+4. `lpc_analysis.rs` — windowed autocorrelation, Levinson-Durbin, white-noise floor,
+   LPC lag windowing, and `silk_A2NLSF` (Chebyshev + cos-table bisection; the decoder
+   already ships `LSF_COS_TAB_FIX_Q12`).
+5. `nlsf_quant.rs` — NLSF quantizer producing indices that `nlsf_decode` reconstructs
+   exactly (stage-1 nearest-vector search, then stage-2 residuals quantized in the
+   dequantizer's own reverse-prediction order).
+6. `pitch_analysis.rs` — correlation pitch search over the 2-18 ms range, mapped to a
+   primary lag index + contour codebook entry.
+7. `ltp_analysis.rs` — per-subframe 5-tap LTP estimation (normal equations) and
+   quantization into the `LTP_VQ_*` codebooks with a periodicity (`per_index`) choice.
+8. `nsq.rs` — the core: a **closed-loop forward NSQ that mirrors `decode_core`'s exact
+   integer arithmetic**, choosing each sample's quantization index by evaluating
+   candidate `q` values through the decoder's own excitation/LTP/LPC/gain path and
+   picking the one that best tracks the input. Guarantees encoder-side simulated
+   reconstruction equals the real decoder's output bit-for-bit.
+9. `encoder.rs` — `SilkEncoder` top level: API-rate resampling (the `for_enc`
+   resampler direction already landed), signal-type/VAD decision, per-frame assembly,
+   residual-energy gain selection with a rate-dependent SNR boost (a documented
+   approximation of `silk_control_SNR`), payload assembly. Single-frame payloads;
+   `OggOpusEncoder`/hybrid integration is follow-up work, exactly as the CELT
+   foundation was followed by its container wiring.
+
+Acceptance for the foundation: encode → `SilkDecoder` round-trip is **bit-exact**
+(encoder simulation == decoder output) at every bandwidth/frame-size combination, with
+sane SNR/bitrate behavior on synthetic tonal/noise material.
+
+**Landed (2026-09-26, this session)** — all nine modules implemented and green
+(`cargo test -p tpt-av-cadence-opus` debug + release: 219 lib tests + all
+integration suites, `clippy -D warnings` clean, fmt clean):
+
+- `encode_indices.rs`, `encode_pulses.rs` (exact mirrors; the rate-level search
+  is the reference's min-bits argmin over the `*_BITS_Q5` tables — no budget
+  term), `gains_quant`/`lin2log` promoted from gains.rs tests to module level.
+- `nlsf_quant.rs`: exact `silk_NLSF_encode` port — stage-1 weighted VQ,
+  survivor sort, the 4-state `NLSF_del_dec_quant` trellis over
+  `ec_rates_Q5`, stage-1 entropy cost, and reconstruction through the
+  shared `nlsf_decode`; Laroia weights ported alongside.
+- `lpc_analysis.rs`: float kernels (sine window with the reference's
+  recurrence, autocorrelation, Schur, k2a, bwexpander, LPC analysis filter,
+  corrMatrix/corrVector) plus the exact fixed-point `silk_A2NLSF` (Chebyshev
+  split, 3-step bisection, bandwidth-expansion retries, white-spectrum
+  fallback) on the existing `LSF_COS_TAB_FIX_Q12`.
+- `ltp_quant.rs`: `find_ltp` (float corr matrix/vector, LTP_CORR_INV_MAX
+  normalization) → ×2^17 Q17 conversion → exact `VQ_WMat_EC` +
+  `quant_LTP_gains` (three codebooks, `sum_log_gain` safety cap).
+- `nsq.rs`: the closed-loop forward NSQ. A differential test proves the
+  committed reconstruction is bit-identical to `decode_core` on identical
+  parameters/state (unvoiced + voiced, gain changes).
+- `encoder.rs`: `SilkEncoder` — encoder-direction resampling, RMS VAD gate,
+  full-resolution pitch search + contour quantization (sparseness rule for
+  the non-voiced quantization offset), proxy shaping gains from the ported
+  `control_SNR` tables, the find_pred_coefs/process_gains chain, payload
+  assembly.
+
+Round-trip verification (`tests/silk_encoder.rs`): decode-through-`SilkDecoder`
+is **bit-exact** against the encoder simulation at (8/12/16 kHz) × (10/20 ms);
+the comparison accounts for the reference's own decoder-side delay (mono
+`s_mid` header + `DELAY_MATRIX_DEC` resampler delay line). Fidelity gates:
+speech SNR > 6 dB, 440 Hz sine SNR > 10 dB at 30 kbps targets; silence stays
+silent (< 16-byte payloads); bitrate control moves the payload with target
+rate. Diagnostics worth keeping in mind for the next session: the decoder's
+output being delayed ~13 samples (16 kHz mono) relative to the internal xq is
+reference behavior, not a bug; the encoder resampler likewise delays input by
+`DELAY_MATRIX_ENC[fs][fs]` (10 at 16 kHz), which fidelity tests must align.
+
+Not yet done (next steps): Opus/Ogg packetization of SILK payloads
+(`Packet`/TOC config 0–3 SILK modes + `OggOpusEncoder` wiring), hybrid
+SILK+CELT, SILK quality iterations (noise-shaping filter + warped
+autocorrelation, delayed-decision NSQ, Burg LPC, pitch lookahead), SILK CBR
+sizing, and cross-checking against a real libopus-encoded SILK stream via
+`opus_demo` (the FFmpeg-oracle pattern used for the CELT encoder).
 
 ### WAV/AIFF/PCM writers (2026-09-22)
 
