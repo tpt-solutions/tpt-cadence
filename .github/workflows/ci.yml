@@ -325,8 +325,12 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
+      # taiki-e/install-action's cargo-fuzz support depends on rust-fuzz/cargo-fuzz
+      # publishing a prebuilt binary for the runner's platform, which isn't
+      # guaranteed and has been observed to leave `cargo fuzz` missing from
+      # PATH without failing this step. `cargo install` always works.
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
       - name: Restore corpus cache
         uses: actions/cache@v4
