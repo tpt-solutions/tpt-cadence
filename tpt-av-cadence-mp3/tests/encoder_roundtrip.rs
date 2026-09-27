@@ -103,6 +103,12 @@ fn pearson_correlation(a: &[f32], b: &[f32]) -> f64 {
     num / (da.sqrt() * db.sqrt())
 }
 
+/// Best *positive* correlation over all alignments. A pure tone's
+/// correlation magnitude is nearly identical at phase-aligned and
+/// anti-phase alignments (corr ≈ cos of the residual phase shift), so
+/// tracking max |corr| makes the gate flip-flop on rounding; the gate's
+/// intent is "the source waveform is recognizable at some alignment",
+/// which is the positive peak.
 fn best_delayed_correlation(decoded: &[f32], source: &[f32], max_delay: usize) -> (f64, usize) {
     let mut best = (0.0f64, 0usize);
     for delay in 0..=max_delay {
@@ -111,7 +117,7 @@ fn best_delayed_correlation(decoded: &[f32], source: &[f32], max_delay: usize) -
             break;
         }
         let corr = pearson_correlation(&decoded[delay..delay + n], &source[..n]);
-        if corr.abs() > best.0.abs() {
+        if corr > best.0 {
             best = (corr, delay);
         }
     }

@@ -8,6 +8,158 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 ## [Unreleased]
 
 ### Added
+- MP3 systematic FFmpeg-oracle conformance matrix (`tpt-av-cadence-mp3`):
+  with the official ISO/IEC 11172-4 conformance bitstreams still
+  unobtainable (re-verified 2026-09-27: mpg123 SVN `test/` only, no
+  client-free access, no mirrors), `tests/ffmpeg_oracle_matrix.rs` now
+  synthesizes 28 LAME-encoded streams at test time — MPEG-1/2/2.5 sample
+  rates, the 8–320 kbps ladder, mono/stereo/joint modes, transient content,
+  reservoir-off, and header surgery (dual-channel mode, flag flips,
+  Xing-strip) — and requires each stream to byte-tile exactly per the ISO
+  frame-size formula and match FFmpeg's decode at the suite gate
+  (>100 dB SNR / <=1e-5 peak), applying LAME gapless-tag alignment where
+  the muxer writes one. A companion test independently re-parses the
+  corpus's headers and side info and asserts the Layer III feature space
+  (all four block types incl. mixed, scfsi, bit-reservoir use, preflag,
+  scalefac_scale, subblock gains, both count1 tables, count1-only and
+  zero-length granules, mid/side mode_ext) is genuinely exercised, with
+  the bundled fixtures byte-tile-checked too. The encoder cross-check
+  gained a full 32–320 kbps stereo ladder gated on FFmpeg acceptance and
+  FFmpeg-vs-ours PCM agreement of the same bytes — and the ladder
+  immediately surfaced two real encoder defects (a ~1e5× output-scale
+  error in all materials, and cross-decoder divergence on tonal granules),
+  tracked with measurements in `todo.md` behind an `#[ignore]`d regression
+  test. Remaining documented oracle gaps: Layer III intensity stereo,
+  CRC-protected whole streams (separately covered by `crc_streams.rs`),
+  and free-format bitrates.
+- CBR payload sizing for the SILK encoder (`tpt-av-cadence-opus`):
+  `SilkEncoder::set_cbr_bytes` / `set_max_payload_bytes` and
+  `OggOpusEncoder::new_silk_cbr` close the SILK CBR-sizing gap. Every
+  encoding attempt is wrapped in a snapshot/retry loop: the payload is
+  serialized, measured (exact byte length for standalone CBR, range-
+  coder `tell()` plus the hybrid redundancy-lookahead headroom for the
+  hybrid), and an oversized payload is re-encoded from a full mutable-
+  state snapshot at a proportionally reduced working rate (up to 12
+  attempts); an undersized payload is padded with zero bytes, which the
+  SILK decoder never reads (its range coding has no end-relative raw
+  bits), so padding is lossless. `new_silk_cbr` emits constant-size
+  packets at the nominal `bitrate·ms/8000`; `new_hybrid` now enforces
+  the SILK share with the same mechanism, so the frame-budget guard can
+  no longer fire from SILK overshoot. Two subtleties pinned during
+  development: the retry snapshot must include the per-channel
+  RESAMPLER (its retained inter-call tail otherwise corrupts the
+  re-sampled frame on every retry), and the foundation's quantizer has
+  a content-dependent minimum payload (~45 B for active speech at
+  16 kHz internal, ~20 B for silence) below which ExactBytes sizing
+  fails cleanly and MaxBytes sizing degrades best-effort. Tests:
+  constant-size mono/stereo CBR streams with decode SNR gates, CBR
+  determinism, infeasible-size rejection, and all prior suites green.
+- Stereo hybrid encoding (`tpt-av-cadence-opus`): `OggOpusEncoder::new_hybrid`
+  now accepts 1 or 2 channels — stereo pairs code through stereo
+  adaptive-mid/side SILK (per-channel rate targets split from the total)
+  plus the stereo start-band-17 CELT layer on the shared range coder,
+  with the TOC stereo bit set and every budget guard unchanged. The
+  constructor's rate validation is now per channel (stereo totals range
+  up to 2x). Found and fixed a real robustness bug while testing: the
+  `finish()`/`Drop` delayed-tail flush loop spun forever when
+  `emit_frame` kept failing (e.g. a budget guard error) because
+  `emitted_samples` never advanced — both loops are now progress-bound
+  and end the stream a few samples short instead of hanging. Documented
+  measurement: stereo SILK's natural VBR payload is far larger than the
+  nominal rate math (~114/140/165/290 B per 20 ms frame at 8/12/16/40
+  kbps per channel — two channels' side info plus the MS predictor
+  symbols dominate), so stereo hybrid budgets must be sized from the
+  measured payload, which the frame-budget guard enforces by refusing to
+  emit frames the decoder would misread. Tests: stereo hybrid SWB/FB
+  round trips with exact length recovery, TOC stereo-bit and exact
+  frame-size checks, per-channel SNR gates, and the extended validation
+  matrix.
+- SILK stereo (adaptive mid/side) encoding (`tpt-av-cadence-opus`):
+  `SilkEncoder::new_stereo` and `OggOpusEncoder::new_silk(.., channels =
+  2)` produce real stereo SILK payloads and `.opus` streams (TOC stereo
+  bit set, `nChannelsInternal = 2`). Per frame after resampling, the
+  left/right input is converted to adaptive mid/side by
+  `stereo::lr_to_ms` — an exact fixed-point mirror of the decoder's
+  `ms_to_lr` unmixing in reverse, including the one-sample-delay
+  buffering and the 8 ms predictor ramp. The mid/side predictor is
+  chosen by least squares over the frame's constant-weight region and
+  quantized to the decoder's `STEREO_PRED_QUANT_Q13` table (the joint
+  25-symbol index packs the two weights' regions); the quantized
+  predictor is then removed with the decoder's own ramped arithmetic, so
+  a decode of the emitted indices reconstructs the input mid/side pair.
+  Mid-only side skipping is engaged when the side residual's RMS falls
+  below the activity gate — the flag is present in the bitstream exactly
+  when the decoder's side-VAD gate reads it — and the encoder mirrors
+  the decoder's side-channel reset (zeroed synthesis memory, re-seeded
+  pitch/gain state, `LastGainIndex` = 10) on the first coded side frame
+  after a skipped one. Per-frame and per-channel conditional coding
+  follow the decoder's rules exactly: mid independent on frame 0 and
+  conditional afterwards; side offset by one frame index (independent
+  for frames 0 and 1) with `CODE_INDEPENDENTLY_NO_LTP_SCALING` after a
+  skipped frame; per-channel VAD/LBRR prologues and per-channel
+  persistent `ec_prev`/`indices` state. All per-channel state moved into
+  a `ChannelState` with the analysis chain; the mono path is
+  bit-identical (pinned by the existing suite). Tests: stereo Ogg round
+  trips at 8/16 kHz internal with exact length recovery, per-channel SNR
+  gates and TOC stereo-bit checks; mid-only engagement (near-mono
+  packets shrink ~1.7x vs true stereo while decoding both channels at
+  >20 dB); stereo pre-skip pinning (mid channel at the signalled
+  constant, side within the documented dispersion tolerance);
+  determinism and validation.
+- Hybrid SILK+CELT encoding (`tpt-av-cadence-opus`): `OggOpusEncoder::new_hybrid`
+  writes real mono hybrid `.opus` streams (TOC configs 12–15, 10/20 ms,
+  superwideband or fullband) — the third and last Opus mode on the encode
+  side. The SILK layer (always 16 kHz internal, the wideband low band)
+  writes its symbols first onto a shared range coder, the hybrid
+  no-redundancy bit follows, and a `start`-band-17 CELT layer codes the
+  ≈6.8 kHz+ region on the same coder, exactly as a hybrid decoder reads
+  it. `SilkEncoder::encode_frame_into` exposes the shared-coder
+  half (no finalization), and the CELT encoder's bitstream body was
+  refactored into a band-windowed, shared-encoder core
+  (`encode_frame_core`) used by both the pure-CELT and hybrid paths —
+  header bits mirror the decoder's exact conditions (silence only at
+  `tell() == 1`, postfilter only at `start == 0`), and every budget gate
+  plus the whole allocation arithmetic keys off `8 × whole-frame bytes`,
+  which the hybrid packet makes exact by fixing the frame's final byte
+  count (SILK share + CELT share, padded through the proven
+  raw-bit/clone-verify finalizer) so encoder-side and decoder-side
+  budgets match by construction. Measured hybrid pre-skip: 67 samples
+  (the SILK low band's delay dominates the composite alignment; the CELT
+  high band's ~120-sample delay is the documented compromise). Speech
+  round trips at 16 kbps SILK + 24 kbps CELT decode at ~37 dB SNR
+  through the real hybrid `OpusDecoder` path (vs ~21 dB SILK-only).
+  Tests: SWB/FB × 10/20 ms round trips with exact sample-count recovery
+  and TOC/frame-size checks, pre-skip pinning, low-band consistency,
+  determinism, and configuration validation. Remaining Opus encoder
+  scope: SILK stereo, LBRR/FEC/DTX, CBR SILK sizing, and the SILK
+  quality iterations.
+- SILK-mode Opus packetization (`tpt-av-cadence-opus`): `SilkEncoder` now
+  emits complete RFC 6716 SILK payloads — 10/20 ms single-frame packets
+  plus 40/60 ms packets carrying two/three 20 ms frames in the reference's
+  intra-packet arrangement (frame 0 coded independently, later frames
+  conditionally: subframe-0 gains delta-coded against the previous frame's
+  last subframe, delta pitch lags when the previous frame was voiced, no
+  LTP-scale symbol, NLSF interpolation factor still transmitted but held
+  at 4 = no interpolation; the encoder keeps a decoder-mirror persistent
+  `SideInfoIndices` so fields a frame does not code carry across frames
+  exactly as `decode_indices` reads them). `OggOpusEncoder::new_silk`
+  wires the payloads into real `.opus` streams: mono, TOC configs 0–11
+  (NB/MB/WB × 10/20/40/60 ms, single-frame code-0 packets), target-bitrate
+  steering of the quantizer SNR (5–64 kbps, VBR packet sizes), and
+  per-rate RFC 7845 pre-skip constants measured with aperiodic
+  impulse-train round trips (68/65/67 samples at 8/12/16 kHz internal;
+  an earlier periodic-signal measurement had produced period-shifted
+  representatives of the same alignment — the dispersion caveat and the
+  measurement method are documented on `silk_pre_skip`). Tests:
+  multi-frame payloads bit-exact through the real `SilkDecoder` with
+  voiced, unvoiced, and inactive predecessors so pitch-delta coding is
+  exercised in both directions; TOC/parse-back configuration checks;
+  20/40/60 ms Ogg end-to-end with exact sample-count recovery, SNR gates,
+  and a pre-skip pinning test; bitrate steering; determinism; and
+  invalid-configuration rejection. Remaining Opus encoder scope: hybrid
+  SILK+CELT, SILK stereo, LBRR/FEC/DTX, CBR payload sizing, and the SILK
+  quality iterations (noise shaping + warping, Burg LPC, delayed-decision
+  NSQ, pitch lookahead).
 - SILK encoder foundation (`tpt-av-cadence-opus`): `SilkEncoder` encodes
   mono 10/20 ms frames at 8/12/16 kHz internal rate into VBR SILK
   payloads, closing the first half of the last major Opus encoder gap.

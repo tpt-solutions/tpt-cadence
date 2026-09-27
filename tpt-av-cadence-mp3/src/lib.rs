@@ -14,8 +14,15 @@
 //!
 //! Ten bundled fixtures cover stream geometry, deterministic seek replay,
 //! and independent FFmpeg float PCM (>100 dB SNR, <=1e-5 peak error) when
-//! FFmpeg is available. These tolerance-based checks are not bit-exact
-//! conformance or exhaustive coverage of Layer III features.
+//! FFmpeg is available. Because the official ISO/IEC 11172-4 conformance
+//! bitstreams are unobtainable, `tests/ffmpeg_oracle_matrix.rs` additionally
+//! generates a 28-stream LAME matrix at test time (all MPEG versions, the
+//! bitrate ladder, channel modes, header-surgery variants), byte-tile-checks
+//! and oracle-compares each stream, and asserts the corpus exercises the
+//! Layer III feature space (block types, scfsi, reservoir, count1 tables).
+//! These tolerance-based checks are not bit-exact conformance; Layer III
+//! intensity stereo and free-format bitrates remain outside the oracle
+//! corpus.
 //!
 //! # Example
 //!

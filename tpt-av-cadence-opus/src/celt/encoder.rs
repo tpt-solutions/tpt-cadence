@@ -462,6 +462,200 @@ impl CeltEncoder {
         force_transient: Option<bool>,
         vbr: bool,
     ) -> Vec<u8> {
+        let mut enc = RangeEncoder::new();
+        let used_bits_bytes = self.encode_frame_core(
+            &mut enc,
+            pcm,
+            CoreParams {
+                start: 0,
+                end: NB_EBANDS,
+                total_bits_bytes: (bytes_per_frame * 8) as i32,
+                bytes_per_frame: Some(bytes_per_frame),
+                vbr,
+                force_transient,
+            },
+        );
+        let bytes_per_frame = (used_bits_bytes / 8) as usize;
+
+        // CBR padding: `quant_energy_finalise` above targets `bits_left =
+        // bytes_per_frame*8 - enc.tell()`, but it can only spend up to one
+        // extra raw bit per (band, channel) per priority pass (at most
+        // `2 * NB_EBANDS * channels` bits total across both passes), and
+        // bails out early once every eligible band/channel has had its
+        // turn — it does not loop back for a second helping. When the
+        // leftover budget exceeds that cap (observed in practice: up to a
+        // few dozen bits, more likely when very few bands are still
+        // fine-bit-eligible), `enc.done()` below yields fewer than
+        // `bytes_per_frame` bytes.
+        //
+        // Critically, that shortfall must be made up with *raw* bits
+        // written through `enc.write_raw_bits`, not by resizing the
+        // returned `Vec<u8>` afterwards. `RangeEncoder::done()` (range.rs)
+        // lays out its output as the range-coded bytes first, followed
+        // immediately by the raw-bit bytes (written back-to-front during
+        // encoding, e.g. by `quant_fine_energy`/`quant_energy_finalise`/
+        // the anti-collapse bit/large-alphabet `encode_uint` tails/N=1
+        // band signs) — with no gap between them. `RangeDecoder::new`
+        // mirrors this by reading raw bits from the *end* of the full
+        // `bytes_per_frame`-sized packet slice it's constructed with.
+        // Appending zero bytes after `done()` (as this used to do)
+        // inserts them *after* that raw-bit suffix instead of before it,
+        // shifting every raw-bit read on the decode side off by however
+        // many bytes were appended — silently corrupting exactly the raw
+        // bits (fine energy, anti-collapse, etc.), while leaving the
+        // range-coded portion (coarse energy, PVQ shape) untouched. This
+        // was invisible in the general case because CBR frames usually
+        // land at or above `bytes_per_frame` on their own (no resize
+        // needed), and stayed invisible in isolated round-trip tests that
+        // never went through this padding path — it only reproduced with
+        // a real end-to-end `encode_frame` call that happened to undershoot.
+        //
+        // Padding through `write_raw_bits` instead keeps every zero bit
+        // inside the *same* raw-bit suffix `done()` already positions
+        // correctly, so no post-hoc byte surgery is needed.
+        //
+        // Target exactly `bytes_per_frame * 8` here, with NO extra cushion
+        // beyond that. An earlier version of this loop padded to
+        // `bytes_per_frame*8 + 8` (an extra whole byte) to defensively
+        // absorb `tell()`'s estimate slack — but on a frame whose *natural*
+        // encoding already reaches or exceeds `bytes_per_frame` (common;
+        // `quant_energy_finalise` already targets exactly this budget and
+        // frequently lands a little over), that cushion is spurious: this
+        // loop's own `enc.tell() < target_bits` guard means it only ever
+        // fires when genuinely short, so an unconditional "+8" doesn't
+        // change *whether* it pads, only adds one unnecessary extra byte
+        // when it does. That extra byte turned out not to be the harmless
+        // padding it looked like: appending it after `quant_energy_finalise`
+        // shifts the packet's raw-bit-suffix/range-coded-prefix boundary by
+        // a byte, which perturbs the low bits of nearby quantized values
+        // (observed: a ~1-2% change in fine-energy correction) enough to
+        // occasionally flip a threshold-sensitive decoder decision (e.g.
+        // postfilter pitch/gain), corrupting that frame's decoder-side
+        // memory and compounding into every subsequent frame. Root-caused
+        // by bisecting a real regression: `CeltEncoder::new(1,
+        // 3).encode_frame` on a steady 440 Hz tone decoded at ~20-25 dB SNR
+        // before the "+8" cushion was added and ~0.4 dB after, with the
+        // *only* byte-level difference between the two encoders' output
+        // being that one extra padding byte (confirmed by decoding each
+        // encoder's saved packets, and each other's, through the same
+        // unmodified decoder).
+        //
+        // `tell()`'s bit count is RFC 6716's well-known *estimate*
+        // (`ec_tell()`) of the range-coded prefix's eventual byte length,
+        // not a guarantee: `done()`'s actual carry-propagation/renormalization
+        // can still land a whole byte short of what `tell()` predicted (not
+        // just the sub-byte slack this loop was originally written to
+        // absorb) — reproduced with a real stereo encode where one channel
+        // stays bit-exact digital silence for many consecutive frames,
+        // where `done()` yielded 319 bytes against a 320-byte target. A
+        // prior version of this function padded that residual shortfall by
+        // resizing the returned byte vector directly, which — per the
+        // layout note above — appends zero bytes *after* the raw-bit
+        // suffix instead of before it, corrupting exactly the raw bits
+        // (fine energy, anti-collapse, etc.) on decode; confirmed via the
+        // `STEREO_DEBUG2` trace, where the decoder's reconstructed
+        // `old_band_e` for the loud channel diverged from the encoder's own
+        // on precisely the frame that undershot, then stayed diverged
+        // (persistent per-channel state) for every following frame,
+        // cratering that channel's SNR from ~20 dB to ~1 dB despite every
+        // per-band/per-call round trip already being individually
+        // bit-exact-tested. Fixed by verifying the actual output length
+        // (via a cheap `RangeEncoder` clone — `done()` consumes `self` and
+        // isn't idempotent) instead of trusting `tell()`'s estimate, and
+        // padding with additional raw-bit *bytes* — always landing before
+        // the raw-bit suffix, never after it — until the real length is
+        // confirmed sufficient.
+        let frame = finalize_sized(enc, bytes_per_frame);
+        debug_assert_eq!(frame.len(), bytes_per_frame);
+
+        // TOC byte: CELT-only, fullband, config 28+lm (28/29/30/31 for
+        // 2.5/5/10/20 ms — see `packet.rs::Toc::frame_duration`'s "CELT:
+        // 2.5, 5, 10, 20 ms" branch, `config % 4` in that order), code 0
+        // (single CBR frame, payload is exactly this frame's bytes), stereo
+        // bit set from `self.channels`.
+        let config = 28u8 + self.lm as u8;
+        let mut packet = Vec::with_capacity(1 + frame.len());
+        packet.push((config << 3) | (u8::from(self.channels == 2)) << 2); // code 0
+        packet.extend_from_slice(&frame);
+        packet
+    }
+
+    /// Hybrid-mode CELT layer: codes bands `start..end` of `pcm` onto a
+    /// range encoder shared with the SILK layer (which has already
+    /// written its symbols and the hybrid redundancy bit), without
+    /// finalizing. `total_frame_bytes` is the whole Opus frame's *exact*
+    /// final byte count (SILK share + CELT share): the decoder derives
+    /// every budget gate and the whole allocation arithmetic from
+    /// `data_len * 8`, so the caller must pad the combined packet to
+    /// exactly this many frame bytes after all symbols are written (see
+    /// [`finalize_sized`]) — then encoder-side and decoder-side budgets
+    /// are identical by construction.
+    pub(crate) fn encode_hybrid_frame(
+        &mut self,
+        pcm: &[f32],
+        enc: &mut RangeEncoder,
+        start: usize,
+        end: usize,
+        total_frame_bytes: usize,
+    ) {
+        self.encode_frame_core(
+            enc,
+            pcm,
+            CoreParams {
+                start,
+                end,
+                total_bits_bytes: (total_frame_bytes * 8) as i32,
+                bytes_per_frame: None,
+                vbr: false,
+                force_transient: None,
+            },
+        );
+    }
+}
+
+/// Parameterization shared by the pure-CELT and hybrid encode paths.
+struct CoreParams {
+    /// First band to code (0 pure; 17 hybrid — the SILK layer covers
+    /// everything below).
+    start: usize,
+    /// One past the last band (`NB_EBANDS` pure; 20/21 hybrid per the
+    /// packet's bandwidth).
+    end: usize,
+    /// `8 × whole-frame bytes`: the exact budget base every header gate,
+    /// the TF/dynalloc loops, and the allocation arithmetic use. The
+    /// decoder derives all of them from `total_bits = data_len * 8` where
+    /// `data_len` is the whole Opus frame — for hybrid packets that
+    /// includes the SILK prefix, so the hybrid caller must know (and
+    /// pad to) the final packet length up front.
+    total_bits_bytes: i32,
+    /// Pure-CELT byte budget (`Some` for the CBR/VBR paths, which derive
+    /// `total_bits_bytes` from it — VBR after band-energy analysis;
+    /// `None` for hybrid, whose budget is fixed above).
+    bytes_per_frame: Option<usize>,
+    vbr: bool,
+    force_transient: Option<bool>,
+}
+
+/// Shared finalization of a fixed-size CELT frame: pads with raw bits
+/// (which the range-coder layout places inside the raw-bit suffix, where
+/// the decoder expects them) until `done()` is confirmed to produce
+/// exactly `frame_bytes`, then finalizes. Used by the pure-CELT CBR path
+/// and by the hybrid packet assembler alike.
+pub(crate) fn finalize_sized(mut enc: RangeEncoder, frame_bytes: usize) -> Vec<u8> {
+    let target_bits = (frame_bytes * 8) as u32;
+    while enc.tell() < target_bits {
+        enc.write_raw_bits(0, 1);
+    }
+    while enc.clone().done().len() < frame_bytes {
+        enc.write_raw_bits(0, 8);
+    }
+
+    enc.try_done_sized(frame_bytes)
+        .expect("CELT allocation should fit its fixed CBR storage")
+}
+
+impl CeltEncoder {
+    fn encode_frame_core(&mut self, enc: &mut RangeEncoder, pcm: &[f32], p: CoreParams) -> i32 {
         let channels = self.channels;
         let stereo = channels == 2;
         let lm = self.lm;
@@ -472,6 +666,7 @@ impl CeltEncoder {
             n2 * channels,
             "pcm must be {channels}-channel interleaved, {n2} samples/channel (lm={lm})"
         );
+        let hybrid = p.bytes_per_frame.is_none();
 
         // --- Pre-emphasis (inverse of the decoder's `deemphasis`), one
         // filter per channel, deinterleaving the input PCM as it goes ---
@@ -488,21 +683,25 @@ impl CeltEncoder {
         // conservative and assume the smallest budget VBR can ever derive
         // (the clamp floor), so a transient bit is only signaled when it is
         // affordable even in the quietest case.
-        let probe_bits_bytes = if vbr {
-            ((bytes_per_frame / 3).max(VBR_MIN_BYTES) * 8) as i32
+        let probe_bits_bytes = if p.vbr {
+            ((p.bytes_per_frame.unwrap() / 3).max(VBR_MIN_BYTES) * 8) as i32
         } else {
-            (bytes_per_frame * 8) as i32
+            p.total_bits_bytes
         };
 
         // --- Transient detection ---
         // The `is_transient` bit is only ever affordable/meaningful when
-        // the (content-independent) silence+postfilter bits before it in
-        // the header leave at least 3/8 bits of budget — probe that with a
-        // throwaway encoder (silence/postfilter are always encoded as
-        // `false`, so this probe's `tell()` progression is identical to
-        // the real encode below) rather than risking a short-block
-        // analysis the real bitstream then has no room to signal.
-        let is_transient = {
+        // the (content-independent) header bits before it in the
+        // bitstream leave at least 3/8 bits of budget — probe that with a
+        // throwaway encoder (mirroring the real header's `tell()`
+        // progression) rather than risking a short-block analysis the
+        // real bitstream then has no room to signal. Hybrid frames skip
+        // the probe: their whole-frame budget includes the SILK prefix
+        // and the CELT header gates are trivially affordable with any
+        // sane CELT share.
+        let is_transient = if hybrid {
+            lm > 0 && detect_transient(channels, lm, &syn)
+        } else {
             let mut probe = RangeEncoder::new();
             probe.encode_bit_logp(false, 15);
             let mut probe_tell = probe.tell() as i32;
@@ -511,7 +710,9 @@ impl CeltEncoder {
                 probe_tell = probe.tell() as i32;
             }
             let budget_ok = lm > 0 && probe_tell + 3 <= probe_bits_bytes;
-            budget_ok && force_transient.unwrap_or_else(|| detect_transient(channels, lm, &syn))
+            budget_ok
+                && p.force_transient
+                    .unwrap_or_else(|| detect_transient(channels, lm, &syn))
         };
         self.last_is_transient = is_transient;
 
@@ -687,15 +888,21 @@ impl CeltEncoder {
         // EMA reference (see `derive_vbr_budget`); CBR keeps the caller's
         // fixed budget. Everything below (header gates, allocation, padding,
         // finalization) is budget-driven and works identically for either.
-        let bytes_per_frame = if vbr {
-            self.derive_vbr_budget(bytes_per_frame, &means, channels)
+        // VBR derives this frame's actual budget from the frame's
+        // loudness relative to the running EMA reference (see
+        // `derive_vbr_budget`); CBR and hybrid keep the caller's fixed
+        // whole-frame budget. Everything below (header gates, allocation,
+        // padding, finalization) is budget-driven and works identically.
+        let total_bits_bytes = if p.vbr {
+            (self.derive_vbr_budget(p.bytes_per_frame.unwrap(), &means, channels) * 8) as i32
         } else {
-            bytes_per_frame
+            p.total_bits_bytes
         };
-        let total_bits_bytes = (bytes_per_frame * 8) as i32;
+        let frame_bytes = (total_bits_bytes / 8) as usize;
 
         // --- Bitstream ---
-        let mut enc = RangeEncoder::new();
+        // (`enc` is caller-provided: a fresh coder for pure-CELT frames,
+        // the shared SILK+CELT coder for hybrid frames.)
 
         // silence / postfilter: forced off (see the module doc comment on
         // scope); transient: the real, content-driven decision from the
@@ -703,14 +910,22 @@ impl CeltEncoder {
         // `tf_decode`'s decode-side counterpart uses — omitting a bit the
         // decoder wouldn't read (or vice versa) would desync everything
         // after it.
+        // silence: the decoder only reads this bit when tell() == 1 (the
+        // very first thing in the frame — celt/decoder.rs's
+        // `if tell == 1` guard). Pure-CELT frames start a fresh encoder,
+        // so the bit is always written; hybrid frames continue after the
+        // SILK payload and the redundancy bit (tell > 1), so no bit is
+        // written and the decoder assumes non-silent — mirroring it
+        // exactly is what keeps the shared-coder symbol stream in sync.
+        if enc.tell() == 1 {
+            enc.encode_bit_logp(false, 15); // silence
+        }
         let mut tell = enc.tell() as i32;
-        // silence: the decoder only reads this when tell() == 1 (i.e. the
-        // very first thing in the frame — true here, nothing encoded yet).
-        debug_assert_eq!(tell, 1);
-        enc.encode_bit_logp(false, 15); // silence
-        tell = enc.tell() as i32;
 
-        if tell + 16 <= total_bits_bytes {
+        // postfilter: the decoder only reads this when start == 0 (its
+        // `start == 0 && tell + 16 <= total_bits` guard) — hybrid frames
+        // (start == 17) never carry it, exactly like the decode side.
+        if p.start == 0 && tell + 16 <= total_bits_bytes {
             enc.encode_bit_logp(false, 1); // postfilter
             tell = enc.tell() as i32;
         }
@@ -736,14 +951,14 @@ impl CeltEncoder {
         let mut old_band_e = [0.0f32; 2 * NB_EBANDS];
         let mut error = [0.0f32; 2 * NB_EBANDS];
         quant_coarse_energy(
-            0,
-            NB_EBANDS,
+            p.start,
+            p.end,
             &means,
             &mut old_band_e,
             &mut error,
             intra_ener,
-            bytes_per_frame,
-            &mut enc,
+            frame_bytes,
+            enc,
             channels,
             lm,
         );
@@ -764,7 +979,7 @@ impl CeltEncoder {
         if tf_select_rsv {
             budget -= 1;
         }
-        for _ in 0..NB_EBANDS {
+        for _ in p.start..p.end {
             if tell + logp <= budget {
                 enc.encode_bit_logp(false, logp as u32);
                 tell = enc.tell() as i32;
@@ -830,7 +1045,7 @@ impl CeltEncoder {
         let mut band_peakiness_db = [0f64; NB_EBANDS];
         let mut active_means = [0f64; NB_EBANDS];
         let mut active_bands = 0usize;
-        for i in 0..NB_EBANDS {
+        for i in p.start..p.end {
             if (0..channels).any(|ch| means[ch * NB_EBANDS + i] > -8.9) {
                 let m = (0..channels)
                     .map(|ch| means[ch * NB_EBANDS + i])
@@ -865,8 +1080,8 @@ impl CeltEncoder {
         let mut dynalloc_logp = 6i32;
         let mut tell = enc.tell_frac() as i32;
         let mut offsets = [0i32; NB_EBANDS];
-        let allow_boost = bytes_per_frame >= 60;
-        for i in 0..NB_EBANDS {
+        let allow_boost = frame_bytes >= 60;
+        for i in p.start..p.end {
             let width = (channels * (EBAND5MS[i + 1] - EBAND5MS[i]) as usize) << lm;
             let quanta = ((width << 3) as i32).min((6 << 3).max(width as i32));
             let mut dynalloc_loop_logp = dynalloc_logp;
@@ -920,8 +1135,8 @@ impl CeltEncoder {
         };
         bits -= anti_collapse_rsv;
         let alloc = compute_allocation_encode(
-            0,
-            NB_EBANDS,
+            p.start,
+            p.end,
             &offsets,
             &cap,
             alloc_trim,
@@ -929,16 +1144,16 @@ impl CeltEncoder {
             lm as i32,
             channels,
             chosen_intensity,
-            &mut enc,
+            enc,
         );
 
         quant_fine_energy(
-            0,
-            NB_EBANDS,
+            p.start,
+            p.end,
             &mut old_band_e,
             &mut error,
             &alloc.ebits,
-            &mut enc,
+            enc,
             channels,
         );
         let mut seed = 0u32;
@@ -947,11 +1162,11 @@ impl CeltEncoder {
         let mut scratch = [0.0f32; 176];
         let mut htmp = [0.0f32; 176];
         let mut iy = [0i32; 176];
-        total_bits_q = (bytes_per_frame as i32 * 8) * 8 - anti_collapse_rsv;
+        total_bits_q = (total_bits_bytes << 3) - anti_collapse_rsv;
         quant_all_bands_encode(
-            &mut enc,
-            0,
-            NB_EBANDS,
+            enc,
+            p.start,
+            p.end,
             &mut x_spec[..channels * n2],
             stereo,
             alloc.alloc.dual_stereo,
@@ -981,128 +1196,18 @@ impl CeltEncoder {
         }
 
         quant_energy_finalise(
-            0,
-            NB_EBANDS,
+            p.start,
+            p.end,
             &mut old_band_e,
             &error,
             &alloc.ebits,
             &alloc.fine_priority,
-            (bytes_per_frame * 8) as i32 - enc.tell() as i32,
-            &mut enc,
+            total_bits_bytes - enc.tell() as i32,
+            enc,
             channels,
         );
 
-        // CBR padding: `quant_energy_finalise` above targets `bits_left =
-        // bytes_per_frame*8 - enc.tell()`, but it can only spend up to one
-        // extra raw bit per (band, channel) per priority pass (at most
-        // `2 * NB_EBANDS * channels` bits total across both passes), and
-        // bails out early once every eligible band/channel has had its
-        // turn — it does not loop back for a second helping. When the
-        // leftover budget exceeds that cap (observed in practice: up to a
-        // few dozen bits, more likely when very few bands are still
-        // fine-bit-eligible), `enc.done()` below yields fewer than
-        // `bytes_per_frame` bytes.
-        //
-        // Critically, that shortfall must be made up with *raw* bits
-        // written through `enc.write_raw_bits`, not by resizing the
-        // returned `Vec<u8>` afterwards. `RangeEncoder::done()` (range.rs)
-        // lays out its output as the range-coded bytes first, followed
-        // immediately by the raw-bit bytes (written back-to-front during
-        // encoding, e.g. by `quant_fine_energy`/`quant_energy_finalise`/
-        // the anti-collapse bit/large-alphabet `encode_uint` tails/N=1
-        // band signs) — with no gap between them. `RangeDecoder::new`
-        // mirrors this by reading raw bits from the *end* of the full
-        // `bytes_per_frame`-sized packet slice it's constructed with.
-        // Appending zero bytes after `done()` (as this used to do)
-        // inserts them *after* that raw-bit suffix instead of before it,
-        // shifting every raw-bit read on the decode side off by however
-        // many bytes were appended — silently corrupting exactly the raw
-        // bits (fine energy, anti-collapse, etc.), while leaving the
-        // range-coded portion (coarse energy, PVQ shape) untouched. This
-        // was invisible in the general case because CBR frames usually
-        // land at or above `bytes_per_frame` on their own (no resize
-        // needed), and stayed invisible in isolated round-trip tests that
-        // never went through this padding path — it only reproduced with
-        // a real end-to-end `encode_frame` call that happened to undershoot.
-        //
-        // Padding through `write_raw_bits` instead keeps every zero bit
-        // inside the *same* raw-bit suffix `done()` already positions
-        // correctly, so no post-hoc byte surgery is needed.
-        //
-        // Target exactly `bytes_per_frame * 8` here, with NO extra cushion
-        // beyond that. An earlier version of this loop padded to
-        // `bytes_per_frame*8 + 8` (an extra whole byte) to defensively
-        // absorb `tell()`'s estimate slack — but on a frame whose *natural*
-        // encoding already reaches or exceeds `bytes_per_frame` (common;
-        // `quant_energy_finalise` already targets exactly this budget and
-        // frequently lands a little over), that cushion is spurious: this
-        // loop's own `enc.tell() < target_bits` guard means it only ever
-        // fires when genuinely short, so an unconditional "+8" doesn't
-        // change *whether* it pads, only adds one unnecessary extra byte
-        // when it does. That extra byte turned out not to be the harmless
-        // padding it looked like: appending it after `quant_energy_finalise`
-        // shifts the packet's raw-bit-suffix/range-coded-prefix boundary by
-        // a byte, which perturbs the low bits of nearby quantized values
-        // (observed: a ~1-2% change in fine-energy correction) enough to
-        // occasionally flip a threshold-sensitive decoder decision (e.g.
-        // postfilter pitch/gain), corrupting that frame's decoder-side
-        // memory and compounding into every subsequent frame. Root-caused
-        // by bisecting a real regression: `CeltEncoder::new(1,
-        // 3).encode_frame` on a steady 440 Hz tone decoded at ~20-25 dB SNR
-        // before the "+8" cushion was added and ~0.4 dB after, with the
-        // *only* byte-level difference between the two encoders' output
-        // being that one extra padding byte (confirmed by decoding each
-        // encoder's saved packets, and each other's, through the same
-        // unmodified decoder).
-        //
-        // `tell()`'s bit count is RFC 6716's well-known *estimate*
-        // (`ec_tell()`) of the range-coded prefix's eventual byte length,
-        // not a guarantee: `done()`'s actual carry-propagation/renormalization
-        // can still land a whole byte short of what `tell()` predicted (not
-        // just the sub-byte slack this loop was originally written to
-        // absorb) — reproduced with a real stereo encode where one channel
-        // stays bit-exact digital silence for many consecutive frames,
-        // where `done()` yielded 319 bytes against a 320-byte target. A
-        // prior version of this function padded that residual shortfall by
-        // resizing the returned byte vector directly, which — per the
-        // layout note above — appends zero bytes *after* the raw-bit
-        // suffix instead of before it, corrupting exactly the raw bits
-        // (fine energy, anti-collapse, etc.) on decode; confirmed via the
-        // `STEREO_DEBUG2` trace, where the decoder's reconstructed
-        // `old_band_e` for the loud channel diverged from the encoder's own
-        // on precisely the frame that undershot, then stayed diverged
-        // (persistent per-channel state) for every following frame,
-        // cratering that channel's SNR from ~20 dB to ~1 dB despite every
-        // per-band/per-call round trip already being individually
-        // bit-exact-tested. Fixed by verifying the actual output length
-        // (via a cheap `RangeEncoder` clone — `done()` consumes `self` and
-        // isn't idempotent) instead of trusting `tell()`'s estimate, and
-        // padding with additional raw-bit *bytes* — always landing before
-        // the raw-bit suffix, never after it — until the real length is
-        // confirmed sufficient.
-        let target_bits = (bytes_per_frame * 8) as u32;
-        while enc.tell() < target_bits {
-            enc.write_raw_bits(0, 1);
-        }
-        while enc.clone().done().len() < bytes_per_frame {
-            enc.write_raw_bits(0, 8);
-        }
-
-        let frame = enc
-            .try_done_sized(bytes_per_frame)
-            .expect("CELT allocation should fit its fixed CBR storage");
-        debug_assert_eq!(frame.len(), bytes_per_frame);
-
-        // TOC byte: CELT-only, fullband, config 28+lm (28/29/30/31 for
-        // 2.5/5/10/20 ms — see `packet.rs::Toc::frame_duration`'s "CELT:
-        // 2.5, 5, 10, 20 ms" branch, `config % 4` in that order), code 0
-        // (single CBR frame, payload is exactly this frame's bytes), stereo
-        // bit set from `self.channels`.
-        let config = 28u8 + lm as u8;
-        let mut packet = Vec::with_capacity(1 + frame.len());
-        packet.push((config << 3) | ((stereo as u8) << 2)); // code 0
-        packet.extend_from_slice(&frame);
-        packet
+        total_bits_bytes
     }
 }
 

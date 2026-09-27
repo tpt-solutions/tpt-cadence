@@ -46,6 +46,17 @@ pub(crate) fn sr_table_idx(hdr: &FrameHeader) -> usize {
     (if my != 0 { my - 1 } else { 0 }) as usize
 }
 
+/// Encoder-side variant: the same table index selected directly from a
+/// sample rate (the encoder only supports the MPEG-1 rates, rows 5–7).
+pub(crate) fn sr_table_idx_for_sr(sample_rate: u32) -> usize {
+    match sample_rate {
+        44100 => 5,
+        48000 => 6,
+        32000 => 7,
+        _ => unreachable!("encoder rejects non-MPEG-1 rates at open"),
+    }
+}
+
 /// Number of leading long-window subbands for mixed blocks (4 on MPEG-2.5
 /// 8 kHz, 2 elsewhere; 0 for non-mixed blocks).
 pub(crate) fn mixed_long_bands(hdr: &FrameHeader, mixed: bool) -> usize {

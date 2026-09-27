@@ -1,8 +1,8 @@
-//! SILK top-level encoder — the mono, single-frame-per-payload foundation.
+//! SILK top-level encoder — mono and stereo (adaptive mid/side).
 //!
 //! Assembles the encoder modules into a `silk_encode_frame_FLP`-shaped
-//! pipeline (mono, 10/20 ms frames, 8/12/16 kHz internal rate, VBR
-//! payloads, no LBRR/DTX/FEC/stereo/hybrid):
+//! pipeline (1 or 2 internal channels, 10/20/40/60 ms *packets*, 8/12/16
+//! kHz internal rate, VBR payloads, no LBRR/DTX/FEC/hybrid):
 //!
 //! 1. **Input**: API-rate `i16` samples (8/12/16/24/48 kHz) are resampled
 //!    to the internal rate with the shared [`super::resampler::Resampler`]
@@ -30,20 +30,47 @@
 //!    soft limit, and [`gains_quant`] into the transmitted indices.
 //! 7. **Excitation** ([`nsq::encode_frame_nsq`]): closed-loop quantization
 //!    over the decoder's exact arithmetic.
-//! 8. **Bitstream**: VAD/LBRR prologue (LBRR always off), side info
-//!    (independent coding — the payload carries one frame), excitation.
+//! 8. **Bitstream**: VAD/LBRR prologue (LBRR always off), then per-frame
+//!    side info + excitation, all in one range-coded payload.
+//!
+//! A payload covers the whole *packet* (RFC 6716 sense): 10/20 ms packets
+//! carry one SILK frame; 40/60 ms packets carry two/three 20 ms frames in
+//! the reference's intra-packet arrangement — frame 0 coded independently,
+//! later frames conditionally (delta gains against the previous frame's
+//! last subframe, delta pitch lags when the previous frame was voiced, no
+//! LTP-scale symbol, NLSF interpolation factor still transmitted but left
+//! at 4 = no interpolation). This is exactly what a decoder expects for
+//! TOC configs 0–11 (`payloadSize_ms` → `nFramesPerPacket` of 1/2/3), so
+//! each payload drops into a single-frame code-0 Opus packet unchanged.
 //!
 //! The persistent decoder-mirror state ([`SynthesisState`],
 //! `LastGainIndex`, `prevNLSF_Q15`, `ec_prev`, `lagPrev`,
-//! `prevSignalType`) matches a fresh [`SilkDecoder`]'s initialization, so
-//! encoding then decoding from reset reproduces the encoder's simulated
-//! output bit-for-bit (pinned by tests).
+//! `prevSignalType`, the persistent side-info `indices` whose
+//! `ltp_scale_index` carries across conditionally coded frames) matches a
+//! fresh [`SilkDecoder`]'s initialization, so encoding then decoding from
+//! reset reproduces the encoder's simulated output bit-for-bit (pinned by
+//! tests).
+//!
+//! **Stereo** (`new_stereo`): the left/right input is converted to
+//! adaptive mid/side per frame ([`stereo::lr_to_ms`]) after resampling —
+//! exactly mirroring the decoder's `ms_to_lr` unmixing in reverse, with
+//! the mid/side predictor chosen by least squares and quantized to the
+//! decoder's table. Each frame carries its own predictor indices and —
+//! when the side residual is inactive — a mid-only flag; the side channel
+//! is then skipped entirely (the decoder reconstructs side from the
+//! prediction alone and resets its state on the next coded side frame,
+//! which this encoder mirrors). Per-frame and per-channel conditional
+//! coding follow the decoder's rules precisely: the mid channel is
+//! independent on frame 0 and conditional afterwards; the side channel's
+//! frame index is offset by one (independent for frames 0 and 1), and a
+//! side frame following a skipped one drops the LTP-scale symbol
+//! (`CODE_INDEPENDENTLY_NO_LTP_SCALING`).
 //!
 //! SOURCE: Xiph.Org libopus 1.5.2, `silk/float/encode_frame_FLP.c`,
 //! `find_pitch_lags_FLP.c`, `find_pred_coefs_FLP.c`,
 //! `noise_shape_analysis_FLP.c`, `process_gains_FLP.c`,
-//! `silk/control_SNR.c` (tables ported verbatim), `silk/define.h`
-//! (BSD-3-Clause).
+//! `silk/control_SNR.c` (tables ported verbatim), `silk/define.h`,
+//! `silk/enc_API.c` (per-packet VAD/LBRR prologue) (BSD-3-Clause).
 #![allow(dead_code)]
 
 use crate::silk::decode_indices::{
@@ -62,6 +89,9 @@ use crate::silk::nlsf::nlsf2a;
 use crate::silk::nlsf_quant::{nlsf_encode, nlsf_vq_weights_laroia};
 use crate::silk::nsq::encode_frame_nsq;
 use crate::silk::resampler::Resampler;
+use crate::silk::stereo::{
+    encode_mid_only_flag, encode_stereo_pred, lr_to_ms, StereoEncState, StereoPredIx,
+};
 use crate::silk::synthesis::{DecoderControl, FrameInfo, SynthesisState, MAX_FRAME_LENGTH};
 use crate::silk::tables::{
     NlsfCbStruct, CB_LAGS_STAGE2, CB_LAGS_STAGE2_10_MS, CB_LAGS_STAGE3, CB_LAGS_STAGE3_10_MS,
@@ -144,18 +174,21 @@ fn control_snr(fs_khz: u32, nb_subfr: usize, mut target_rate_bps: i32) -> i32 {
     }
 }
 
-/// The SILK frame encoder.
-pub struct SilkEncoder {
+/// Per-channel geometry, decoder-mirror state, and analysis chain. The
+/// decoder keeps one fully independent `silk_decoder_channel_state` per
+/// channel; this mirrors that (including per-channel copies of the frame
+/// geometry and SNR target, which are stream-constant here).
+struct ChannelState {
     /* Geometry */
     fs_khz: u32,
-    api_sample_rate: i32,
+    /// Subframes per SILK frame: 4 (20 ms frames) or 2 (10 ms frames).
     nb_subfr: usize,
+    /// Samples per SILK frame at the internal rate.
     frame_length: usize,
     subfr_length: usize,
     ltp_mem_length: usize,
     predict_lpc_order: usize,
     pitch_lpc_order: usize,
-    nlsf_cb: &'static NlsfCbStruct,
     frame: FrameInfo,
 
     /* Rate control */
@@ -171,26 +204,274 @@ pub struct SilkEncoder {
     prev_signal_type: i8,
     sum_log_gain_q7: i32,
     first_frame_after_reset: bool,
-
-    /* Analysis output retained for the caller/tests */
-    last_xq: Vec<i16>,
+    /// The decoder's persistent `psDec->indices`: fields a frame does not
+    /// code (notably `ltp_scale_index` of conditionally coded frames)
+    /// carry the previous frame's values, exactly as on the decode side.
+    indices: SideInfoIndices,
 
     /* Input path */
     resampler: Resampler,
     /// `[ltp_mem history | current frame]` at the internal rate.
     x_buf: Vec<f32>,
     vad_flags: [bool; MAX_FRAMES_PER_PACKET],
+
+    /* Analysis output retained for the caller/tests */
+    last_xq: Vec<i16>,
+}
+
+impl ChannelState {
+    /// Fresh per-channel state from a fresh `SilkDecoder`'s
+    /// initialization (zeros everywhere except `first_frame_after_reset`
+    /// and the seed/`lagPrev` conventions the decoder uses).
+    fn new(
+        (
+            fs_khz,
+            nb_subfr,
+            frame_length,
+            subfr_length,
+            ltp_mem_length,
+            predict_lpc_order,
+            pitch_lpc_order,
+        ): (u32, usize, usize, usize, usize, usize, usize),
+        api_sample_rate: i32,
+        internal_sample_rate: i32,
+    ) -> Result<Self> {
+        let resampler = Resampler::new(api_sample_rate, internal_sample_rate, true)?;
+        Ok(ChannelState {
+            fs_khz,
+            nb_subfr,
+            frame_length,
+            subfr_length,
+            ltp_mem_length,
+            predict_lpc_order,
+            pitch_lpc_order,
+            frame: FrameInfo::new(fs_khz, nb_subfr),
+            snr_db_q7: 0,
+            synth: SynthesisState::default(),
+            exc_q14: [0; MAX_FRAME_LENGTH],
+            last_gain_index: 0,
+            prev_nlsf_q15: [0; MAX_LPC_ORDER],
+            ec_prev: EcPrevState::default(),
+            lag_prev: 0,
+            prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
+            sum_log_gain_q7: 0,
+            first_frame_after_reset: true,
+            indices: SideInfoIndices::default(),
+            resampler,
+            x_buf: vec![0.0; ltp_mem_length + frame_length],
+            vad_flags: [false; MAX_FRAMES_PER_PACKET],
+            last_xq: Vec::new(),
+        })
+    }
+
+    /// A placeholder second channel for mono streams (never analyzed nor
+    /// serialized; mirrors how the decoder builds its second channel
+    /// state lazily). The `Resampler` has no all-zero state; the rates
+    /// are irrelevant placeholders, exactly like the decoder's own
+    /// `ChannelState::default` placeholder.
+    fn placeholder() -> Self {
+        ChannelState {
+            fs_khz: 8,
+            nb_subfr: MAX_NB_SUBFR,
+            frame_length: MAX_FRAME_LENGTH,
+            subfr_length: 40,
+            ltp_mem_length: 160,
+            predict_lpc_order: MAX_LPC_ORDER,
+            pitch_lpc_order: 6,
+            frame: FrameInfo::new(8, MAX_NB_SUBFR),
+            snr_db_q7: 0,
+            synth: SynthesisState::default(),
+            exc_q14: [0; MAX_FRAME_LENGTH],
+            last_gain_index: 0,
+            prev_nlsf_q15: [0; MAX_LPC_ORDER],
+            ec_prev: EcPrevState::default(),
+            lag_prev: 0,
+            prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
+            sum_log_gain_q7: 0,
+            first_frame_after_reset: true,
+            indices: SideInfoIndices::default(),
+            resampler: Resampler::new(8_000, 8_000, true).unwrap(),
+            x_buf: vec![0.0; 160 + MAX_FRAME_LENGTH],
+            vad_flags: [false; MAX_FRAMES_PER_PACKET],
+            last_xq: Vec::new(),
+        }
+    }
+
+    /// Mirrors the decoder's side-channel reset on the first coded side
+    /// frame after a skipped (mid-only) one: synthesis memory zeroed,
+    /// pitch/gain/signal-type state re-seeded.
+    fn reset_after_mid_only(&mut self) {
+        self.synth.out_buf = [0; crate::silk::synthesis::MAX_FRAME_LENGTH
+            + 2 * crate::silk::synthesis::MAX_SUB_FRAME_LENGTH];
+        self.synth.s_lpc_q14_buf = [0; MAX_LPC_ORDER];
+        self.lag_prev = 100;
+        self.last_gain_index = crate::silk::gains::LAST_GAIN_INDEX_ON_PACKET_LOSS;
+        self.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
+        self.first_frame_after_reset = true;
+    }
+}
+
+/// The SILK frame encoder.
+pub struct SilkEncoder {
+    api_sample_rate: i32,
+    nlsf_cb: &'static NlsfCbStruct,
+    /// SILK frames per payload: 1 (10/20 ms packets), 2 (40 ms), 3 (60 ms).
+    packet_frames: usize,
+    /// Duration of one SILK frame in ms (10 or 20).
+    frame_ms: i32,
+    /// Total payload duration in ms (`frame_ms * packet_frames`).
+    packet_ms: i32,
+    /// Internal channel count: 1 (mono) or 2 (adaptive mid/side).
+    channels_internal: usize,
+    ch: [ChannelState; 2],
+    /// Stereo MS transform state (unused for mono).
+    stereo: StereoEncState,
+    /// Mirrors the decoder's persistent `prev_decode_only_middle`.
+    prev_decode_only_middle: bool,
+    /// The caller's rate target (`set_bitrate`); the CBR retry loop
+    /// derives reduced working rates from it.
+    target_rate_bps: i32,
+    /// CBR sizing mode (`None` = plain VBR).
+    cbr: Option<CbrMode>,
+    /// Per-frame mid-only decisions of the packet being encoded.
+    mid_only: [bool; MAX_FRAMES_PER_PACKET],
+    /// Per-frame quantized MS predictor indices.
+    pred_ix: [StereoPredIx; MAX_FRAMES_PER_PACKET],
+    frame_counter: u32,
+}
+
+/// The NLSF codebook for an internal rate (`silk_decoder_set_fs`):
+/// wideband at 16 kHz, the shared NB/MB book otherwise.
+fn nlsf_cb_for(fs_khz: u32) -> &'static NlsfCbStruct {
+    if fs_khz == 16 {
+        &NLSF_CB_WB
+    } else {
+        &NLSF_CB_NB_MB
+    }
+}
+
+/// CBR sizing mode for [`SilkEncoder::encode_frame_into`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CbrMode {
+    /// Standalone payload must be exactly this many bytes: oversized
+    /// payloads are re-encoded at a reduced rate, undersized ones are
+    /// padded with zero bytes (which the SILK decoder never reads — its
+    /// range coding has no end-relative raw bits).
+    ExactBytes(usize),
+    /// Written symbols must fit this many bytes (plus a small headroom
+    /// for the hybrid redundancy-bit lookahead): oversized payloads are
+    /// re-encoded at a reduced rate, nothing is padded. Used by the
+    /// hybrid packet assembler, whose CELT layer continues on the same
+    /// range coder.
+    MaxBytes(usize),
+}
+
+/// Maximum CBR sizing re-encodes per payload (each attempt quarters the
+/// previous working rate; eight attempts reach ~10% of the original,
+/// below which the payload is near-silence and always fits).
+const CBR_MAX_ATTEMPTS: usize = 12;
+
+/// Full mutable-state snapshot of one channel, taken before a CBR
+/// sizing attempt and restored when the attempt must be retried at a
+/// lower rate (so every attempt starts from identical state and the
+/// final attempt's end state is exactly what the decoder will have).
+struct ChannelSnapshot {
+    synth: SynthesisState,
+    exc_q14: [i32; MAX_FRAME_LENGTH],
+    last_gain_index: i8,
+    prev_nlsf_q15: [i16; MAX_LPC_ORDER],
+    ec_prev: EcPrevState,
+    lag_prev: i32,
+    prev_signal_type: i8,
+    sum_log_gain_q7: i32,
+    first_frame_after_reset: bool,
+    indices: SideInfoIndices,
+    x_buf: Vec<f32>,
+    vad_flags: [bool; MAX_FRAMES_PER_PACKET],
+    last_xq: Vec<i16>,
+    /// The resampler retains the previous call's tail between calls, so
+    /// re-sampling the same chunk a second time (a CBR retry) starting
+    /// from the post-call state would corrupt the internal-rate signal.
+    resampler: Resampler,
+}
+
+impl ChannelState {
+    fn snapshot(&self) -> ChannelSnapshot {
+        ChannelSnapshot {
+            synth: self.synth,
+            exc_q14: self.exc_q14,
+            last_gain_index: self.last_gain_index,
+            prev_nlsf_q15: self.prev_nlsf_q15,
+            ec_prev: self.ec_prev,
+            lag_prev: self.lag_prev,
+            prev_signal_type: self.prev_signal_type,
+            sum_log_gain_q7: self.sum_log_gain_q7,
+            first_frame_after_reset: self.first_frame_after_reset,
+            indices: self.indices,
+            x_buf: self.x_buf.clone(),
+            vad_flags: self.vad_flags,
+            last_xq: self.last_xq.clone(),
+            resampler: self.resampler.clone(),
+        }
+    }
+
+    fn restore(&mut self, s: &ChannelSnapshot) {
+        self.synth = s.synth;
+        self.exc_q14 = s.exc_q14;
+        self.last_gain_index = s.last_gain_index;
+        self.prev_nlsf_q15 = s.prev_nlsf_q15;
+        self.ec_prev = s.ec_prev;
+        self.lag_prev = s.lag_prev;
+        self.prev_signal_type = s.prev_signal_type;
+        self.sum_log_gain_q7 = s.sum_log_gain_q7;
+        self.first_frame_after_reset = s.first_frame_after_reset;
+        self.indices = s.indices;
+        self.x_buf = s.x_buf.clone();
+        self.vad_flags = s.vad_flags;
+        self.last_xq = s.last_xq.clone();
+        self.resampler = s.resampler.clone();
+    }
+}
+
+/// Full mutable-state snapshot of the encoder (see [`ChannelSnapshot`]).
+struct EncoderSnapshot {
+    ch: [ChannelSnapshot; 2],
+    stereo: StereoEncState,
+    prev_decode_only_middle: bool,
     frame_counter: u32,
 }
 
 impl SilkEncoder {
     /// Creates an encoder for mono input at `api_sample_rate` Hz (one of
     /// 8/12/16/24/48 kHz) coded at `internal_sample_rate` Hz (8/12/16 kHz)
-    /// with 10 or 20 ms frames.
+    /// with 10/20/40/60 ms packets. A 10 ms packet carries one 10 ms SILK
+    /// frame; a 20/40/60 ms packet carries one/two/three 20 ms SILK frames
+    /// (later frames of multi-frame packets conditionally coded).
     pub fn new(
         api_sample_rate: i32,
         internal_sample_rate: i32,
-        frame_size_ms: i32,
+        packet_size_ms: i32,
+    ) -> Result<Self> {
+        Self::new_impl(api_sample_rate, internal_sample_rate, packet_size_ms, 1)
+    }
+
+    /// Stereo counterpart to [`Self::new`]: adaptive mid/side coding with
+    /// the per-frame quantized MS predictor and mid-only side skipping of
+    /// the reference. `input` to [`Self::encode_frame_into`] is
+    /// interleaved left/right; the payload carries the stereo TOC bit.
+    pub fn new_stereo(
+        api_sample_rate: i32,
+        internal_sample_rate: i32,
+        packet_size_ms: i32,
+    ) -> Result<Self> {
+        Self::new_impl(api_sample_rate, internal_sample_rate, packet_size_ms, 2)
+    }
+
+    fn new_impl(
+        api_sample_rate: i32,
+        internal_sample_rate: i32,
+        packet_size_ms: i32,
+        channels_internal: usize,
     ) -> Result<Self> {
         crate::debug::init();
         let fs_khz = match internal_sample_rate {
@@ -203,14 +484,21 @@ impl SilkEncoder {
                 )))
             }
         };
-        let nb_subfr = match frame_size_ms {
-            10 => MAX_NB_SUBFR / 2,
-            20 => MAX_NB_SUBFR,
+        let (frame_ms, packet_frames) = match packet_size_ms {
+            10 => (10i32, 1usize),
+            20 => (20, 1),
+            40 => (20, 2),
+            60 => (20, 3),
             _ => {
                 return Err(CadenceError::UnsupportedFeature(format!(
-                    "unsupported SILK frame size {frame_size_ms} ms"
+                    "unsupported SILK packet size {packet_size_ms} ms"
                 )))
             }
+        };
+        let nb_subfr = if frame_ms == 10 {
+            MAX_NB_SUBFR / 2
+        } else {
+            MAX_NB_SUBFR
         };
         if !(8000..=48000).contains(&api_sample_rate) || api_sample_rate % 1000 != 0 {
             return Err(CadenceError::UnsupportedFeature(format!(
@@ -224,113 +512,515 @@ impl SilkEncoder {
         let predict_lpc_order = if fs_khz == 16 { 16 } else { 10 };
         let pitch_lpc_order = 6.min(predict_lpc_order);
 
-        let resampler = Resampler::new(api_sample_rate, internal_sample_rate, true)?;
-
-        Ok(SilkEncoder {
+        let geom = (
             fs_khz,
-            api_sample_rate,
             nb_subfr,
             frame_length,
             subfr_length,
             ltp_mem_length,
             predict_lpc_order,
             pitch_lpc_order,
+        );
+        let ch0 = ChannelState::new(geom, api_sample_rate, internal_sample_rate)?;
+        let ch1 = if channels_internal == 2 {
+            ChannelState::new(geom, api_sample_rate, internal_sample_rate)?
+        } else {
+            ChannelState::placeholder()
+        };
+
+        Ok(SilkEncoder {
+            api_sample_rate,
             nlsf_cb: if fs_khz == 16 {
                 &NLSF_CB_WB
             } else {
                 &NLSF_CB_NB_MB
             },
-            frame: FrameInfo::new(fs_khz, nb_subfr),
-            snr_db_q7: 0,
-            synth: SynthesisState::default(),
-            exc_q14: [0; MAX_FRAME_LENGTH],
-            last_xq: Vec::new(),
-            last_gain_index: 0,
-            prev_nlsf_q15: [0; MAX_LPC_ORDER],
-            ec_prev: EcPrevState::default(),
-            lag_prev: 0,
-            prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
-            sum_log_gain_q7: 0,
-            first_frame_after_reset: true,
-            resampler,
-            x_buf: vec![0.0; ltp_mem_length + frame_length],
-            vad_flags: [false; MAX_FRAMES_PER_PACKET],
+            packet_frames,
+            frame_ms,
+            packet_ms: frame_ms * packet_frames as i32,
+            channels_internal,
+            ch: [ch0, ch1],
+            stereo: StereoEncState::default(),
+            prev_decode_only_middle: false,
+            target_rate_bps: 0,
+            cbr: None,
+            mid_only: [false; MAX_FRAMES_PER_PACKET],
+            pred_ix: [StereoPredIx::default(); MAX_FRAMES_PER_PACKET],
             frame_counter: 0,
         })
     }
 
-    /// `silk_control_SNR`: sets the rate target. `target_rate_bps` is the
-    /// total mono bitrate including the ~25 kbps... (the caller passes the
-    /// SILK-mode target directly; packet overhead is not modeled).
+    /// Snapshot of all mutable encoder state (CBR sizing retries).
+    fn snapshot_state(&self) -> EncoderSnapshot {
+        EncoderSnapshot {
+            ch: [self.ch[0].snapshot(), self.ch[1].snapshot()],
+            stereo: self.stereo,
+            prev_decode_only_middle: self.prev_decode_only_middle,
+            frame_counter: self.frame_counter,
+        }
+    }
+
+    fn restore_state(&mut self, s: &EncoderSnapshot) {
+        self.ch[0].restore(&s.ch[0]);
+        self.ch[1].restore(&s.ch[1]);
+        self.stereo = s.stereo;
+        self.prev_decode_only_middle = s.prev_decode_only_middle;
+        self.frame_counter = s.frame_counter;
+    }
+
+    /// `silk_control_SNR`: sets the rate target (per internal channel).
+    /// `target_rate_bps` is the per-mono-channel SILK-mode target;
+    /// packet overhead is not modeled. With CBR sizing enabled this is
+    /// also the *starting* rate the sizing loop reduces from.
     pub fn set_bitrate(&mut self, target_rate_bps: i32) {
-        self.snr_db_q7 = control_snr(self.fs_khz, self.nb_subfr, target_rate_bps.max(0));
+        self.target_rate_bps = target_rate_bps;
+        self.set_working_rate(target_rate_bps);
+    }
+
+    /// Applies a working rate without touching the caller's target (the
+    /// CBR retry loop reduces this until the payload fits).
+    fn set_working_rate(&mut self, rate_bps: i32) {
+        for ch in self.ch.iter_mut().take(self.channels_internal) {
+            ch.snr_db_q7 = control_snr(ch.fs_khz, ch.nb_subfr, rate_bps.max(0));
+        }
+    }
+
+    /// Enables CBR sizing: [`Self::encode_frame`] returns payloads of
+    /// exactly `bytes` bytes. Oversized payloads are re-encoded at a
+    /// progressively reduced rate (up to [`CBR_MAX_ATTEMPTS`] attempts;
+    /// an error is returned if even the quietest encoding does not fit);
+    /// undersized payloads are padded with zero bytes, which the SILK
+    /// decoder never reads (its range coding has no end-relative raw
+    /// bits), so padding is lossless.
+    pub fn set_cbr_bytes(&mut self, bytes: usize) -> Result<()> {
+        if bytes < 8 {
+            return Err(CadenceError::InvalidFormat(format!(
+                "SILK CBR payload size {bytes} bytes is below the 8-byte minimum"
+            )));
+        }
+        self.cbr = Some(CbrMode::ExactBytes(bytes));
+        Ok(())
+    }
+
+    /// Hybrid-mode variant: the written symbols must fit `bytes` bytes
+    /// of the shared range coder (with headroom for the hybrid
+    /// redundancy-bit lookahead); oversized payloads are re-encoded at a
+    /// progressively reduced rate, and nothing is padded (the CELT layer
+    /// continues on the same coder).
+    pub fn set_max_payload_bytes(&mut self, bytes: usize) {
+        self.cbr = Some(CbrMode::MaxBytes(bytes));
     }
 
     /// Current SNR target in dB·128 (exposed for tests).
     pub fn snr_db_q7(&self) -> i32 {
-        self.snr_db_q7
+        self.ch[0].snr_db_q7
     }
 
-    /// The number of API-rate samples one frame consumes.
+    /// The number of API-rate samples one *SILK frame* consumes per
+    /// channel.
     pub fn frame_length_api(&self) -> usize {
-        self.frame_length * self.api_sample_rate as usize / (self.fs_khz as usize * 1000)
+        self.ch[0].frame_length * self.api_sample_rate as usize
+            / (self.ch[0].fs_khz as usize * 1000)
+    }
+
+    /// The number of API-rate samples one payload (packet) consumes per
+    /// channel — [`Self::frame_length_api`] × [`Self::frames_per_packet`].
+    /// [`Self::encode_frame_into`] takes interleaved samples across all
+    /// internal channels (× 1 mono, × 2 stereo).
+    pub fn packet_length_api(&self) -> usize {
+        self.frame_length_api() * self.packet_frames
+    }
+
+    /// SILK frames per payload (1, 2, or 3).
+    pub fn frames_per_packet(&self) -> usize {
+        self.packet_frames
+    }
+
+    /// Payload duration in ms (10/20/40/60).
+    pub fn packet_ms(&self) -> i32 {
+        self.packet_ms
+    }
+
+    /// Internal channel count (1 mono, 2 mid/side).
+    pub fn channels_internal(&self) -> usize {
+        self.channels_internal
     }
 
     /// The decoder-exact reconstruction of the most recently encoded
-    /// frame (the output a conforming decoder produces from the last
-    /// payload, at the internal sample rate). Because the closed-loop NSQ
-    /// runs on the decoder's own arithmetic, this is bit-identical to the
-    /// decoder's output — the property the round-trip tests pin.
+    /// payload (the output a conforming decoder produces from the last
+    /// payload, at the internal sample rate, concatenated across the
+    /// packet's SILK frames — and, for stereo, the mid channel followed
+    /// by the coded side frames). Because the closed-loop NSQ runs on the
+    /// decoder's own arithmetic, this is bit-identical to the decoder's
+    /// output — the property the round-trip tests pin.
     pub fn last_reconstructed_frame(&self) -> &[i16] {
-        &self.last_xq
+        &self.ch[0].last_xq
     }
 
-    /// Encodes one frame; `input` must be [`Self::frame_length_api`]
+    /// The side channel's reconstruction (stereo only; empty when the
+    /// last packet's side frames were all skipped).
+    pub fn last_reconstructed_side(&self) -> &[i16] {
+        &self.ch[1].last_xq
+    }
+
+    /// Encodes one payload; `input` must be [`Self::packet_length_api`]
     /// interleaved... (mono) API-rate samples. Returns the SILK payload
-    /// bytes (one frame, VBR).
+    /// bytes (one range-coded packet covering [`Self::frames_per_packet`]
+    /// SILK frames, VBR), ready to drop into a single-frame code-0 Opus
+    /// packet for the matching TOC config.
     pub fn encode_frame(&mut self, input: &[i16]) -> Result<Vec<u8>> {
-        let api_len = self.frame_length_api();
+        let mut enc = crate::range::RangeEncoder::new();
+        self.encode_frame_into(input, &mut enc)?;
+        let mut payload = enc.done();
+        if let Some(CbrMode::ExactBytes(n)) = self.cbr {
+            payload.resize(n, 0);
+        }
+        Ok(payload)
+    }
+
+    /// Writes the same symbols onto a caller-provided range encoder (so a
+    /// CELT layer can continue on the same coder, as hybrid packets
+    /// require) without finalizing — the caller serializes the combined
+    /// payload. `input` holds interleaved API-rate samples covering
+    /// [`Self::packet_length_api`] samples per internal channel (× 2 for
+    /// stereo). The payload is one range-coded packet covering
+    /// [`Self::frames_per_packet`] SILK frames, ready to drop into a
+    /// single-frame code-0 Opus packet for the matching TOC config.
+    pub fn encode_frame_into(
+        &mut self,
+        input: &[i16],
+        enc: &mut crate::range::RangeEncoder,
+    ) -> Result<()> {
+        let channels = self.channels_internal;
+        let api_len = self.packet_length_api() * channels;
         if input.len() != api_len {
             return Err(CadenceError::CorruptData(format!(
-                "expected {api_len} input samples, got {}",
+                "expected {api_len} interleaved input samples, got {}",
                 input.len()
             )));
         }
+        let frame_len_api = self.frame_length_api();
+        let frame_length = self.ch[0].frame_length;
+        let stereo = channels == 2;
 
-        /* Resample to the internal rate */
-        let mut x_int = vec![0i16; self.frame_length];
-        self.resampler.resample(&mut x_int, input)?;
+        /* CBR sizing loop: encode, then (only when a sizing mode is
+         * active) check the fit — an oversized payload restores the
+         * pre-attempt snapshot, resets the encoder, and re-encodes at a
+         * reduced working rate. Without a sizing mode the single pass
+         * below runs exactly once, as before. */
+        let mut working_rate = self.target_rate_bps;
+        let mut attempts = 0;
+        loop {
+            let snap = self.snapshot_state();
 
-        /* Slide the history window and append the frame */
-        let total = self.ltp_mem_length + self.frame_length;
-        self.x_buf.copy_within(self.frame_length..total, 0);
-        {
-            let tail = &mut self.x_buf[self.ltp_mem_length..total];
-            for (dst, &src) in tail.iter_mut().zip(x_int.iter()) {
-                *dst = src as f32;
+            /*--------------------------------------------------------*/
+            /* Pass A: per-frame analysis, quantization, closed-loop  */
+            /* NSQ (in order — the simulation state carries across    */
+            /* frames and channels), buffering each frame's indices   */
+            /* and pulses.                                            */
+            /*--------------------------------------------------------*/
+            let mut plans = [Vec::new(), Vec::new()];
+            for ch in self.ch.iter_mut().take(channels) {
+                ch.vad_flags = [false; MAX_FRAMES_PER_PACKET];
+                ch.last_xq.clear();
             }
+            self.mid_only = [false; MAX_FRAMES_PER_PACKET];
+            let mut mid_buf = [0i16; MAX_FRAME_LENGTH + 2];
+            let mut side_buf = [0i16; MAX_FRAME_LENGTH + 2];
+            // Mirrors the decoder's persistent `prev_decode_only_middle`,
+            // updated once per frame. The pre-packet value is needed again
+            // during serialization (frame 0's side cond coding).
+            let mut prev_mid_only = self.prev_decode_only_middle;
+            let prev_mid_only_at_start = self.prev_decode_only_middle;
+            for i in 0..self.packet_frames {
+                let frame =
+                    &input[i * frame_len_api * channels..(i + 1) * frame_len_api * channels];
+
+                /* Resample each channel to the internal rate */
+                let mut l_int = vec![0i16; frame_length];
+                let deinterleave = |ch: usize| -> Vec<i16> {
+                    frame[ch..].iter().step_by(channels).copied().collect()
+                };
+                self.ch[0]
+                    .resampler
+                    .resample(&mut l_int, &deinterleave(0))?;
+                let mut r_int = Vec::new();
+                if stereo {
+                    r_int = vec![0i16; frame_length];
+                    self.ch[1]
+                        .resampler
+                        .resample(&mut r_int, &deinterleave(1))?;
+                }
+
+                /* Stereo: convert Left/Right to adaptive Mid/Side with the
+                 * quantized predictor, and decide the mid-only flag for this
+                 * frame (the side is skipped when its residual is inactive —
+                 * which is also exactly when the decoder reads the flag). */
+                if stereo {
+                    mid_buf[..2].copy_from_slice(&self.stereo.s_mid);
+                    side_buf[..2].copy_from_slice(&self.stereo.s_side);
+                    let (ix, _pred_q13, mid_e, side_e) = lr_to_ms(
+                        &mut self.stereo,
+                        &l_int,
+                        &r_int,
+                        &mut mid_buf,
+                        &mut side_buf,
+                        self.ch[0].fs_khz,
+                        frame_length,
+                    );
+                    self.pred_ix[i] = ix;
+                    self.mid_only[i] = (side_e.sqrt() as f32) < INACTIVE_RMS_THRESHOLD;
+                    let _ = mid_e;
+                }
+                let mid_only_i = stereo && self.mid_only[i];
+                self.ch[1].vad_flags[i] = !mid_only_i;
+
+                /* Mid channel: slide the history window, append the frame. */
+                {
+                    let ch = &mut self.ch[0];
+                    let total = ch.ltp_mem_length + ch.frame_length;
+                    ch.x_buf.copy_within(ch.frame_length..total, 0);
+                    let tail = &mut ch.x_buf[ch.ltp_mem_length..total];
+                    for (dst, &src) in tail.iter_mut().zip(l_int.iter()) {
+                        *dst = src as f32;
+                    }
+                    let seed = (self.frame_counter & 3) as i8;
+                    self.frame_counter += 1;
+                    let plan = ch.analyze_and_quantize_frame(&l_int, i, i > 0, seed);
+                    plans[0].push(plan);
+                }
+
+                /* Side channel (skipped entirely on mid-only frames — the
+                 * decoder mirrors this by zeroing the side and leaving its
+                 * state untouched) */
+                if stereo && !mid_only_i {
+                    if prev_mid_only {
+                        self.ch[1].reset_after_mid_only();
+                    }
+                    let conditional_side = !(i == 0 || i == 1 || prev_mid_only);
+                    {
+                        let ch = &mut self.ch[1];
+                        let total = ch.ltp_mem_length + ch.frame_length;
+                        ch.x_buf.copy_within(ch.frame_length..total, 0);
+                        let tail = &mut ch.x_buf[ch.ltp_mem_length..total];
+                        for (dst, &src) in tail.iter_mut().zip(side_buf[2..frame_length + 2].iter())
+                        {
+                            *dst = src as f32;
+                        }
+                        let seed = (self.frame_counter & 3) as i8;
+                        self.frame_counter += 1;
+                        let plan = ch.analyze_and_quantize_frame(
+                            &side_buf[2..frame_length + 2],
+                            i,
+                            conditional_side,
+                            seed,
+                        );
+                        plans[1].push(plan);
+                    }
+                }
+                prev_mid_only = mid_only_i;
+            }
+            self.prev_decode_only_middle = prev_mid_only;
+
+            /*--------------------------------------------------------*/
+            /* Pass B: serialize the whole payload — per-channel      */
+            /* VAD/LBRR prologues once, then per frame the MS         */
+            /* predictor indices, the mid-only flag (present exactly  */
+            /* when the side VAD flag makes the decoder read it), and */
+            /* each coded channel's side info + excitation — exactly  */
+            /* as the decoder reads it.                               */
+            /*--------------------------------------------------------*/
+            encode_vad_flags_and_lbrr_flag(enc, &self.ch[0].vad_flags, self.packet_frames, false);
+            if stereo {
+                encode_vad_flags_and_lbrr_flag(
+                    enc,
+                    &self.ch[1].vad_flags,
+                    self.packet_frames,
+                    false,
+                );
+            }
+            let mut side_plan_iter = plans[1].iter();
+            for (i, plan0) in plans[0].iter().enumerate() {
+                if stereo {
+                    encode_stereo_pred(enc, &self.pred_ix[i]);
+                    if self.mid_only[i] {
+                        encode_mid_only_flag(enc, true);
+                    }
+                }
+
+                /* Mid channel: decoder cond rule with frame_index = i. */
+                {
+                    let cond_coding = if i == 0 {
+                        CondCoding::Independently
+                    } else {
+                        CondCoding::Conditionally
+                    };
+                    let delta_possible = cond_coding == CondCoding::Conditionally
+                        && self.ch[0].ec_prev.ec_prev_signal_type == TYPE_VOICED;
+                    let params = FrameParams {
+                        nlsf_cb: self.nlsf_cb,
+                        fs_khz: self.ch[0].fs_khz,
+                        nb_subfr: self.ch[0].nb_subfr,
+                        frame_index: i,
+                        vad_flag: plan0.vad_flag,
+                        decode_lbrr: false,
+                        cond_coding,
+                    };
+                    encode_indices(
+                        enc,
+                        &plan0.indices,
+                        &mut self.ch[0].ec_prev,
+                        &params,
+                        delta_possible,
+                    );
+                    encode_pulses(
+                        enc,
+                        plan0.indices.signal_type as i32,
+                        plan0.indices.quant_offset_type as i32,
+                        &plan0.pulses,
+                        self.ch[0].frame_length,
+                    );
+                }
+
+                /* Side channel: the decoder's frame index for channel 1 is
+                 * offset by one (n_frames_decoded - n with n == 1), so frames
+                 * 0 and 1 are independent; a frame following a skipped one
+                 * drops the LTP scale (NO_LTP_SCALING). */
+                if stereo && !self.mid_only[i] {
+                    let plan1 = side_plan_iter.next().expect("side plan for coded frame");
+                    let prev_skipped = if i > 0 {
+                        self.mid_only[i - 1]
+                    } else {
+                        prev_mid_only_at_start
+                    };
+                    let cond_coding = if i == 0 || i == 1 {
+                        CondCoding::Independently
+                    } else if prev_skipped {
+                        CondCoding::IndependentlyNoLtpScaling
+                    } else {
+                        CondCoding::Conditionally
+                    };
+                    let delta_possible = cond_coding == CondCoding::Conditionally
+                        && self.ch[1].ec_prev.ec_prev_signal_type == TYPE_VOICED;
+                    let params = FrameParams {
+                        nlsf_cb: self.nlsf_cb,
+                        fs_khz: self.ch[1].fs_khz,
+                        nb_subfr: self.ch[1].nb_subfr,
+                        frame_index: i,
+                        vad_flag: plan1.vad_flag,
+                        decode_lbrr: false,
+                        cond_coding,
+                    };
+                    encode_indices(
+                        enc,
+                        &plan1.indices,
+                        &mut self.ch[1].ec_prev,
+                        &params,
+                        delta_possible,
+                    );
+                    encode_pulses(
+                        enc,
+                        plan1.indices.signal_type as i32,
+                        plan1.indices.quant_offset_type as i32,
+                        &plan1.pulses,
+                        self.ch[1].frame_length,
+                    );
+                }
+            }
+            let fits = match self.cbr {
+                None => true,
+                Some(CbrMode::ExactBytes(n)) => enc.clone().done().len() <= n,
+                Some(CbrMode::MaxBytes(n)) => i64::from(enc.tell()) + 37 <= (8 * n) as i64,
+            };
+            if fits {
+                return Ok(());
+            }
+            attempts += 1;
+            if attempts > CBR_MAX_ATTEMPTS {
+                match self.cbr {
+                    // Exact-size payloads have no fallback: the caller
+                    // asked for a constant size and the minimum-rate
+                    // encoding still does not fit, which is a hard
+                    // (content-dependent) failure.
+                    Some(CbrMode::ExactBytes(n)) => {
+                        return Err(CadenceError::InvalidFormat(format!(
+                            "SILK CBR sizing: payload does not fit {n} bytes even at the minimum rate"
+                        )));
+                    }
+                    // Best-effort mode: keep the last attempt (the rate
+                    // was reduced as far as the attempts allow) and let
+                    // the caller's own hard backstop — for the hybrid,
+                    // the redundancy-lookahead guard — have the final
+                    // word. The foundation's quantizer has a
+                    // content-dependent minimum payload (measured ~45 B
+                    // for active speech at 16 kHz internal) that no rate
+                    // reduction can go below.
+                    Some(CbrMode::MaxBytes(_)) | None => return Ok(()),
+                }
+            }
+            // Restore the pre-attempt state so the retry encodes from
+            // identical conditions, start the shared/payload coder over,
+            // and step the working rate proportionally to the measured
+            // overshoot (a fixed multiplicative cut degrades quality far
+            // more than needed when the payload is only slightly over).
+            let actual_bytes = match self.cbr {
+                Some(CbrMode::ExactBytes(_)) => enc.clone().done().len().max(1) as f64,
+                // MaxBytes works in bits with a 37-bit headroom; convert
+                // to the equivalent byte count.
+                Some(CbrMode::MaxBytes(n)) => (((i64::from(enc.tell()) + 37) as f64) / 8.0)
+                    .max(1.0)
+                    .min(n as f64),
+                None => 1.0,
+            };
+            let target_bytes = match self.cbr {
+                Some(CbrMode::ExactBytes(n)) | Some(CbrMode::MaxBytes(n)) => n as f64,
+                None => 1.0,
+            };
+            self.restore_state(&snap);
+            *enc = crate::range::RangeEncoder::new();
+            let ratio = (target_bytes / actual_bytes).clamp(0.25, 1.0);
+            let reduced = ((working_rate as f64 * ratio) as i32).max(1);
+            working_rate = reduced.min(working_rate.saturating_sub(1)).max(1);
+            self.set_working_rate(working_rate);
         }
+    }
+}
 
-        let seed = (self.frame_counter & 3) as i8;
-        self.frame_counter += 1;
-
+/// The per-frame analysis chain: every step below reads only the
+/// channel's own geometry, buffers, and decoder-mirror state.
+impl ChannelState {
+    /// The per-frame analysis chain: runs the full
+    /// `encode_frame_FLP`-shaped pipeline on the current `x_buf`
+    /// contents, advances every piece of decoder-mirror state, and
+    /// returns the frame's serializable parameters. `frame_index` is the
+    /// frame's position within its packet (0-based); `conditional_gains`
+    /// selects delta coding for subframe 0's gain (the caller derives it
+    /// from the decoder's per-channel conditional-coding rule); `seed`
+    /// is the frame's deterministic excitation dither seed.
+    fn analyze_and_quantize_frame(
+        &mut self,
+        x_int: &[i16],
+        frame_index: usize,
+        conditional_gains: bool,
+        seed: i8,
+    ) -> FramePlan {
         /*--------------------------------------------------------*/
-        /* Side-info skeleton (type, VAD flag, seed)              */
+        /* Side-info skeleton (type, VAD flag, seed). `indices`   */
+        /* starts from the persistent mirror so uncoded fields    */
+        /* carry over as they do on the decode side.              */
         /*--------------------------------------------------------*/
+        let total = self.ltp_mem_length + self.frame_length;
         let frame_rms = (energy(&self.x_buf[self.ltp_mem_length..total]) / self.frame_length as f64)
             .sqrt() as f32;
-        let mut indices = SideInfoIndices {
-            seed,
-            ..SideInfoIndices::default()
-        };
+        let mut indices = self.indices;
+        indices.seed = seed;
         indices.signal_type = if frame_rms < INACTIVE_RMS_THRESHOLD {
             TYPE_NO_VOICE_ACTIVITY
         } else {
             TYPE_UNVOICED
         };
         let vad_flag = indices.signal_type != TYPE_NO_VOICE_ACTIVITY;
-        self.vad_flags = [false; MAX_FRAMES_PER_PACKET];
-        self.vad_flags[0] = vad_flag;
+        self.vad_flags[frame_index] = vad_flag;
 
         /*--------------------------------------------------------*/
         /* Pitch analysis (find_pitch_lags shape)                 */
@@ -403,21 +1093,30 @@ impl SilkEncoder {
             indices.ltp_index = ltp.cbk_index;
             indices.per_index = ltp.periodicity_index;
             /* LTP scale control with 0% packet loss and LBRR off: the
-             * reference's comparisons are both false -> index 0. */
+             * reference's comparisons are both false -> index 0. The
+             * symbol is only *coded* for independently coded frames;
+             * conditionally coded frames keep the previous frame's index
+             * (persistent `indices`), exactly like the decoder. */
             indices.ltp_scale_index = 0;
             ltpred_cod_gain_db = ltp.pred_gain_d_b_q7 as f32 * (1.0 / 128.0);
         } else {
             ctrl.ltp_coef_q14[..5 * self.nb_subfr].fill(0);
+            ctrl.ltp_scale_q14 = 0;
             self.sum_log_gain_q7 = 0;
         }
-        ctrl.ltp_scale_q14 =
-            crate::silk::tables::LTPSCALES_TABLE_Q14[indices.ltp_scale_index as usize];
+        if indices.signal_type == TYPE_VOICED {
+            ctrl.ltp_scale_q14 =
+                crate::silk::tables::LTPSCALES_TABLE_Q14[indices.ltp_scale_index as usize];
+        }
 
         /* Weighted LPC analysis on the (LTP-)residual */
         let (nlsf_q15, lpc_in_pre) =
             self.lpc_analysis_to_nlsf(&pitch_l, &ctrl.ltp_coef_q14, &gains, indices.signal_type);
 
-        /* NLSF quantization + conversion to the decoder's Q12 filters */
+        /* NLSF quantization + conversion to the decoder's Q12 filters.
+         * The interpolation factor is 4 (no interpolation) for every
+         * frame - legal for both coding modes (20 ms frames transmit the
+         * symbol either way; 10 ms frames force it decoder-side). */
         let mut weights = [0i16; MAX_LPC_ORDER];
         nlsf_vq_weights_laroia(&mut weights, &nlsf_q15);
         let mut nlsf_mu_q20: i32 = 3146; // SILK_FIX_CONST(0.003, 20), speech activity 0
@@ -429,7 +1128,7 @@ impl SilkEncoder {
         nlsf_encode(
             &mut nlsf_indices,
             &mut quantized,
-            self.nlsf_cb,
+            crate::silk::encoder::nlsf_cb_for(self.fs_khz),
             &weights,
             nlsf_mu_q20,
             16,
@@ -471,11 +1170,14 @@ impl SilkEncoder {
         for k in 0..self.nb_subfr {
             gains_q16[k] = (gains[k] * 65536.0) as i32;
         }
+        /* Frames 1.. of a multi-frame packet are conditionally coded:
+         * subframe 0's gain is quantized as a delta against the persistent
+         * `LastGainIndex`, mirroring the decoder's `gains_dequant`. */
         gains_quant(
             &mut indices.gains_indices,
             &mut gains_q16,
             &mut self.last_gain_index,
-            false,
+            conditional_gains,
             self.nb_subfr,
         );
         ctrl.gains_q16 = gains_q16;
@@ -493,7 +1195,7 @@ impl SilkEncoder {
             &mut self.exc_q14,
             &mut pulses,
             &mut xq,
-            &x_int,
+            x_int,
             &ctrl,
             &indices,
             &self.frame,
@@ -503,41 +1205,19 @@ impl SilkEncoder {
         );
         self.synth
             .update_out_buf(&xq[..self.frame_length], self.ltp_mem_length);
-        self.last_xq = xq[..self.frame_length].to_vec();
+        self.last_xq.extend_from_slice(&xq[..self.frame_length]);
         self.lag_prev = ctrl.pitch_l[self.nb_subfr - 1];
         self.prev_signal_type = indices.signal_type;
         self.first_frame_after_reset = false;
+        self.indices = indices;
 
-        /*--------------------------------------------------------*/
-        /* Bitstream                                              */
-        /*--------------------------------------------------------*/
-        let mut enc = crate::range::RangeEncoder::new();
-        encode_vad_flags_and_lbrr_flag(&mut enc, &self.vad_flags, 1, false);
-        let params = FrameParams {
-            nlsf_cb: self.nlsf_cb,
-            fs_khz: self.fs_khz,
-            nb_subfr: self.nb_subfr,
-            frame_index: 0,
+        FramePlan {
+            indices,
+            pulses,
             vad_flag,
-            decode_lbrr: false,
-            cond_coding: CondCoding::Independently,
-        };
-        encode_indices(&mut enc, &indices, &mut self.ec_prev, &params, false);
-        encode_pulses(
-            &mut enc,
-            indices.signal_type as i32,
-            indices.quant_offset_type as i32,
-            &pulses,
-            self.frame_length,
-        );
-        Ok(enc.done())
+        }
     }
-}
 
-/* ---- analysis helpers (impl block split for readability) ---- */
-
-/// Fields set by [`SilkEncoder::pitch_search`].
-impl SilkEncoder {
     /// The pitch-LPC residual over the whole buffered window (history +
     /// frame), foundation shape of `silk_find_pitch_lags_FLP`'s
     /// sine-windowed order-6 analysis.
@@ -826,6 +1506,16 @@ impl SilkEncoder {
         }
         nrgs
     }
+}
+
+/// The serializable result of one analyzed SILK frame — the side-info
+/// indices plus the quantized excitation pulses, buffered by pass A of
+/// [`SilkEncoder::encode_frame`] so the whole payload can be serialized
+/// in order in pass B.
+struct FramePlan {
+    indices: SideInfoIndices,
+    pulses: [i16; MAX_FRAME_LENGTH],
+    vad_flag: bool,
 }
 
 /// `silk_sigmoid` (`silk/SigProc_FIX.h` approximation is fixed-point; the

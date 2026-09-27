@@ -36,6 +36,7 @@ CRATES = [
     ("tpt-av-cadence-aiff", [], "AIFF (bit-exact, no SNR — pass/fail only)"),
     ("tpt-av-cadence-flac", [], "FLAC (bit-exact via embedded MD5 — pass/fail only)"),
     ("tpt-av-cadence-mp3", ["--test", "conformance"], "MP3 (FFmpeg-oracle SNR, needs FFmpeg on PATH)"),
+    ("tpt-av-cadence-mp3", ["--test", "ffmpeg_oracle_matrix"], "MP3 generated LAME matrix (FFmpeg oracle; needs FFmpeg+libmp3lame)"),
     ("tpt-av-cadence-aac", ["--test", "conformance"], "AAC-LC / HE-AAC (FFmpeg-oracle SNR)"),
     ("tpt-av-cadence-vorbis", ["--test", "conformance"], "Ogg Vorbis I (FFmpeg-oracle SNR)"),
 ]

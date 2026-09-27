@@ -23,12 +23,16 @@
 //!   `decode_celt_only_packet`/`decode_silk_only_packet` entry points
 //!   remain for single-mode use; cross-mode state continuity needs
 //!   `OpusDecoder`.)
-//! - SILK encoder foundation ([`silk::encoder::SilkEncoder`], re-exported
-//!   at the crate root): mono 10/20 ms frames at 8/12/16 kHz internal rate
+//! - SILK encoder ([`silk::encoder::SilkEncoder`], re-exported at the
+//!   crate root): mono, 8/12/16 kHz internal rate, 10/20/40/60 ms packets
 //!   into VBR SILK payloads, with exact reference bitstream ports
 //!   ([`silk::encode_indices`], [`silk::encode_pulses`], gains/NLSF/LTP
 //!   quantizers) and a closed-loop forward NSQ
-//!   ([`silk::nsq`]) whose simulation is bit-identical to the decoder.
+//!   ([`silk::nsq`]) whose simulation is bit-identical to the decoder;
+//!   multi-frame packets use the reference's intra-packet conditional
+//!   coding. [`ogg_opus_encoder::OggOpusEncoder::new_silk`] writes these
+//!   payloads as real SILK-mode `.opus` streams (TOC configs 0–11,
+//!   measured per-rate pre-skip).
 //! - [`ogg_opus`]: the Ogg Opus (RFC 7845) container — `OpusHead`/
 //!   `OpusTags` parsing, pre-skip/end-trim granule bookkeeping, output
 //!   gain, and `OggOpusDecoder`/`OggOpusReader` implementing the core
