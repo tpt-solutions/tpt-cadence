@@ -1703,9 +1703,9 @@ Verification: full workspace `cargo test --workspace` (every crate, 0 failed), `
 
 - [x] WAV/AIFF/PCM writers (near-trivial, no compression, zero patent surface) — see "WAV/AIFF/PCM writers (2026-09-22)" below
 - [x] FLAC encoder (royalty-free by design, well-specified reference encoder to port/adapt) — see "FLAC encoder (2026-09-22)" below
-- [ ] Vorbis encoder (royalty-free by design, higher effort — psychoacoustic model)
+**The delayed-decision NSQ (`silk_NSQ_del_dec`) is now landed and wired behind `set_complexity(u8)` (2026-09-29, session log at the end of this file)**: exact port of `NSQ_del_dec.c` (1-4 pruning paths, 40-sample decision delay, per-path warping feedback, the subframe-2 tree reset), validated by a 64-configuration differential against `decode_core` and bit-exact complexity-10 round trips (including CBR); complexity 1 (the default) keeps the foundation quantizer byte-identical for the bit-cost reasons recorded in the 2026-09-28 session logs. Two port bugs were caught by the differential test (the scale-states subframe index; the subframe-2 copy's divergent rounding form, normalized to the decoder's). On the speech-like fixture, complexity 10 improves A-weighted SNR by 9-13 dB while shrinking the payload (the reference Lambda RDO + shaped error feedback). With this, every named Opus encoder refinement is landed; remaining scope: none. - [ ] Vorbis encoder (royalty-free by design, higher effort — psychoacoustic model)
 - [ ] AAC encoder — **REJECTED, will not be implemented (user decision, 2026-09-26)**: Fraunhofer/VIA-LA patent pool primarily targets encoders and the user has ruled the encoder out outright; do not plan or start any AAC encoding work
-- [ ] MP3 encoder — core patents expired worldwide by 2017 (broadly considered safe), but confirm before shipping if there's commercial distribution. **Partial progress (2026-09-24):** `tpt-av-cadence-mp3::Mp3Encoder` emits valid, spec-compliant, bit-reservoir-free CBR and is independently FFmpeg-decodable. The analysis polyphase fill, forward MDCT/antialias/change-sign chain, Huffman pair orientation, count1 handling, MPEG-1 stereo side-info order, and synthesis state are regression-tested. Active mono and independent-stereo end-to-end fidelity gates now pass within the reduced flat-gain/no-reservoir scope. **Major rework landed (2026-09-27, this session — see "MP3 encoder bit-allocation rework" below for the full session log):** full 32-book Huffman encode tables (verified bit-identical to FFmpeg's canonical assignment), count1 coding, three-region exhaustive book/region selection, per-band scalefactor machinery with bit-exact decoder parity, per-frame mid/side stereo (FFmpeg-verified at 113.8 dB on dual-mono noise), intra-frame budget pooling, and the ISO/LAME two-loop quantizer with psychoacoustic amplification ACTIVE (see the root-cause resolution below). The FFmpeg bitrate ladder (every MPEG-1 bitrate, mono+stereo, >=100 dB inter-decoder) PASSES, and the tonal-material defect is FIXED (120+ dB agreement). **Bit reservoir landed (2026-09-28):** full `main_data_begin` reach-back (up to 511 bytes banked, lent to the next frame's budget, lead-in patched at the tail-aligned reach-back position both FFmpeg and minimp3-style decoders read), regression-covered (`bit_reservoir_banks_quiet_frames_and_borrows_for_loud_ones`: byte-exact frame tiling, mdb engagement, decode of the borrowed-to tail). **The "universal scale defect" re-resolved (2026-09-28) as a REAL defect:** the 2026-09-27 "mis-calibration" conclusion was wrong — the encoder's analyzer ran at 32768× input on top of an analyzer↔synth kernel pair carrying 2^16, so every stream decoded 65536× too loud (full-scale clipping under FFmpeg); it survived every gate because all of them are correlation/SNR-based and amplitude-invariant, and the decade check that did assert amplitude was calibrated to the bug's output. Proven by: our decoder decodes a LAME reference with exact RMS parity (0.0839 vs 0.0841) while both decoders render our stream at ×65536; the analyzer now runs at 0.5× input for measured unity gain (1.000 across amplitudes), the psy ATH anchor is recalibrated, and the decade gate asserts decoded ≈ source peak. **MPEG-2/2.5 (LSF) encoding landed (2026-09-28, same session):** `Mp3Encoder` now writes all three version families — MPEG-2 at 16/22.05/24 kHz and MPEG-2.5 at 8/11.025/12 kHz (8-160 kbps) on top of the shared quantizer/Huffman/reservoir machinery: one 576-sample granule per frame, 9/17-byte side info (8-bit `main_data_begin` capping the reservoir at 255, no scfsi, preflag implied by `scalefac_compress >= 500` and kept off), and a 9-bit mixed-radix `scalefac_compress` search over `SCF_MOD`/`SCF_PARTITIONS` (mirroring the decoder's decomposition; all long-block partition groups transmit 21 values, band 21 uncoded, matching the MPEG-1 convention) with partitioned scalefactor emission. New FFmpeg oracle gate `lsf_encoder_agrees_with_ffmpeg`: nine rate/family/channel/bitrate configurations at 116-121 dB inter-decoder SNR with unity gain, passing first run. Remaining work: short blocks (block switching), psycho-loop quality tuning, VBR encode, intensity stereo.
+- [ ] MP3 encoder — core patents expired worldwide by 2017 (broadly considered safe), but confirm before shipping if there's commercial distribution. **Partial progress (2026-09-24):** `tpt-av-cadence-mp3::Mp3Encoder` emits valid, spec-compliant, bit-reservoir-free CBR and is independently FFmpeg-decodable. The analysis polyphase fill, forward MDCT/antialias/change-sign chain, Huffman pair orientation, count1 handling, MPEG-1 stereo side-info order, and synthesis state are regression-tested. Active mono and independent-stereo end-to-end fidelity gates now pass within the reduced flat-gain/no-reservoir scope. **Major rework landed (2026-09-27, this session — see "MP3 encoder bit-allocation rework" below for the full session log):** full 32-book Huffman encode tables (verified bit-identical to FFmpeg's canonical assignment), count1 coding, three-region exhaustive book/region selection, per-band scalefactor machinery with bit-exact decoder parity, per-frame mid/side stereo (FFmpeg-verified at 113.8 dB on dual-mono noise), intra-frame budget pooling, and the ISO/LAME two-loop quantizer with psychoacoustic amplification ACTIVE (see the root-cause resolution below). The FFmpeg bitrate ladder (every MPEG-1 bitrate, mono+stereo, >=100 dB inter-decoder) PASSES, and the tonal-material defect is FIXED (120+ dB agreement). **Bit reservoir landed (2026-09-28):** full `main_data_begin` reach-back (up to 511 bytes banked, lent to the next frame's budget, lead-in patched at the tail-aligned reach-back position both FFmpeg and minimp3-style decoders read), regression-covered (`bit_reservoir_banks_quiet_frames_and_borrows_for_loud_ones`: byte-exact frame tiling, mdb engagement, decode of the borrowed-to tail). **The "universal scale defect" re-resolved (2026-09-28) as a REAL defect:** the 2026-09-27 "mis-calibration" conclusion was wrong — the encoder's analyzer ran at 32768× input on top of an analyzer↔synth kernel pair carrying 2^16, so every stream decoded 65536× too loud (full-scale clipping under FFmpeg); it survived every gate because all of them are correlation/SNR-based and amplitude-invariant, and the decade check that did assert amplitude was calibrated to the bug's output. Proven by: our decoder decodes a LAME reference with exact RMS parity (0.0839 vs 0.0841) while both decoders render our stream at ×65536; the analyzer now runs at 0.5× input for measured unity gain (1.000 across amplitudes), the psy ATH anchor is recalibrated, and the decade gate asserts decoded ≈ source peak. **MPEG-2/2.5 (LSF) encoding landed (2026-09-28, same session):** `Mp3Encoder` now writes all three version families — MPEG-2 at 16/22.05/24 kHz and MPEG-2.5 at 8/11.025/12 kHz (8-160 kbps) on top of the shared quantizer/Huffman/reservoir machinery: one 576-sample granule per frame, 9/17-byte side info (8-bit `main_data_begin` capping the reservoir at 255, no scfsi, preflag implied by `scalefac_compress >= 500` and kept off), and a 9-bit mixed-radix `scalefac_compress` search over `SCF_MOD`/`SCF_PARTITIONS` (mirroring the decoder's decomposition; all long-block partition groups transmit 21 values, band 21 uncoded, matching the MPEG-1 convention) with partitioned scalefactor emission. New FFmpeg oracle gate `lsf_encoder_agrees_with_ffmpeg`: nine rate/family/channel/bitrate configurations at 116-121 dB inter-decoder SNR with unity gain, passing first run. **VBR encode landed (2026-09-28, same session):** `Mp3Encoder::new_vbr(sink, sr, ch, quality 0..=9)` picks the smallest standard bitrate index per frame whose planned content meets the quality tolerance — the decoder-recommended MP3 VBR (per-frame self-describing headers; the reservoir absorbs the frame-size differences, and the tail-aligned reach-back needed no changes for mixed-rate streams). The amplification loop gained a tolerance target (CBR keeps noise-at-threshold = 1.0; VBR maps quality to +1.5 dB allowed band noise per step via 10^(quality*0.15)), and plans now carry their worst-band noise-to-threshold ratio as the frame's delivered quality, so `plan_vbr_frame` probes the ladder ascending with no re-planning at the chosen rate. Gates: `vbr_selects_bitrates_by_loudness_and_tiles_exactly` (bitrate varies with loudness, the mixed-size frame chain tiles byte-exactly, quiet-then-loud decodes correctly) and `vbr_encoder_agrees_with_ffmpeg` (MPEG-1 44.1k stereo q3 / 48k mono q6 / LSF 24k stereo q4 at 120-124 dB inter-decoder SNR with unity gain) — both passing first run. Remaining work: short blocks (block switching, assessed in detail below — needs a dedicated session, not a partial one), psycho-loop quality tuning, intensity stereo (decoder supports it; the encoder never emits it, per `ffmpeg_oracle_matrix.rs`'s own doc comment).
 
 **Short-block scope assessed 2026-09-28 (encoder side only — the decode side is already done and FFmpeg-validated).** The decoder half of this feature is complete: `sideinfo.rs:135` selects `SCF_SHORT[sr_idx]` for non-zero `block_type`, `imdct::imdct_short` and the start/stop window select exist, and the FFmpeg oracle matrix *requires* short-block coverage in the streams it decodes (`ffmpeg_oracle_matrix.rs:940-944`: >= 50 short, >= 30 start, >= 20 mixed, >= 50 stop granules, with `subblock_gain` tallies too) and compares inter-decoder SNR on them. So the encoder work is purely additive against a known-good, already-tested contract — and the same oracle gives it a real gate, provided the test signal is transient.
 
@@ -3437,3 +3437,106 @@ number (20.6 dB) sits below the old overshoot-inflated gate.
 `SILK_DBG`); no measurement scratch files were kept. `cargo test --workspace`
 (56 test binaries) green, clippy `-D warnings` clean, fmt clean.
 
+### Session log (2026-09-29): `silk_NSQ_del_dec` ported and wired behind `set_complexity` — the last named Opus refinement is closed
+
+The remaining-scope item every 2026-09-27/28 log ends with is now landed.
+`src/silk/nsq_del_dec.rs` is an exact port of `silk/NSQ_del_dec.c`
+(`silk_NSQ_del_dec`, `silk_noise_shape_quantizer_del_dec`,
+`silk_nsq_del_dec_scale_states`): 1-4 quantization paths, each carrying its
+own LPC/shaping state, dither seed and `DECISION_DELAY` (40) ring buffers,
+extended with best/second-best candidates per sample and pruned by
+accumulated rate/distortion; only the running winner's decisions — delayed
+by `decisionDelay` samples — reach the output and the shared LTP/shaping
+state. The three reference constructs the 2026-09-27 assessment flagged all
+needed deliberate Rust shapes: (1) the pruning-point partial state copy (C
+`memcpy` skipping the struct's first `i` words) became a per-field copy
+skipping the first `i` samples of the per-path `sLPC_Q14`; (2) the winner's
+`pulses[i - decisionDelay]` writes became frame-relative indexing into
+whole-frame buffers (the reference's negative pointer offsets across
+subframe boundaries); (3) the voiced subframe-2 rewhite snaps the tree (all
+non-winner states get `RD += INT32_MAX>>4`, the winner's pending tail is
+flushed to the output) before re-filtering. `warping_Q16` is ported (the
+per-path allpass feedback); with 0 it reduces exactly to the plain NSQ's
+feedback loop.
+
+**Two real port bugs, both caught by the differential test**
+(`del_dec_xq_equals_decode_core`: 2 signal types x 2 seeds x 2 NLSF
+interpolations x 4 state counts x 2 warpings = 64 configurations, each
+asserting `xq == decode_core(pulses, transmitted_seed)`):
+
+1. `silk_nsq_del_dec_scale_states` receives the raw subframe index `k`,
+   NOT the quantizer's output-guard counter (which the subframe-2 rewhite
+   resets to 0). Passing the reset counter re-applied the `LTP_scale`
+   downscale at subframe 2, where `silk_decode_core` does not — every
+   voiced+interpolated frame diverged from exactly that subframe on. The
+   reference passes `subfr++` to the *quantizer* but `k` to
+   *scale_states*; the port now does too.
+2. The subframe-2 winner copy materializes output as
+   `SAT16(RSHIFT_ROUND(SMULWW(xq, Gains_Q16[1]), 14))` while every other
+   output write (and the decoder) use
+   `SAT16(RSHIFT_ROUND(SMULWW(xq, Gains_Q16[k] >> 6), 8))`. The two are
+   the same value mathematically but the intermediate truncations differ by
+   up to 1 LSB on rounding-boundary samples — observed directly as an
+   enc=413/dec=412 divergence at a k2-window sample with identical pulses.
+   libopus tolerates this (its encoder-side reconstruction is a soft state
+   that only feeds the next frame's rewhite); this crate's closed-loop
+   contract (`encoder_simulation_matches_decoder_bit_exactly`) does not,
+   so the copy uses the decoder's exact form — a one-line, documented
+   deviation in the module header.
+
+**Wiring** (`SilkEncoder::set_complexity(u8)`, clamped 0..=10): the
+quantizer-facing columns of `silk_setup_complexity` — `nStatesDelayedDecision`
+(1 below complexity 2, 2 below 6, 3 below 8, `MAX_DEL_DEC_STATES`=4 at
+8..=10) and `warping_Q16` (0 below complexity 4, `fs_kHz * 0.015` in Q16
+from 4) — select between the foundation's `encode_frame_nsq` and the ported
+del_dec via the reference's own dispatch
+(`nStatesDelayedDecision > 1 || warping_Q16 > 0`). The rate-control loop is
+quantizer-agnostic as designed: each attempt seeds a working `NsqState`
+from the (restored) synthesis state plus the pre-frame shaping-state
+snapshot, runs the quantizer, and commits back (decoder-mirror
+`sLPC_Q14`/`prev_gain_Q16`, `exc_q14` via the decoder's own
+`reconstruct_excitation`, and the NSQ carrier); `RateAttempt` snapshots roll
+the carrier back with everything else. The CBR retry loop's
+`ChannelSnapshot` now carries the NSQ carrier (a retry without it would
+resume from the failed attempt's shaping state), and `reset_after_mid_only`
+resets it alongside the synthesis state. `indices.seed` flows through
+untouched: the port writes the winner's `SeedInit` back, which is exactly
+the seed the decoder must receive (transmitted in pass B and pinned by the
+differential test).
+
+**The default of complexity 1 is a deliberate deviation, documented on the
+setter**: it keeps the foundation quantizer, whose bit cost the whole
+suite's gates (notably the hybrid SILK/CELT budget split) were measured
+against — the fifth session showed the reference quantizer families are not
+cost-interchangeable. The remaining `silk_setup_complexity` columns
+(pitch-estimation complexity, shaping/LPC orders, NLSF survivors) are fixed
+in this foundation's analysis chain and are not part of the knob.
+
+**Validation.** Complexity 1 produces byte-identical payloads to the
+default (pinned); complexity 10 round-trips bit-exactly through the real
+decoder across the same mixed speech/noise/silence material and rates as
+the default-path test, including under CBR sizing (constant payloads, the
+zero padding never read). Measured on the suite's speech-like fixture
+(`encode_reconstruct`, 20 ms, 32/24/16 kbps): complexity 10 improves the
+A-weighted SNR from 6.8/7.8/24.0 dB to 20.1/17.2/23.2 dB while the mean
+payload *shrinks* (73.9->70.2 B, 56.1->52.5 B at 16 kHz) — the reference
+Lambda RDO term spending fewer bits and the shaping error feedback placing
+the remaining noise where A-weighting does not mind it, exactly the
+trade the perceptual metrics were built to see (segmental SNR drops as
+expected). New tests: the module differential sweep,
+`complexity_knob_selects_the_reference_dispatch`,
+`complexity_ten_round_trips_match_the_decoder`,
+`complexity_ten_cbr_keeps_constant_payloads_bit_exact`,
+`delayed_decision_complexity_improves_perceptual_metrics`. Stereo SILK runs
+the same per-channel quantizer path (mid/side + mid-only resets covered at
+the default complexity; the Ogg layer does not expose the complexity knob).
+
+`cargo test -p tpt-av-cadence-opus` green (234 lib tests, up from 233;
+all integration suites), `cargo test --workspace --exclude
+tpt-av-cadence-mp3` green, clippy `-D warnings` clean, `cargo fmt` clean.
+**Note: `cargo test --workspace` as a whole currently does not compile —
+`tpt-av-cadence-mp3/tests/scratch_short.rs` (uncommitted, from the
+concurrent MP3 short-block workstream; not touched here) references four
+`sideinfo_*`/`bitreader_*` functions that do not exist yet.** The MP3
+crate's own lib tests pass (39). Remaining Opus scope: nothing named; the
+encoder's recorded scope is fully landed including this refinement.

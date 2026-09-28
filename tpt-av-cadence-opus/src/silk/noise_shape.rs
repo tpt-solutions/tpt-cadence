@@ -180,10 +180,17 @@ impl ShapeGeometry {
     }
 
     /// `warping_Q16` = `fs_kHz * WARPING_MULTIPLIER` in Q16 (the reference's
-    /// complexity >= 6 value; zero below that, where warping is disabled).
+    /// complexity >= 4 value; zero below that, where warping is disabled).
     pub fn warping_q16(&self) -> i32 {
-        (self.fs_khz as f32 * WARPING_MULTIPLIER * 65536.0) as i32
+        warping_q16(self.fs_khz)
     }
+}
+
+/// `warping_Q16` = `fs_kHz * WARPING_MULTIPLIER` in Q16 — the warp shared
+/// by the shaping analysis (`ShapeGeometry`) and, from complexity 4, the
+/// quantizer's noise-shaping feedback loop (`silk_setup_complexity`).
+pub(crate) fn warping_q16(fs_khz: u32) -> i32 {
+    (fs_khz as f32 * WARPING_MULTIPLIER * 65536.0) as i32
 }
 
 /// One frame's noise-shaping parameters in the fixed-point form the NSQ

@@ -19,6 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`encode_frame_vbr` / `OggOpusEncoder::new_vbr`), and full RFC 7845
   pre-skip/granule/end-trim handling for the measured 120-sample CELT
   delay.
+- SILK encoder (`silk::encoder::SilkEncoder`) with delayed-decision
+  noise-shaping quantization: `set_complexity(u8)` selects, per the
+  reference's own `silk_setup_complexity` columns and
+  `silk_encode_frame_FLP` dispatch, between the foundation closed-loop NSQ
+  (the default, complexity 1) and the ported `silk_NSQ_del_dec` (1-4
+  rate/distortion-pruned paths with the warped shaping feedback,
+  complexity 2-10), validated bit-exact against the decoder across 64
+  quantizer configurations.
 - Opus packet parser (TOC byte, frame framing) and range coder.
 - Full CELT decoder (unit-tested).
 - Full SILK decoder (unit-tested).

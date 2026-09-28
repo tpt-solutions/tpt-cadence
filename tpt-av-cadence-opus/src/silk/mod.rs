@@ -85,6 +85,7 @@ pub mod nlsf;
 pub mod nlsf_quant;
 pub mod noise_shape;
 pub mod nsq;
+pub mod nsq_del_dec;
 pub mod nsq_ref;
 pub mod pitch;
 pub mod plc;

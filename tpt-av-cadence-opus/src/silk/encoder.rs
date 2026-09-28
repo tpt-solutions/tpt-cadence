@@ -347,6 +347,7 @@ impl ChannelState {
         self.synth.out_buf = [0; crate::silk::synthesis::MAX_FRAME_LENGTH
             + 2 * crate::silk::synthesis::MAX_SUB_FRAME_LENGTH];
         self.synth.s_lpc_q14_buf = [0; MAX_LPC_ORDER];
+        self.nsq.reset();
         self.lag_prev = 100;
         self.last_gain_index = crate::silk::gains::LAST_GAIN_INDEX_ON_PACKET_LOSS;
         self.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
@@ -371,6 +372,9 @@ pub struct SilkEncoder {
     stereo: StereoEncState,
     /// Mirrors the decoder's persistent `prev_decode_only_middle`.
     prev_decode_only_middle: bool,
+    /// Encoder complexity 0..=10 (`silk_setup_complexity`); 1 by default,
+    /// which keeps the foundation quantizer — see [`Self::set_complexity`].
+    complexity: u8,
     /// The caller's rate target (`set_bitrate`); the CBR retry loop
     /// derives reduced working rates from it.
     target_rate_bps: i32,
@@ -479,6 +483,9 @@ struct ChannelSnapshot {
     shape: ShapeState,
 
     speech_activity_q8: i32,
+    /// The reference NSQ carrier (shaping feedback state across frames);
+    /// the delayed-decision quantizer reads and advances it.
+    nsq: crate::silk::nsq_ref::NsqState,
 }
 
 impl ChannelState {
@@ -501,6 +508,7 @@ impl ChannelState {
             shape: self.shape,
 
             speech_activity_q8: self.speech_activity_q8,
+            nsq: self.nsq.clone(),
         }
     }
 
@@ -521,6 +529,7 @@ impl ChannelState {
         self.resampler = s.resampler.clone();
         self.shape = s.shape;
         self.speech_activity_q8 = s.speech_activity_q8;
+        self.nsq = s.nsq.clone();
     }
 }
 
@@ -633,6 +642,7 @@ impl SilkEncoder {
             ch: [ch0, ch1],
             stereo: StereoEncState::default(),
             prev_decode_only_middle: false,
+            complexity: 1,
             target_rate_bps: 0,
             cbr: None,
             mid_only: [false; MAX_FRAMES_PER_PACKET],
@@ -751,6 +761,30 @@ impl SilkEncoder {
     /// actual loss rate and activity); `pct <= 0` disables LBRR.
     pub fn set_packet_loss_perc(&mut self, pct: i32) {
         self.lbrr_enabled = pct > 0;
+    }
+
+    /// Sets the encoder complexity, clamped to 0..=10
+    /// (`silk_control_encoder`'s `complexity` control). The only
+    /// complexity-controlled stage in this foundation is the noise-shaping
+    /// quantizer, selected exactly as the reference dispatches it
+    /// (`nStatesDelayedDecision > 1 || warping_Q16 > 0` →
+    /// `silk_NSQ_del_dec`, else `silk_NSQ`): 1 delayed-decision state below
+    /// complexity 2, 2 below 6, 3 below 8 and 4 (`MAX_DEL_DEC_STATES`) at
+    /// 8..=10, with the warped shaping feedback from complexity 4 (see
+    /// [`crate::silk::nsq_del_dec::complexity_del_dec_config`]). The
+    /// remaining table columns (pitch-estimation complexity, shaping/LPC
+    /// orders, NLSF survivors) are fixed in this foundation's analysis
+    /// chain.
+    ///
+    /// **The default of 1 is a deliberate foundation deviation**: it keeps
+    /// the foundation's `encode_frame_nsq` quantizer, whose bitrate the
+    /// whole suite's gates (notably the hybrid SILK/CELT budget split) were
+    /// measured against — the reference quantizer families have a
+    /// materially different bit cost at equal gains (see the 2026-09-28
+    /// session logs in todo.md). Complexity >= 2 opts into the ported
+    /// delayed-decision quantizer.
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.complexity = complexity.min(10);
     }
 
     /// Hybrid-mode variant: the written symbols must fit `bytes` bytes
@@ -987,6 +1021,11 @@ impl SilkEncoder {
             /* frames and channels), buffering each frame's indices   */
             /* and pulses.                                            */
             /*--------------------------------------------------------*/
+            let (del_dec_n_states, del_dec_warping_q16) =
+                crate::silk::nsq_del_dec::complexity_del_dec_config(
+                    self.complexity,
+                    self.ch[0].fs_khz,
+                );
             let mut plans = [Vec::new(), Vec::new()];
             for i in 0..self.packet_frames {
                 let l_int = &mid_frames[i];
@@ -1019,6 +1058,8 @@ impl SilkEncoder {
                         seed,
                         use_cbr,
                         mid_max_bits,
+                        del_dec_n_states,
+                        del_dec_warping_q16,
                     );
                     plans[0].push(plan);
                 }
@@ -1056,6 +1097,8 @@ impl SilkEncoder {
                             seed,
                             use_cbr,
                             side_max_bits,
+                            del_dec_n_states,
+                            del_dec_warping_q16,
                         );
                         plans[1].push(plan);
                     }
@@ -1346,6 +1389,8 @@ impl ChannelState {
         seed: i8,
         use_cbr: bool,
         max_bits: Option<i32>,
+        del_dec_n_states: usize,
+        del_dec_warping_q16: i32,
     ) -> FramePlan {
         /*--------------------------------------------------------*/
         /* Side-info skeleton (type, VAD flag, seed). `indices`   */
@@ -1599,6 +1644,8 @@ impl ChannelState {
             base_quant_offset_type,
             conditional_gains,
             max_bits,
+            del_dec_n_states,
+            del_dec_warping_q16,
         );
 
         self.synth
@@ -1674,14 +1721,16 @@ impl ChannelState {
     /// interpolate instead of only ramping, and the per-subframe `gain_lock`
     /// freezes subframes whose pulse count has stopped falling.
     ///
-    /// The loop is quantizer-agnostic: it only re-quantizes the gains and
-    /// re-measures, so it drives the foundation's `encode_frame_nsq` here
-    /// rather than the reference `nsq_ref::nsq`. The two are not
-    /// interchangeable in *cost* — `encode_frame_nsq` is
-    /// analysis-by-synthesis and spends more bits per sample at equal
-    /// quality — and adopting the reference one shifts the encoder's
-    /// bitrate enough to break the hybrid layer's fixed SILK/CELT budget
-    /// split. See the todo.md session log.
+    /// The quantizer itself is selected per `silk_encode_frame_FLP`'s
+    /// dispatch (`nStatesDelayedDecision > 1 || warping_Q16 > 0`):
+    /// `del_dec_n_states > 1 || del_dec_warping_q16 > 0` runs the ported
+    /// delayed-decision reference quantizer
+    /// ([`crate::silk::nsq_del_dec`], the complexity >= 2 family), and
+    /// otherwise the foundation's `encode_frame_nsq` (this foundation's
+    /// `silk_NSQ`). The two are not interchangeable in *cost* — the
+    /// foundation quantizer is analysis-by-synthesis and spends more bits
+    /// per sample at equal quality — which is why the complexity knob
+    /// defaults below the dispatch threshold (see `set_complexity`).
     ///
     /// **Deviation — deferred serialization.** The reference codes straight
     /// into the output range coder and rolls it back between attempts. This
@@ -1709,6 +1758,8 @@ impl ChannelState {
         base_quant_offset_type: i8,
         conditional_gains: bool,
         max_bits: Option<i32>,
+        del_dec_n_states: usize,
+        del_dec_warping_q16: i32,
     ) -> ([i16; MAX_FRAME_LENGTH], [i16; MAX_FRAME_LENGTH]) {
         const MAX_ITER: usize = 6;
         let nb_subfr = self.nb_subfr;
@@ -1744,6 +1795,16 @@ impl ChannelState {
         let ec_prev_copy = self.ec_prev;
         let prev_signal_type = self.prev_signal_type;
         let lag_prev_in = self.lag_prev;
+        /* The reference NSQ carrier's encoder-only shaping fields
+         * (`sAR2`/`LF_AR`/`Diff` and the shaped-LTP history) — the
+         * delayed-decision quantizer's per-attempt starting point. Its
+         * decoder-mirror fields are re-seeded from `self.synth` (restored
+         * per attempt) every attempt, so only this pre-frame snapshot is
+         * needed. */
+        let nsq_shape_copy = self.nsq.clone();
+        /* The reference's own quantizer dispatch
+         * (`silk_encode_frame_FLP.c`). */
+        let use_del_dec = del_dec_n_states > 1 || del_dec_warping_q16 > 0;
 
         let mut gain_mult_q8: i32 = 256;
         let mut prev_gains_id: Option<i32> = None;
@@ -1826,24 +1887,71 @@ impl ChannelState {
             ctrl.gains_q16 = p_gains_q16;
             indices.quant_offset_type = quant_offset_type;
 
-            /* Noise-shaping quantization (the foundation's closed-loop NSQ;
-             * see the note on quantizer cost above). */
+            /* Noise-shaping quantization: the reference's own dispatch —
+             * the delayed-decision port at complexity >= 2, the
+             * foundation's closed-loop NSQ below it. */
             cur_pulses = [0i16; MAX_FRAME_LENGTH];
             cur_xq = [0i16; MAX_FRAME_LENGTH];
-            encode_frame_nsq(
-                &mut self.synth,
-                shape,
-                &mut self.exc_q14,
-                &mut cur_pulses,
-                &mut cur_xq,
-                x_int,
-                ctrl,
-                indices,
-                &self.frame,
-                0,
-                prev_signal_type,
-                lag_prev_in,
-            );
+            if use_del_dec {
+                /* Seed the working reference-NSQ state: the decoder-mirror
+                 * fields from the (restored) synthesis state, the
+                 * encoder-only shaping fields from the pre-frame snapshot. */
+                let mut work = nsq_shape_copy.clone();
+                work.xq[..self.ltp_mem_length]
+                    .copy_from_slice(&self.synth.out_buf[..self.ltp_mem_length]);
+                work.s_lpc_q14[..MAX_LPC_ORDER].copy_from_slice(&self.synth.s_lpc_q14_buf);
+                work.prev_gain_q16 = self.synth.prev_gain_q16;
+                work.lag_prev = lag_prev_in;
+                let res = crate::silk::nsq_del_dec::nsq_del_dec(
+                    &mut work,
+                    indices,
+                    x_int,
+                    ctrl,
+                    &self.frame,
+                    &shape.ar_q13,
+                    &shape.lf_shp_q14,
+                    &shape.tilt_q14,
+                    &shape.harm_shape_gain_q14,
+                    shape.lambda_q10,
+                    i32::from(ctrl.ltp_scale_q14),
+                    &ctrl.gains_q16,
+                    del_dec_n_states,
+                    del_dec_warping_q16,
+                );
+                cur_pulses = res.pulses;
+                cur_xq = res.xq;
+                /* The delayed-decision port does not write the decoder
+                 * mirror directly; commit the fields the foundation path
+                 * updates inside `encode_frame_nsq`. The `out_buf` slide is
+                 * `update_out_buf` in the caller, as for both paths. */
+                self.synth
+                    .s_lpc_q14_buf
+                    .copy_from_slice(&work.s_lpc_q14[..MAX_LPC_ORDER]);
+                self.synth.prev_gain_q16 = work.prev_gain_q16;
+                crate::silk::excitation::reconstruct_excitation(
+                    &mut self.exc_q14[..frame_length],
+                    &cur_pulses,
+                    indices.seed,
+                    indices.signal_type,
+                    indices.quant_offset_type,
+                );
+                self.nsq = work;
+            } else {
+                encode_frame_nsq(
+                    &mut self.synth,
+                    shape,
+                    &mut self.exc_q14,
+                    &mut cur_pulses,
+                    &mut cur_xq,
+                    x_int,
+                    ctrl,
+                    indices,
+                    &self.frame,
+                    0,
+                    prev_signal_type,
+                    lag_prev_in,
+                );
+            }
 
             /* Measure this attempt on a scratch coder. */
             let mut scratch = crate::range::RangeEncoder::new();
@@ -1896,9 +2004,10 @@ impl ChannelState {
                 synth: self.synth,
                 exc_q14: self.exc_q14,
                 last_gain_index: self.last_gain_index,
+                nsq: self.nsq.clone(),
             };
             if iter > 0 {
-                prev_attempt = Some(attempt);
+                prev_attempt = Some(attempt.clone());
             }
 
             if iter == MAX_ITER {
@@ -1910,6 +2019,7 @@ impl ChannelState {
                     self.synth = b.synth;
                     self.exc_q14 = b.exc_q14;
                     self.last_gain_index = best_last_gain_index;
+                    self.nsq = b.nsq;
                     cur_pulses = b.pulses;
                     cur_xq = b.xq;
                 } else if n_bits > max_bits {
@@ -1929,6 +2039,7 @@ impl ChannelState {
                         self.synth = p.synth;
                         self.exc_q14 = p.exc_q14;
                         self.last_gain_index = p.last_gain_index;
+                        self.nsq = p.nsq;
                         cur_pulses = p.pulses;
                         cur_xq = p.xq;
                     }
@@ -2415,7 +2526,7 @@ impl ChannelState {
 
 /// One accepted attempt of the SILK per-frame rate-control loop, with
 /// everything the loop has to roll back if a later attempt turns out worse.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RateAttempt {
     gains_indices: [i8; MAX_NB_SUBFR],
     quant_offset_type: i8,
@@ -2428,6 +2539,9 @@ struct RateAttempt {
     synth: SynthesisState,
     exc_q14: [i32; MAX_FRAME_LENGTH],
     last_gain_index: i8,
+    /// The reference-NSQ carrier's post-attempt state (the encoder-only
+    /// shaping feedback of the delayed-decision quantizer).
+    nsq: crate::silk::nsq_ref::NsqState,
 }
 
 /// The serializable result of one analyzed SILK frame — the side-info
