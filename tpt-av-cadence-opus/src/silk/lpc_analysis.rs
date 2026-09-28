@@ -134,6 +134,165 @@ pub(crate) fn k2a(a: &mut [f32], rc: &[f32], order: usize) {
 }
 
 /// `silk_bwexpander_FLP`: chirp (bandwidth expansion) of an AR vector.
+/// `silk_burg_modified_FLP` (`silk/float/burg_modified_FLP.c`): modified
+/// Burg algorithm for LPC analysis over `nb_subfr` subframes stacked in
+/// `x` (each `subfr_length` long, beginning with `order` history
+/// samples). Returns the residual energy; `a` receives the prediction
+/// coefficients (same sign convention as [`k2a`]'s output).
+///
+/// `FIND_LPC_COND_FAC` = 1e-5 (`silk/tuning_parameters.h`);
+/// `SILK_MAX_ORDER_LPC` = 24.
+pub(crate) fn burg_modified_f32(
+    a: &mut [f32],
+    x: &[f32],
+    min_inv_gain: f32,
+    subfr_length: usize,
+    nb_subfr: usize,
+    order: usize,
+) -> f32 {
+    const FIND_LPC_COND_FAC: f32 = 1e-5;
+    const SILK_MAX_ORDER_LPC: usize = 24;
+    debug_assert!(subfr_length * nb_subfr <= 384); // MAX_FRAME_SIZE
+    debug_assert!(order <= SILK_MAX_ORDER_LPC);
+
+    let mut c_first_row = [0f64; SILK_MAX_ORDER_LPC];
+    let mut caf = [0f64; SILK_MAX_ORDER_LPC + 1];
+    let mut cab = [0f64; SILK_MAX_ORDER_LPC + 1];
+    let mut af = [0f64; SILK_MAX_ORDER_LPC];
+
+    // Compute autocorrelations, added over subframes.
+    let c0: f64 = x.iter().map(|&v| (v as f64) * v as f64).sum();
+    for s in 0..nb_subfr {
+        let x_ptr = &x[s * subfr_length..];
+        for n in 1..order + 1 {
+            let ip: f64 = x_ptr[..subfr_length - n]
+                .iter()
+                .zip(x_ptr[n..].iter())
+                .map(|(&u, &v)| (u as f64) * v as f64)
+                .sum();
+            c_first_row[n - 1] += ip;
+        }
+    }
+    let mut c_last_row = c_first_row;
+
+    // Initialize.
+    caf[0] = c0 + FIND_LPC_COND_FAC as f64 * c0 + 1e-9;
+    cab[0] = caf[0];
+    let mut inv_gain = 1.0f64;
+    let mut reached_max_gain = false;
+    for n in 0..order {
+        // Update first/last rows of the correlation matrix and C·Af / C·Ab.
+        for s in 0..nb_subfr {
+            let x_ptr = &x[s * subfr_length..];
+            let mut tmp1 = x_ptr[n] as f64;
+            let mut tmp2 = x_ptr[subfr_length - n - 1] as f64;
+            for k in 0..n {
+                c_first_row[k] -= x_ptr[n] as f64 * x_ptr[n - k - 1] as f64;
+                c_last_row[k] -=
+                    x_ptr[subfr_length - n - 1] as f64 * x_ptr[subfr_length - n + k] as f64;
+                let atmp = af[k];
+                tmp1 += x_ptr[n - k - 1] as f64 * atmp;
+                tmp2 += x_ptr[subfr_length - n + k] as f64 * atmp;
+            }
+            for k in 0..=n {
+                caf[k] -= tmp1 * x_ptr[n - k] as f64;
+                cab[k] -= tmp2 * x_ptr[subfr_length - n + k - 1] as f64;
+            }
+        }
+        let mut tmp1 = c_first_row[n];
+        let mut tmp2 = c_last_row[n];
+        for k in 0..n {
+            let atmp = af[k];
+            tmp1 += c_last_row[n - k - 1] * atmp;
+            tmp2 += c_first_row[n - k - 1] * atmp;
+        }
+        caf[n + 1] = tmp1;
+        cab[n + 1] = tmp2;
+
+        // Nominator and denominator for the next reflection coefficient.
+        let mut num = cab[n + 1];
+        let mut nrg_b = cab[0];
+        let mut nrg_f = caf[0];
+        for k in 0..n {
+            let atmp = af[k];
+            num += cab[n - k] * atmp;
+            nrg_b += cab[k + 1] * atmp;
+            nrg_f += caf[k + 1] * atmp;
+        }
+
+        // Next reflection (parcor) coefficient.
+        let mut rc = -2.0 * num / (nrg_f + nrg_b);
+
+        // Update the inverse prediction gain, capping at min_inv_gain.
+        let tmp = inv_gain * (1.0 - rc * rc);
+        if tmp <= min_inv_gain as f64 {
+            // Max prediction gain exceeded: set the reflection
+            // coefficient so the max gain is exactly hit.
+            rc = (1.0 - min_inv_gain as f64 / inv_gain).sqrt();
+            if num > 0.0 {
+                // Preserve the original sign.
+                rc = -rc;
+            }
+            inv_gain = min_inv_gain as f64;
+            reached_max_gain = true;
+        } else {
+            inv_gain = tmp;
+        }
+
+        // Update the AR coefficients.
+        for k in 0..(n + 1) >> 1 {
+            let tmp1 = af[k];
+            let tmp2 = af[n - k - 1];
+            af[k] = tmp1 + rc * tmp2;
+            af[n - k - 1] = tmp2 + rc * tmp1;
+        }
+        af[n] = rc;
+
+        if reached_max_gain {
+            // Set remaining coefficients to zero and exit.
+            for v in af[n + 1..order].iter_mut() {
+                *v = 0.0;
+            }
+            break;
+        }
+
+        // Update C·Af and C·Ab.
+        for k in 0..=n + 1 {
+            let tmp1 = caf[k];
+            caf[k] += rc * cab[n + 1 - k];
+            cab[n + 1 - k] += rc * tmp1;
+        }
+    }
+
+    if reached_max_gain {
+        for (dst, &v) in a.iter_mut().zip(af.iter()).take(order) {
+            *dst = -v as f32;
+        }
+        // Subtract the history energy from C0 and approximate the
+        // residual energy.
+        let mut c0 = c0;
+        for s in 0..nb_subfr {
+            c0 -= x[s * subfr_length..s * subfr_length + order]
+                .iter()
+                .map(|&v| (v as f64) * v as f64)
+                .sum::<f64>();
+        }
+        (c0 * inv_gain) as f32
+    } else {
+        // Compute the residual energy; store coefficients negated.
+        let mut nrg_f = caf[0];
+        let mut tmp1 = 1.0;
+        for k in 0..order {
+            let atmp = af[k];
+            nrg_f += caf[k + 1] * atmp;
+            tmp1 += atmp * atmp;
+            a[k] = -atmp as f32;
+        }
+        nrg_f -= FIND_LPC_COND_FAC as f64 * c0 * tmp1;
+        nrg_f as f32
+    }
+}
+
 pub(crate) fn bwexpander_f32(ar: &mut [f32], chirp: f32) {
     let d = ar.len();
     debug_assert!(d > 0);
@@ -170,8 +329,19 @@ pub(crate) fn lpc_analysis_filter(r_lpc: &mut [f32], pred_coef: &[f32], s: &[f32
     r_lpc[..order].fill(0.0);
 }
 
-/// `silk_corrMatrix_FLP`: X'*X for the data matrix whose column `lag` is
+/// `silk_interpolate` (`silk/interpolate.c`): `xi = x0 +
+/// ((x1 − x0)·
 /// `x` delayed by `lag`; row-major `order x order` output.
+/// `silk_interpolate` (`silk/interpolate.c`): `xi = x0 +
+/// ((x1 − x0)·ifact) >> 2`, weight `ifact_Q2` on the second vector.
+pub(crate) fn interpolate_i16(xi: &mut [i16], x0: &[i16], x1: &[i16], ifact_q2: i32, d: usize) {
+    debug_assert!((0..=4).contains(&ifact_q2));
+    for i in 0..d {
+        xi[i] = ((x0[i] as i32).wrapping_add((((x1[i] as i32) - (x0[i] as i32)) * ifact_q2) >> 2))
+            as i16;
+    }
+}
+
 pub(crate) fn corr_matrix(xx: &mut [f32], x: &[f32], l: usize, order: usize) {
     debug_assert!(x.len() >= l + order - 1);
     debug_assert!(xx.len() >= order * order);
@@ -472,5 +642,25 @@ mod tests {
         let mut a_back = [0i16; 10];
         nlsf2a(&mut a_back, &nlsf, 10);
         assert!(lpc_inverse_pred_gain(&a_back, 10) > 0);
+    }
+}
+
+#[cfg(test)]
+mod interpolate_tests {
+    use super::interpolate_i16;
+
+    /// `silk_interpolate` reference semantics: xi = x0 + ((x1-x0)*k) >> 2.
+    #[test]
+    fn interpolate_matches_reference_formula() {
+        let x0 = [100i16, -200, 30000, -30000];
+        let x1 = [200i16, -400, -30000, 30000];
+        for k in 0..=4i32 {
+            let mut xi = [0i16; 4];
+            interpolate_i16(&mut xi, &x0, &x1, k, 4);
+            for i in 0..4 {
+                let expect = x0[i] as i32 + (((x1[i] as i32 - x0[i] as i32) * k) >> 2);
+                assert_eq!(xi[i] as i32, expect, "k={k} i={i}");
+            }
+        }
     }
 }

@@ -18,6 +18,7 @@ log = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+tpt-av-cadence-test-utils = { path = "../tpt-av-cadence-test-utils" }
 
 [[bench]]
 name = "celt_round_trip"

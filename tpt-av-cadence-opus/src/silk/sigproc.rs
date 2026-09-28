@@ -33,6 +33,16 @@ pub(crate) fn smlawb(a: i32, b: i32, c: i32) -> i32 {
     a.wrapping_add(smulwb(b, c))
 }
 
+/// `silk_SMLAWT(a, b, c)`: `a + ((b * (c >> 16)) >> 16)` — accumulate a
+/// Q16-shifted product using the **top** 16 bits of `c` (the full 32-bit
+/// arithmetic shift, not an `i16` truncation). The packed LF-shaping
+/// coefficient relies on this: `silk_SMULWB` picks the low half
+/// (`LF_MA_shp`) while `silk_SMLAWT` picks the high half (`LF_AR_shp`).
+#[inline]
+pub(crate) fn smlawt(a: i32, b: i32, c: i32) -> i32 {
+    a.wrapping_add((((b as i64) * ((c as i64) >> 16)) >> 16) as i32)
+}
+
 /// `silk_SMLABB(a, b, c)`: `a + (opus_int16)b * (opus_int16)c`.
 #[inline]
 pub(crate) fn smlabb(a: i32, b: i32, c: i32) -> i32 {
@@ -331,6 +341,23 @@ pub(crate) fn insertion_sort_increasing_all_values_int16(a: &mut [i16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SMLAWT` uses the **top** 16 bits of its third operand (a full 32-bit
+    /// arithmetic shift), unlike `SMLAWB`'s `i16` truncation of the low half.
+    /// The packed LF-shaping coefficient depends on exactly this split.
+    #[test]
+    fn smlawt_uses_top_half_of_third_operand() {
+        // packed = (-4096 << 16) | 0x2000: high half -4096, low half 8192.
+        let packed = (-4096i32) << 16 | 0x2000;
+        assert_eq!(smlawt(0, 65536, packed), -4096);
+        assert_eq!(smlawt(10, 65536, packed), -4086);
+        // The matching SMULWB picks the low half instead.
+        assert_eq!(smulwb(65536, packed), 8192);
+        // A bare Q14 coefficient has no top half at all, so SMLAWT yields
+        // nothing — which is exactly why the reference packs the LF pair
+        // into one 32-bit word instead.
+        assert_eq!(smlawt(0, 65536, 16384), 0);
+    }
 
     /// `SMULBB` truncates both operands to 16 bits first: 0x1_0001 as
     /// i16 is 1, so the product is 1 * 3 = 3, not 65539.

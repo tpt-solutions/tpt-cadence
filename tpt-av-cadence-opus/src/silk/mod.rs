@@ -62,6 +62,11 @@
 //!   (`silk_VQ_WMat_EC`/`silk_quant_LTP_gains`) quantizers.
 //! - [`lpc_analysis`]: float analysis kernels plus the exact
 //!   fixed-point `silk_A2NLSF`.
+//! - [`noise_shape`]: the noise-shaping analysis
+//!   (`silk_noise_shape_analysis_FLP` + `silk_warped_autocorrelation_FLP`)
+//!   — per-subframe warped-correlation gains (wired into the quantizer and
+//!   the LPC analysis, +0.8-1.2 dB SNR) plus the shaping filter, tilt,
+//!   harmonic gain and `Lambda`.
 //! - [`nsq`]: closed-loop forward NSQ running the decoder's own
 //!   arithmetic (bit-identical reconstruction).
 //! - [`encoder`]: the top-level [`encoder::SilkEncoder`] frame assembly
@@ -78,7 +83,9 @@ pub mod lpc_analysis;
 pub mod ltp_quant;
 pub mod nlsf;
 pub mod nlsf_quant;
+pub mod noise_shape;
 pub mod nsq;
+pub mod nsq_ref;
 pub mod pitch;
 pub mod plc;
 pub mod resampler;
@@ -86,3 +93,4 @@ pub mod sigproc;
 pub mod stereo;
 pub mod synthesis;
 pub mod tables;
+pub mod vad;

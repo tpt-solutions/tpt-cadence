@@ -6,9 +6,9 @@
 //! Huffman/scalefactor/bit-reservoir logic) rules out the failure mode
 //! where this crate's own decoder happens to accept a subtly malformed
 //! bitstream because it shares a bug with the encoder. It is not a
-//! fidelity check (see `tests/encoder_roundtrip.rs`'s `#[ignore]`d tests
-//! for the known, documented fidelity gap); it only asserts FFmpeg accepts
-//! the stream and produces the expected number of samples.
+//! fidelity check (see `tests/encoder_roundtrip.rs` for the round-trip
+//! gates); it only asserts FFmpeg accepts the stream and produces the
+//! expected number of samples.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -159,7 +159,7 @@ fn encoder_bitrate_ladder_matches_ffmpeg_decode() {
             frames[i * 2] = left[i];
             frames[i * 2 + 1] = right[i];
         }
-        let source_peak = frames.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let _source_peak = frames.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         for &bitrate in &[32u32, 64, 96, 128, 192, 256, 320] {
             let case = format!("stereo_{bitrate}k");
             let mut buf = Cursor::new(Vec::new());
@@ -236,11 +236,6 @@ fn encoder_bitrate_ladder_matches_ffmpeg_decode() {
                             oracle.len()
                         ));
                     }
-                    // The decoded peak is recorded but only asserted in the
-                    // ignored scale-defect test: today every bitrate renders
-                    // ~1e5x the source peak (see todo.md 2026-09-27).
-                    let decoded_peak = ours.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                    let _ = (source_peak, decoded_peak);
                 }
                 Err(e) => failures.push(format!("{case}: our open failed: {e}")),
             }
@@ -253,30 +248,36 @@ fn encoder_bitrate_ladder_matches_ffmpeg_decode() {
 /// Regression gate for the encoder defects measured on 2026-09-27 against
 /// FFmpeg (see todo.md "MP3 encoder scale/divergence defects"):
 ///
-/// 1. **"Universal scale defect" — RESOLVED (2026-09-27) as
-///    mis-calibration, not a defect.** The decoder's f32 output carries
-///    16-bit PCM magnitudes (±32768 for full-scale input), matching the
-///    FFmpeg oracle harness convention; the earlier measurements compared
-///    it against normalized source floats. The encoder now round-trips
-///    source scale correctly (decoded peak within 2-3.2x of
-///    source·32768 = well inside a decade, pure noise-peak factor), and
-///    cross-decoder agreement for all noise materials is 114+ dB.
-/// 2. **Tonal-path decoder divergence — STILL OPEN.** A 0.6/1 kHz sine at
-///    128 kbps (mono or stereo) decodes to a peak ~2x the intended line
-///    magnitude and disagrees with FFmpeg's decode at -44.6 (mono) /
-///    -38.3 (stereo) dB. Isolated per-book probes (see todo.md) validate
-///    every Huffman book's full codeword set through the real emission
-///    path in isolation, so the defect lives in the interaction of
-///    extreme-magnitude granules with the planner's chosen structure, not
-///    in the tables themselves. Mono/stereo noise additionally agrees at
-///    114+ dB at every bitrate on the ladder.
+/// 1. **"Universal scale defect" — RESOLVED (2026-09-28, re-resolved).**
+///    The true defect was a 2^16 analysis↔synthesis gain mismatch: the
+///    encoder pre-scaled its input by 32768 on top of an analyzer↔synth
+///    kernel pair that already carries 2^16, so every stream decoded
+///    65536× too loud (clipping to full scale under FFmpeg) — invisible
+///    to correlation-based gates, which is why it masqueraded as
+///    "mis-calibration". The analyzer now runs at 0.5× input for unity
+///    gain; the decoder's f32 output is true normalized PCM (±1 full
+///    scale), the same convention as the FFmpeg oracle harness, and
+///    cross-decoder agreement is 114-120 dB for all measured materials.
+/// 2. **Tonal-path decoder divergence — RESOLVED (2026-09-27, later the
+///    same day).** Root cause: FFmpeg's `l3_unscale` requantizes
+///    escape-coded lines (|ix| >= 15) through an integer mantissa shift
+///    with a zero-return guard for shifts outside [0, 31]; at the global
+///    gains our rate loop produced (gg ~ 250), every escape line fell
+///    outside that window and decoded as exact ZERO in FFmpeg while our
+///    float path rendered them at full precision. The encoder now zeroes
+///    out-of-window escape lines at quantization time (so encoder, our
+///    decoder, and FFmpeg agree) and the gg search treats such plans as
+///    non-fitting, rising to gains where the content is representable
+///    (LAME does the same: its granules for this material sit at
+///    gg <= ~103). Measured: tonal mono/stereo agree with FFmpeg at
+///    120+ dB (was -44/-38 dB before the fix).
 ///
-/// This test asserts the *fixed* behavior (16-bit-convention scale
+/// This test asserts the fixed behavior (16-bit-convention scale fidelity
+/// plus cross-decoder agreement for every material)./// This test asserts the *fixed* behavior (16-bit-convention scale
 /// fidelity plus cross-decoder agreement for every material). Run with
 /// `cargo test -p tpt-av-cadence-mp3 -- --ignored`; it currently fails
 /// only on the tonal SNR items.
 #[test]
-#[ignore = "MP3 encoder tonal-material inter-decoder disagreement remains (todo.md 2026-09-27); scale item resolved"]
 fn encoder_tonal_and_mono_scale_defects() {
     use tpt_av_cadence_core::{Decoder, Encoder};
     use tpt_av_cadence_mp3::Mp3Decoder;
@@ -358,13 +359,14 @@ fn encoder_tonal_and_mono_scale_defects() {
         }
         let _ = std::fs::remove_file(&path);
         // The decoder's f32 output carries 16-bit PCM magnitudes (the same
-        // convention as the FFmpeg oracle harness), so the source is scaled
-        // accordingly before the decade comparison.
-        let source_peak_16 = source_peak * 32768.0;
+        // The decoder's f32 output is true normalized PCM (±1 full scale,
+        // the same convention as the FFmpeg oracle harness) and the
+        // encoder round-trips unity gain, so the decoded peak must track
+        // the source peak directly.
         let decoded_peak = ours.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        if decoded_peak > source_peak_16 * 10.0 || decoded_peak < source_peak_16 / 10.0 {
+        if decoded_peak > source_peak * 10.0 || decoded_peak < source_peak / 10.0 {
             failures.push(format!(
-                "{label}: decoded peak {decoded_peak} not within a decade of source {source_peak_16}"
+                "{label}: decoded peak {decoded_peak} not within a decade of source {source_peak}"
             ));
         }
         if ours.len() == oracle.len() {
@@ -498,4 +500,275 @@ fn low_bitrate_stereo_sine_still_decodes_correct_frame_count() {
     }
     let path = encode_to_temp("stereo_sine_128", sample_rate, 2, 128, &frames);
     run_crosscheck(&path, sample_rate, 2, expected_frames);
+}
+
+/// MPEG-2/2.5 (LSF) encoder gate: every supported LSF sample rate must
+/// produce streams that FFmpeg decodes in agreement with this crate's own
+/// decoder, at unity absolute gain. Spans the MPEG-2 (16/22.05/24 kHz) and
+/// MPEG-2.5 (8/11.025/12 kHz) families across low, mid, and high bitrates,
+/// exercising the 8-bit `main_data_begin` reservoir cap, the 9-bit
+/// mixed-radix `scalefac_compress` search, and the partitioned scalefactor
+/// emission.
+#[test]
+fn lsf_encoder_agrees_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::Mp3Decoder;
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    let cases: &[(u32, u16, u32)] = &[
+        (24000, 2, 128),
+        (24000, 1, 56),
+        (22050, 2, 80),
+        (16000, 2, 64),
+        (16000, 1, 32),
+        (12000, 1, 32),
+        (11025, 2, 48),
+        (8000, 2, 24),
+        (8000, 1, 8),
+    ];
+    let mut failures = Vec::new();
+    for &(sample_rate, channels, kbps) in cases {
+        // One second of tonal + noise content at a moderate level, slightly
+        // decorrelated between channels for stereo cases.
+        let n = sample_rate as usize;
+        let mut frames = Vec::with_capacity(n * channels as usize);
+        let mut state = 0xBEEF_u32;
+        for i in 0..n {
+            let t = i as f32 / sample_rate as f32;
+            let tone = 0.3 * (2.0 * PI * 440.0 * t).sin() + 0.15 * (2.0 * PI * 1300.0 * t).sin();
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = (state as f32 / u32::MAX as f32 - 0.5) * 0.1;
+            let s = tone + noise;
+            frames.push(s);
+            if channels == 2 {
+                frames.push(s * 0.9);
+            }
+        }
+        let source_peak = frames.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = Mp3Encoder::new(&mut buf, sample_rate, channels, kbps).unwrap();
+            enc.encode(&frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "cadence_mp3_lsf_{}_{}_{}.mp3",
+            sample_rate,
+            channels,
+            std::process::id()
+        ));
+        std::fs::write(&path, buf.into_inner()).expect("write temp mp3");
+
+        let oracle = match decode_with_ffmpeg(&path, sample_rate, channels) {
+            Ok(o) => o,
+            Err(e) => {
+                failures.push(format!("{sample_rate}/{channels}/{kbps}: ffmpeg error {e}"));
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+        let ch = dec.info().channels as usize;
+        let mut ours = Vec::new();
+        let mut buf = vec![0.0f32; 4096 * ch];
+        loop {
+            match dec.decode(&mut buf) {
+                Ok(0) => break,
+                Ok(g) => ours.extend_from_slice(&buf[..g * ch]),
+                Err(e) => panic!("{sample_rate} Hz: our decode errored: {e}"),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        let label = format!("lsf_{sample_rate}_{channels}ch_{kbps}k");
+        let decoded_peak = ours.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if decoded_peak > source_peak * 10.0 || decoded_peak < source_peak / 10.0 {
+            failures.push(format!(
+                "{label}: decoded peak {decoded_peak} not within a decade of source {source_peak}"
+            ));
+        }
+        if ours.len() != oracle.len() {
+            failures.push(format!(
+                "{label}: length mismatch ours {} vs ffmpeg {}",
+                ours.len(),
+                oracle.len()
+            ));
+            continue;
+        }
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for (&a, &b) in ours.iter().zip(&oracle) {
+            let delta = f64::from(a) - f64::from(b);
+            error += delta * delta;
+            signal += f64::from(b).powi(2);
+        }
+        if signal > 0.0 {
+            let snr = 10.0 * (signal / error).log10();
+            eprintln!("{label}: inter-decoder SNR={snr:.2} dB");
+            if snr <= 100.0 {
+                failures.push(format!("{label}: inter-decoder SNR={snr:.2} vs ffmpeg"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "LSF encoder regressions: {failures:#?}"
+    );
+}
+
+/// VBR encoder gate: `Mp3Encoder::new_vbr` picks a bitrate index per frame;
+/// the resulting mixed-rate stream must still decode in FFmpeg in agreement
+/// with this crate's decoder (per-frame self-describing headers + the bit
+/// reservoir absorbing the size differences), at unity absolute gain, and
+/// actually vary the bitrate across frames.
+#[test]
+fn vbr_encoder_agrees_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::Mp3Decoder;
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    let cases: &[(u32, u16, u8)] = &[(44_100, 2, 3), (48_000, 1, 6), (24_000, 2, 4)];
+    let mut failures = Vec::new();
+    for &(sample_rate, channels, quality) in cases {
+        // One second of tonal + noise content at a moderate level.
+        let n = sample_rate as usize;
+        let mut frames = Vec::with_capacity(n * channels as usize);
+        let mut state = 0xCAFE_u32;
+        for i in 0..n {
+            let t = i as f32 / sample_rate as f32;
+            let tone = 0.3 * (2.0 * PI * 440.0 * t).sin() + 0.15 * (2.0 * PI * 1500.0 * t).sin();
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = (state as f32 / u32::MAX as f32 - 0.5) * 0.1;
+            let s = tone + noise;
+            frames.push(s);
+            if channels == 2 {
+                frames.push(s * 0.9);
+            }
+        }
+        let source_peak = frames.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = Mp3Encoder::new_vbr(&mut buf, sample_rate, channels, quality).unwrap();
+            enc.encode(&frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        let data = buf.into_inner();
+        let label = format!("vbr_{sample_rate}_{channels}ch_q{quality}");
+
+        // The stream must contain more than one bitrate index (quality
+        // varies slightly across the material), and FFmpeg must accept it.
+        let mut indexes = std::collections::BTreeSet::new();
+        let mut off = 0usize;
+        while off + 4 <= data.len() {
+            indexes.insert(u32::from(data[off + 2]) >> 4);
+            // Frame span from the ISO formula (sample rate family-aware).
+            let kbps = match (data[off + 1] >> 3) & 3 {
+                3 => [
+                    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+                ][(data[off + 2] >> 4) as usize],
+                _ => [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+                    [(data[off + 2] >> 4) as usize],
+            };
+            let id_bits = (data[off + 1] >> 3) & 3;
+            assert!(id_bits != 1, "reserved version ID");
+            let sr_family = if id_bits == 3 { 1u32 } else { 2 };
+            let base = match (data[off + 2] >> 2) & 3 {
+                0 => 44100,
+                1 => 48000,
+                2 => 32000,
+                _ => panic!("reserved sample rate"),
+            };
+            let sr = base / sr_family / if id_bits == 0 { 2 } else { 1 };
+            let samples: u32 = if id_bits == 3 { 1152 } else { 576 };
+            let span = samples * kbps * 125 / sr + ((data[off + 2] >> 1) & 1) as u32;
+            off += span as usize;
+        }
+        assert_eq!(off, data.len(), "{label}: frame spans must tile exactly");
+        assert!(
+            indexes.len() > 1,
+            "{label}: VBR must vary the bitrate index, saw {indexes:?}"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "cadence_mp3_vbr_{}_{}_{}.mp3",
+            sample_rate,
+            channels,
+            std::process::id()
+        ));
+        std::fs::write(&path, &data).expect("write temp mp3");
+        let oracle = match decode_with_ffmpeg(&path, sample_rate, channels) {
+            Ok(o) => o,
+            Err(e) => {
+                failures.push(format!("{label}: ffmpeg error {e}"));
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+        let ch = dec.info().channels as usize;
+        let mut ours = Vec::new();
+        let mut buf = vec![0.0f32; 4096 * ch];
+        loop {
+            match dec.decode(&mut buf) {
+                Ok(0) => break,
+                Ok(g) => ours.extend_from_slice(&buf[..g * ch]),
+                Err(e) => panic!("{label}: our decode errored: {e}"),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        let decoded_peak = ours.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if decoded_peak > source_peak * 10.0 || decoded_peak < source_peak / 10.0 {
+            failures.push(format!(
+                "{label}: decoded peak {decoded_peak} not within a decade of source {source_peak}"
+            ));
+        }
+        if ours.len() != oracle.len() {
+            failures.push(format!(
+                "{label}: length mismatch ours {} vs ffmpeg {}",
+                ours.len(),
+                oracle.len()
+            ));
+            continue;
+        }
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for (&a, &b) in ours.iter().zip(&oracle) {
+            let delta = f64::from(a) - f64::from(b);
+            error += delta * delta;
+            signal += f64::from(b).powi(2);
+        }
+        if signal > 0.0 {
+            let snr = 10.0 * (signal / error).log10();
+            eprintln!("{label}: inter-decoder SNR={snr:.2} dB");
+            if snr <= 100.0 {
+                failures.push(format!("{label}: inter-decoder SNR={snr:.2} vs ffmpeg"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "VBR encoder regressions: {failures:#?}"
+    );
 }

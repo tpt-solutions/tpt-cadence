@@ -1,14 +1,23 @@
-//! MPEG-1 Layer III (MP3) encoder.
+//! MPEG-1/2/2.5 Layer III (MP3) encoder.
 //!
 //! Scope of the current implementation (see `todo.md` for the full
 //! rationale and session history):
 //!
-//! - **MPEG-1 only** (32/44100/48000 Hz), a single fixed CBR bitrate per
-//!   stream, **long blocks only** (no block-switching / short blocks), and
-//!   no bit-reservoir borrowing across frames (`main_data_begin = 0`,
-//!   spec-legal; within a frame, the last granule/channel inherits the
-//!   whole frame's unspent bit remainder — the intra-frame equivalent of
-//!   reservoir borrowing).
+//! - **All three version families** (32/44100/48000 Hz MPEG-1 at 32-320
+//!   kbps; the MPEG-2/2.5 LSF families at 16/22.05/24 kHz and
+//!   8/11.025/12 kHz, 8-160 kbps), a single fixed CBR bitrate per stream,
+//!   **long blocks only** (no block-switching / short blocks).
+//! - **Full bit reservoir** (`main_data_begin` reach-back, capped by the
+//!   9-bit MPEG-1 / 8-bit LSF field): a frame's unspent payload tail is
+//!   held back from the sink
+//!   (zero padding until patched) and lent to the next frame's budget;
+//!   the next frame's granule stream head is written into the last
+//!   `main_data_begin` bytes before its header — exactly where both
+//!   decoder families reach back (FFmpeg saves the previous payload tail
+//!   and skips to `8*main_data_begin` before its end; minimp3-style
+//!   decoders keep the same tail via a source offset). Within a frame,
+//!   the last granule/channel additionally inherits the whole frame's
+//!   unspent remainder.
 //! - **Full Huffman machinery**: encode tables for all 32 big_values books
 //!   mechanically derived from the decoder's own tables (bit-identical to
 //!   FFmpeg's canonical code assignment — verified table-by-table), a
@@ -17,14 +26,13 @@
 //! - **Two-loop quantizer structure** (ISO/LAME style): an inner
 //!   global-gain rate loop (finest gain that fits the slot budget) and an
 //!   outer psychoacoustic loop that amplifies the worst band per
-//!   scalefactor unit. The outer loop's machinery — ISO model I-style
-//!   masking thresholds (spreading function, ATH, tonality), per-band
-//!   scalefactor amplification, and `scalefac_compress` selection — is
-//!   implemented and unit-tested, but amplification is currently disabled
-//!   (`PSY_AMPLIFICATION_ROUNDS = 0`): with it active, some frames
-//!   disagreed with FFmpeg's decode of the same bytes at 26–43 dB (our own
-//!   decoder round-trips them exactly). Investigation continues; see
-//!   `todo.md`.
+//!   scalefactor unit against ISO model I-style masking thresholds
+//!   (spreading function, ATH, tonality), with `scalefac_compress`
+//!   selection. The outer loop also enforces FFmpeg's escape-line
+//!   requantization window (see `apply_ff_window`): escape-coded lines
+//!   outside it decode as zero in FFmpeg's integer requant, so the loop
+//!   amplifies around them and the quantizer masks them, keeping encoder,
+//!   our decoder, and FFmpeg in exact agreement.
 //! - **Mid/side stereo**, decided per frame (joint stereo + mode_ext bit 2)
 //!   when the side channel carries less than half the mid-channel energy:
 //!   `M = (L+R)·2^-3/2`, `S = (L−R)·2^-3/2`, which combined with the
@@ -41,13 +49,10 @@
 //!
 //! Output is spec-compliant Layer III: valid headers, side info,
 //! scalefactors, and Huffman-coded data; it decodes cleanly in this
-//! crate's own decoder and in FFmpeg (see `tests/encoder_ffmpeg_crosscheck.rs`,
-//! whose bitrate ladder requires ≥100 dB agreement between FFmpeg's decode
-//! and ours on every standard bitrate in mono and stereo). Known open
-//! quality items — tonal-material inter-decoder disagreement at low
-//! bitrates and the disabled psychoacoustic amplification — are tracked in
-//! `todo.md` and `tests/encoder_ffmpeg_crosscheck.rs`'s ignored regression
-//! test.
+//! crate's own decoder and in FFmpeg, whose decode of the encoder's output
+//! agrees with ours at 114-120 dB across the full bitrate ladder, for
+//! tonal, noise, and mid/side material alike (see
+//! `tests/encoder_ffmpeg_crosscheck.rs`).
 
 use std::io::Write;
 
@@ -60,7 +65,6 @@ use crate::sideinfo;
 use crate::tables::{HUFF_TABS, LINBITS, TAB_INDEX};
 
 /// Samples per MPEG-1 frame (2 granules of 576).
-const FRAME_SAMPLES: usize = 1152;
 /// Samples per granule.
 const GRANULE_SAMPLES: usize = 576;
 /// Long-block scalefactor bands (fixed: MPEG-1 always has 22).
@@ -631,11 +635,51 @@ fn slens(compress: u8) -> (u32, u32) {
     (part >> 2, part & 3)
 }
 
-/// Total scalefactor bits a granule/channel spends at this compress value:
-/// 11 values at slen1 (bands 0..=10) plus 10 at slen2 (bands 11..=20).
-fn scalefac_bits(compress: u8) -> u64 {
-    let (s1, s2) = slens(compress);
-    11 * s1 as u64 + 10 * s2 as u64
+/// Total scalefactor bits a granule/channel spends at this compress value.
+/// MPEG-1: 11 values at slen1 (bands 0..=10) plus 10 at slen2 (bands
+/// 11..=20). LSF: the mixed-radix partition widths times their per-row
+/// band counts.
+fn scalefac_bits(compress: u16, lsf: bool) -> u64 {
+    if !lsf {
+        let (s1, s2) = slens(compress as u8);
+        return 11 * s1 as u64 + 10 * s2 as u64;
+    }
+    let (sizes, counts) = lsf_sf_layout(compress);
+    sizes
+        .iter()
+        .zip(counts.iter())
+        .map(|(&w, &c)| w as u64 * c as u64)
+        .sum()
+}
+
+/// Decomposes an LSF `scalefac_compress` value into the four partition
+/// widths (`scf_size`) and four partition band counts, mirroring
+/// `crate::scalefac::decode_scalefactors`' mixed-radix walk over
+/// `SCF_MOD`: `sfc` names a digit group, and the counts come from the
+/// *following* `SCF_PARTITIONS` group (the count reader stops at the
+/// first zero count, so trailing zeros truncate the partitions).
+fn lsf_sf_layout(sfc: u16) -> ([u8; 4], [u8; 4]) {
+    const SCF_MOD: [u8; 24] = [
+        5, 5, 4, 4, 5, 5, 4, 1, 4, 3, 1, 1, 5, 6, 6, 1, 4, 4, 4, 1, 4, 3, 1, 1,
+    ];
+    const SCF_PARTITIONS: [u8; 28] = [
+        6, 5, 5, 5, 6, 5, 5, 5, 6, 5, 7, 3, 11, 10, 0, 0, 7, 7, 7, 0, 6, 6, 6, 3, 8, 8, 5, 0,
+    ];
+    let mut sfc = sfc as i32;
+    let mut k = 0usize;
+    let mut sizes = [0u8; 4];
+    while sfc >= 0 {
+        let mut modprod = 1u32;
+        for (i, m) in SCF_MOD[k..k + 4].iter().enumerate().rev() {
+            sizes[i] = ((sfc as u32 / modprod) % u32::from(*m)) as u8;
+            modprod *= u32::from(*m);
+        }
+        sfc -= modprod as i32;
+        k += 4;
+    }
+    let mut counts = [0u8; 4];
+    counts.copy_from_slice(&SCF_PARTITIONS[k..k + 4]);
+    (sizes, counts)
 }
 
 /// Per-band requantization multipliers for a planned granule — an exact
@@ -819,7 +863,8 @@ fn plan_regions(ix: &[u32; GRANULE_SAMPLES], big_values: usize, layout: &BandLay
 #[derive(Debug, Clone, Copy)]
 struct GranulePlan {
     global_gain: u8,
-    scalefac_compress: u8,
+    /// 4-bit value on MPEG-1; 9-bit mixed-radix value on the LSF families.
+    scalefac_compress: u16,
     preflag: bool,
     /// Transmitted scalefactors (already pretab-adjusted when `preflag`).
     scalefacs: [u8; 21],
@@ -851,12 +896,20 @@ impl GranulePlan {
 /// the per-band quantization noise energies it produced.
 struct GranuleCost {
     plan: GranulePlan,
+    /// True when no escape-coded line required zero-window masking: the
+    /// plan's lines are all representable in FFmpeg's integer requant.
+    window_ok: bool,
     /// Quantization noise energy per band, `Σ (x − x̂)²`.
     band_noise: [f64; N_LONG_SFB],
     /// Total encoded bits (scalefacs + Huffman).
     bits: u64,
     /// True when even this granule's cheapest structure exceeded the budget.
     over_budget: bool,
+    /// Worst per-band noise-to-threshold ratio of the returned plan
+    /// (`INFINITY` for fallback plans). This is the frame's delivered
+    /// quality against the psychoacoustic model — the VBR bitrate search
+    /// accepts the first frame size whose worst ratio meets the target.
+    worst_ratio: f64,
 }
 
 /// Number of count1 quads (and the plan's `big_values`) covering all lines
@@ -901,12 +954,31 @@ fn evaluate_granule(
     layout: &BandLayout,
     global_gain: u8,
     scalefacs: &[u8; 21],
-    compress: u8,
+    compress: u16,
     preflag: bool,
     ms_stereo: bool,
+    lsf: bool,
 ) -> GranuleCost {
     let gains = band_gains(global_gain, scalefacs, preflag, ms_stereo);
-    let ix = quantize_granule(spec, &gains, &layout.band_of_line);
+    let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
+    let mut window_ok = true;
+    for band in 0..N_LONG_SFB {
+        // Band 21 carries no transmitted scalefac and no pretab (both read
+        // as zero in the decoder's scalefactor loop).
+        let sf_total = scalefacs.get(band).copied().unwrap_or(0) as i32
+            + if preflag && (11..21).contains(&band) {
+                crate::tables::PREAMP[band - 11] as i32
+            } else {
+                0
+            };
+        let exp_q = global_gain as i32 + 190 - (sf_total << 1);
+        for ix_i in &mut ix[layout.line_start[band]..layout.line_end[band]] {
+            if *ix_i >= 15 && ff_escape_shift(*ix_i, exp_q) < 0 {
+                *ix_i = 0;
+                window_ok = false;
+            }
+        }
+    }
 
     // Region plan for the all-pairs variant and the pairs+count1 variant;
     // keep whichever is cheaper.
@@ -963,7 +1035,7 @@ fn evaluate_granule(
         *noise = acc;
     }
 
-    let sfb_bits = scalefac_bits(compress);
+    let sfb_bits = scalefac_bits(compress, lsf);
     let total_bits = best_bits + sfb_bits;
     GranuleCost {
         plan: GranulePlan {
@@ -982,6 +1054,41 @@ fn evaluate_granule(
         // `part2_3_length` is a 12-bit field: a granule costing more than
         // 4095 bits cannot be claimed honestly and must be trimmed back.
         over_budget: total_bits > 4095,
+        window_ok,
+        worst_ratio: f64::INFINITY,
+    }
+}
+
+/// Applies FFmpeg's zero-window to a quantized granule: escape-coded
+/// lines (|ix| >= 15) whose l3_unscale shift leaves [0, 31] decode as
+/// exact ZERO in FFmpeg's integer requant, while our float path renders
+/// them at full precision - the stream would diverge between decoders.
+/// Zeroing them here makes the encoder, our decoder, and FFmpeg all agree
+/// (the lines are genuinely unrepresentable in FFmpeg at this exponent;
+/// coding them wastes bits on content no decoder will deliver). Must run
+/// identically in evaluate, measure, and emit so the plan's bit
+/// accounting always matches the emitted data.
+fn apply_ff_window(
+    ix: &mut [u32; GRANULE_SAMPLES],
+    global_gain: u8,
+    scalefacs: &[u8; 21],
+    preflag: bool,
+    layout: &BandLayout,
+) {
+    const SHIFT: i32 = 1; // scalefac_scale (0) + 1
+    for band in 0..N_LONG_SFB {
+        let sf_total = scalefacs.get(band).copied().unwrap_or(0) as i32
+            + if preflag && (11..21).contains(&band) {
+                crate::tables::PREAMP[band - 11] as i32
+            } else {
+                0
+            };
+        let exp_q = global_gain as i32 + 190 - (sf_total << SHIFT);
+        for ix_i in &mut ix[layout.line_start[band]..layout.line_end[band]] {
+            if *ix_i >= 15 && ff_escape_shift(*ix_i, exp_q) < 0 {
+                *ix_i = 0;
+            }
+        }
     }
 }
 
@@ -994,19 +1101,26 @@ fn inner_loop(
     spec: &[f32; GRANULE_SAMPLES],
     layout: &BandLayout,
     scalefacs: &[u8; 21],
-    compress: u8,
+    compress: u16,
     preflag: bool,
     ms_stereo: bool,
     budget_bits: u64,
+    lsf: bool,
 ) -> GranuleCost {
-    let cost_at =
-        |gg: u8| evaluate_granule(spec, layout, gg, scalefacs, compress, preflag, ms_stereo);
+    let cost_at = |gg: u8| {
+        evaluate_granule(
+            spec, layout, gg, scalefacs, compress, preflag, ms_stereo, lsf,
+        )
+    };
+
+    let fits = |c: &GranuleCost| c.bits <= budget_bits && c.window_ok;
 
     let coarsest = cost_at(255);
-    if coarsest.bits > budget_bits {
+    if !fits(&coarsest) {
         // Even the coarsest quantizer overshoots (pathologically small
-        // budget): return the coarsest structure; emit-time trimming will
-        // cut the tail to restore the byte budget.
+        // budget) or places escape lines outside FFmpeg's requant window:
+        // return the coarsest structure; emit-time trimming will cut the
+        // tail (applying the window mask) to restore the byte budget.
         let mut coarsest = coarsest;
         coarsest.over_budget = true;
         return coarsest;
@@ -1024,7 +1138,7 @@ fn inner_loop(
     let mut probe = 128u16;
     while probe > 0 {
         let c = cost_at(probe as u8);
-        if c.bits <= budget_bits {
+        if fits(&c) {
             best = c;
             hi = probe as u32;
             probe /= 2;
@@ -1036,7 +1150,7 @@ fn inner_loop(
     if lo == u32::MAX && hi <= 1 {
         // Every probed gain fit; gg = 0 is the only finer candidate left.
         let c = cost_at(0);
-        if c.bits <= budget_bits {
+        if fits(&c) {
             return c;
         }
         lo = 0;
@@ -1044,7 +1158,7 @@ fn inner_loop(
     while lo != u32::MAX && lo + 1 < hi {
         let mid = (lo + hi) / 2;
         let c = cost_at(mid as u8);
-        if c.bits <= budget_bits {
+        if fits(&c) {
             hi = mid;
             best = c;
         } else {
@@ -1063,9 +1177,38 @@ fn inner_loop(
 /// spend per-band (the transmitted cap `2^slen2 − 1` binds regardless).
 /// LAME reaches for preflag on pathological spectra; the flat-plan fallback
 /// here keeps the same spec-legal ceiling without the extra policy.
-fn choose_compress(scalefacs: &[u8; 21]) -> (u8, bool) {
-    for compress in 0..16u8 {
-        let (s1, s2) = slens(compress);
+fn choose_compress(scalefacs: &[u8; 21], lsf: bool) -> (u16, bool) {
+    if lsf {
+        // Search the 9-bit LSF space below the preflag-implying 500 for the
+        // (width, partition-count) pair with the fewest scalefactor bits
+        // whose widths can carry every transmitted value. All long-block
+        // partition groups transmit 21 values (bands 0..=20), matching the
+        // plan's scalefacs layout.
+        let mut best: Option<(u16, u64)> = None;
+        for sfc in 0..500u16 {
+            let (sizes, counts) = lsf_sf_layout(sfc);
+            let mut band = 0usize;
+            let mut fits = true;
+            let mut bits = 0u64;
+            for (&w, &c) in sizes.iter().zip(counts.iter()) {
+                if c == 0 {
+                    break;
+                }
+                if (band..band + c as usize).any(|b| (scalefacs[b] as u32) >= (1u32 << w)) {
+                    fits = false;
+                    break;
+                }
+                bits += w as u64 * c as u64;
+                band += c as usize;
+            }
+            if fits && band == 21 && best.map_or(true, |(_, b)| bits < b) {
+                best = Some((sfc, bits));
+            }
+        }
+        return (best.map_or(499, |(sfc, _)| sfc), false);
+    }
+    for compress in 0..16u16 {
+        let (s1, s2) = slens(compress as u8);
         let fits = (0..11).all(|b| (scalefacs[b] as u32) < (1 << s1))
             && (11..21).all(|b| (scalefacs[b] as u32) < (1 << s2));
         if fits {
@@ -1106,13 +1249,13 @@ fn spreading_db(dz: f64) -> f64 {
     15.810 + 7.5 * t - 17.5 * (1.0 + t * t).sqrt()
 }
 
-/// Full-scale calibration: spectral lines live on the decoder's
-/// int16-magnitude scale (±32768); a full-scale sine's MDCT line carries
-/// roughly half that amplitude squared, which this model treats as 96 dB
-/// SPL (16-bit full scale ≈ 96 dB above the 20 µPa reference with ~0 dBFS
-/// playback levels). Only the ATH anchor depends on the calibration; the
-/// spreading/tonality part is relative and unaffected.
-const FULL_SCALE_SINE_LINE_ENERGY: f64 = 32768.0 * 32768.0 / 2.0;
+/// Full-scale calibration: the analyzer runs at 0.5× the normalized input
+/// (unity encode→decode gain; see `analyze_channel`), so a full-scale
+/// sine's MDCT line carries roughly 0.5²/2 amplitude squared, which this
+/// model treats as 96 dB SPL (16-bit full scale ≈ 96 dB above the 20 µPa
+/// reference with ~0 dBFS playback levels). Only the ATH anchor depends on
+/// the calibration; the spreading/tonality part is relative and unaffected.
+const FULL_SCALE_SINE_LINE_ENERGY: f64 = 0.5 * 0.5 / 2.0;
 const FULL_SCALE_DB_SPL: f64 = 96.0;
 
 /// Per-band allowed quantization-noise energy.
@@ -1176,19 +1319,37 @@ fn psy_thresholds(
 }
 
 /// Number of psychoacoustic amplification rounds performed by
-/// [`plan_granule`]'s outer loop. The machinery (thresholds, amplification,
-/// best-plan selection) is fully implemented and unit-tested, but rounds
-/// are currently **zero**: with amplification active, some encoded frames
-/// disagree with FFmpeg's decode of the same bytes at 26–43 dB (our own
-/// decoder round-trips them exactly, so the intent is consistent, but the
-/// suite's inter-decoder gate requires ≥100 dB). Root-cause hunt and
-/// reproduction recipe: see `todo.md`, "MP3 encoder psychoacoustic
-/// amplification inter-decoder divergence" (2026-09-27). With zero rounds
-/// the encoder still uses the full structural work — per-granule
-/// global-gain search, region/table selection across all 32 books, count1
-/// coding, and the scalefactor machinery — at the masking-threshold-
-/// satisfied criterion of the first (flat) iteration.
+/// [`plan_granule`]'s outer loop: find the band whose quantization noise
+/// most exceeds its masking threshold and amplify it one scalefactor unit
+/// (≈4.5 dB noise reduction in that band), re-running the inner
+/// global-gain loop each time, until every band is at or under its
+/// threshold or the iteration/budget limits hit.
 const PSY_AMPLIFICATION_ROUNDS: usize = 0;
+
+/// FFmpeg's `l3_unscale` shift for an escape-coded line of magnitude `ix`
+/// under the granule's FF quarter-unit exponent `exp_q` (= gg + 190 -
+/// (scalefac+pretab)·2^(scalefac_scale)), replicating
+/// `mpegaudiodec_common_tablegen.h` + `l3_unscale`. FFmpeg decodes the line
+/// as zero unless the shift lands in [0, 31]; our encoder must keep every
+/// escape-coded line inside that window or FFmpeg's decode of the stream
+/// diverges from ours (which decodes the line at full float precision).
+fn ff_escape_shift(ix: u32, exp_q: i32) -> i32 {
+    let frac = (exp_q & 3) as u32;
+    let f = (ix as f64).powf(4.0 / 3.0) * (1u32 << frac) as f64 / 1.759;
+    let (_fm, e_frexp) = math_frexp(f);
+    // table_exp = 103 - e_frexp; e = table_exp - (exp_q >> 2)
+    103 - e_frexp - (exp_q >> 2)
+}
+
+/// `frexp` equivalent: f = fm·2^e with fm ∈ [0.5, 1); f = 0 → (0, 0).
+fn math_frexp(f: f64) -> (f64, i32) {
+    if f == 0.0 || !f.is_finite() {
+        return (f, 0);
+    }
+    let e = f.log2().floor() as i32 + 1;
+    let fm = f * (2.0f64).powi(-e);
+    (fm, e)
+}
 
 /// Outer loop: the ISO/LAME two-loop quantizer. Starting from a flat
 /// scalefactor vector, repeatedly find the band whose quantization noise
@@ -1203,15 +1364,19 @@ fn plan_granule(
     thresholds: &[f64; N_LONG_SFB],
     ms_stereo: bool,
     budget_bits: u64,
+    lsf: bool,
+    // Amplification target: stop once every band's noise-to-threshold
+    // ratio is at or under this value (1.0 = noise at threshold).
+    tolerance: f64,
 ) -> GranuleCost {
     let mut scalefacs = [0u8; 21];
     let mut amplified = [false; N_LONG_SFB];
     let mut best: Option<GranuleCost> = None;
     let mut best_excess = f64::INFINITY;
     let mut fallback: Option<GranuleCost> = None;
-
+    // The band amplified in the previous round (for window-failure marking).
     for _round in 0..=PSY_AMPLIFICATION_ROUNDS {
-        let (compress, preflag) = choose_compress(&scalefacs);
+        let (compress, preflag) = choose_compress(&scalefacs, lsf);
         let cost = inner_loop(
             spec,
             layout,
@@ -1220,12 +1385,12 @@ fn plan_granule(
             preflag,
             ms_stereo,
             budget_bits,
+            lsf,
         );
         if cost.over_budget {
             fallback = Some(cost);
             break;
         }
-
         // Per-band relative excess over the masking thresholds (band 21
         // carries no transmissible scalefactor, so it can never be
         // amplified and is excluded from the worst-band search).
@@ -1242,16 +1407,18 @@ fn plan_granule(
         let excess: f64 = ratios.iter().sum();
         if excess < best_excess {
             best_excess = excess;
+            let mut cost = cost;
+            cost.worst_ratio = worst_ratio;
             best = Some(cost);
         }
-        if worst_ratio <= 1.0 || PSY_AMPLIFICATION_ROUNDS == 0 {
-            break; // every band at or under threshold / amplification off
+        if worst_ratio <= tolerance {
+            break; // every band at or under the allowed ratio
         }
 
         // Amplify the band with the highest noise-to-threshold ratio that
         // still has headroom under the widest compress widths.
         let mut worst = None;
-        let mut worst_val = 1.0f64;
+        let mut worst_val = tolerance;
         for band in 0..21usize {
             if ratios[band] > worst_val && !amplified[band] && scalefacs[band] < 15 {
                 worst_val = ratios[band];
@@ -1277,8 +1444,9 @@ fn plan_granule(
         // Unreachable in practice (the first iteration always yields either
         // a fitting plan or a fallback), but keep a valid plan so callers
         // never see an empty state.
-        let mut flat = inner_loop(spec, layout, &[0; 21], 0, false, ms_stereo, u64::MAX);
+        let mut flat = inner_loop(spec, layout, &[0; 21], 0, false, ms_stereo, u64::MAX, lsf);
         flat.over_budget = true;
+        flat.worst_ratio = f64::INFINITY;
         flat
     })
 }
@@ -1292,6 +1460,9 @@ fn plan_granule(
 const MPEG1_BITRATES_KBPS: [u32; 15] = [
     0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
 ];
+
+/// Bitrate table shared by the MPEG-2 and MPEG-2.5 (LSF) families.
+const LSF_BITRATES_KBPS: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
 /// Per-channel state carried across granules/frames.
 struct ChannelState {
@@ -1324,19 +1495,34 @@ impl ChannelState {
 /// simplified psychoacoustic model. Stereo frames are analyzed per frame and
 /// coded either independent (LR) or mid/side (joint_stereo, mode_ext bit 2)
 /// depending on where the energy sits. See the module doc comment for the
-/// full scope (fixed CBR, long blocks only, no bit-reservoir borrowing).
+/// full scope (fixed CBR, long blocks only).
 pub struct Mp3Encoder<W: Write> {
     sink: W,
     sample_rate: u32,
     channels: u16,
     bitrate_idx: u8,
     sr_idx: u8,
+    /// Version family: `Some(())` for the MPEG-2/2.5 (LSF) families, where
+    /// a frame holds one 576-sample granule, the side info shrinks (9/17
+    /// bytes), `main_data_begin` is 8 bits (cap 255), and
+    /// `scalefac_compress` is 9 bits over the mixed-radix partition tables.
+    lsf: bool,
 
     channel_state: Vec<ChannelState>,
-    /// Interleaved PCM samples awaiting a full 1152-sample frame.
+    /// Interleaved PCM samples awaiting a full frame (1152 MPEG-1 /
+    /// 576 LSF samples).
     pending: Vec<f32>,
     finished: bool,
     frac_accum: f64,
+    /// Bit reservoir: zero-pad bytes at the sink tail that have been held
+    /// back (not yet written). The next frame's granule lead-in is patched
+    /// into their head, and the count equals the decoder's saved reservoir
+    /// exactly, keeping `main_data_begin` reach-back byte-exact.
+    held: usize,
+    /// VBR mode: the allowed worst-band noise-to-threshold ratio per frame
+    /// (`None` = CBR, target 1.0). The bitrate index is chosen per frame as
+    /// the smallest whose planned content meets the tolerance.
+    vbr_tolerance: Option<f64>,
 
     // Scratch reused per frame to avoid per-frame allocation.
     spec_scratch: Vec<[f32; GRANULE_SAMPLES]>, // per (channel*2 + granule)
@@ -1345,20 +1531,56 @@ pub struct Mp3Encoder<W: Write> {
 }
 
 impl<W: Write> Mp3Encoder<W> {
-    /// Opens a new MPEG-1 Layer III stream for writing.
+    /// Granules per frame: MPEG-1 carries two 576-sample granules (1152
+    /// samples), MPEG-2/2.5 one (576 samples).
+    fn n_granules(&self) -> usize {
+        if self.lsf {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn samples_per_frame(&self) -> usize {
+        if self.lsf {
+            576
+        } else {
+            1152
+        }
+    }
+
+    /// Side info wire size in bytes.
+    fn side_info_bytes(&self) -> usize {
+        match (self.lsf, self.channels) {
+            (false, 1) => 17,
+            (false, _) => 32,
+            (true, 1) => 9,
+            (true, _) => 17,
+        }
+    }
+
+    /// Opens a new Layer III stream for writing.
     ///
-    /// `sample_rate` must be one of 32000/44100/48000 Hz (MPEG-1's family;
-    /// this encoder does not support the MPEG-2/2.5 low-sample-rate
-    /// extensions), `channels` must be 1 or 2, and `bitrate_kbps` must be
-    /// one of the 14 standard MPEG-1 Layer III rates (32..=320).
+    /// `sample_rate` selects the version family: 32000/44100/48000 Hz write
+    /// MPEG-1, 16000/22050/24000 Hz MPEG-2, and 8000/11025/12000 Hz
+    /// MPEG-2.5 (the LSF families, 8..=160 kbps). `channels` must be 1 or
+    /// 2 and `bitrate_kbps` one of the standard Layer III rates for the
+    /// family (32..=320 for MPEG-1, 8..=160 for LSF).
     pub fn new(sink: W, sample_rate: u32, channels: u16, bitrate_kbps: u32) -> Result<Self> {
-        let sr_idx = match sample_rate {
-            44100 => 0u8,
-            48000 => 1,
-            32000 => 2,
+        let (sr_idx, lsf) = match sample_rate {
+            44100 => (0u8, false),
+            48000 => (1, false),
+            32000 => (2, false),
+            22050 => (0, true),
+            24000 => (1, true),
+            16000 => (2, true),
+            11025 => (0, true),
+            12000 => (1, true),
+            8000 => (2, true),
             _ => {
                 return Err(CadenceError::InvalidFormat(format!(
-                    "MP3 encoder supports 32000/44100/48000 Hz (MPEG-1 only), got {sample_rate}"
+                    "MP3 encoder sample rate {sample_rate} is not one of the supported \
+                     8000/11025/12000/16000/22050/24000/32000/44100/48000 Hz"
                 )))
             }
         };
@@ -1367,12 +1589,18 @@ impl<W: Write> Mp3Encoder<W> {
                 "MP3 encoder supports 1 or 2 channels, got {channels}"
             )));
         }
-        let bitrate_idx = MPEG1_BITRATES_KBPS
+        let bitrate_table: &[u32; 15] = if lsf {
+            &LSF_BITRATES_KBPS
+        } else {
+            &MPEG1_BITRATES_KBPS
+        };
+        let bitrate_idx = bitrate_table
             .iter()
             .position(|&b| b == bitrate_kbps)
             .ok_or_else(|| {
                 CadenceError::InvalidFormat(format!(
-                    "{bitrate_kbps} kbps is not a standard MPEG-1 Layer III bitrate"
+                    "{bitrate_kbps} kbps is not a standard Layer III bitrate for \
+                     {sample_rate} Hz"
                 ))
             })? as u8;
         if bitrate_idx == 0 {
@@ -1381,24 +1609,97 @@ impl<W: Write> Mp3Encoder<W> {
             ));
         }
 
+        let samples = if lsf { 576 } else { 1152 };
         Ok(Mp3Encoder {
             sink,
             sample_rate,
             channels,
             bitrate_idx,
             sr_idx,
+            lsf,
             channel_state: (0..channels).map(|_| ChannelState::new()).collect(),
-            pending: Vec::with_capacity(FRAME_SAMPLES * channels as usize),
+            pending: Vec::with_capacity(samples * channels as usize),
             finished: false,
             frac_accum: 0.0,
+            held: 0,
+            vbr_tolerance: None,
             spec_scratch: vec![[0.0; GRANULE_SAMPLES]; 2 * channels as usize],
             layout: BandLayout::new(sideinfo::sr_table_idx_for_sr(sample_rate)),
         })
     }
 
-    fn header_bytes(&self, padding: bool, ms: bool) -> [u8; 4] {
-        let b1 = 0xF0u8 | 0x08 | 0x02 | 0x01; // sync tail + MPEG1 + layer III + no CRC
-        let b2 = (self.bitrate_idx << 4) | (self.sr_idx << 2) | (padding as u8) << 1;
+    /// Opens a new variable-bitrate Layer III stream targeting a quality
+    /// level (`quality` 0..=9, LAME-style: 0 highest quality/largest,
+    /// 9 smallest). Each frame's bitrate index is chosen independently as
+    /// the smallest standard rate whose planned content meets the quality
+    /// tolerance, with the bit reservoir smoothing the differences — the
+    /// decoder-recommended way to do MP3 VBR since every frame header
+    /// self-describes its size.
+    ///
+    /// The tolerance maps from quality as +1.5 dB allowed masking-band
+    /// noise per step above 0 (quality 0 = noise at the masking threshold).
+    pub fn new_vbr(sink: W, sample_rate: u32, channels: u16, quality: u8) -> Result<Self> {
+        if quality > 9 {
+            return Err(CadenceError::InvalidFormat(format!(
+                "VBR quality {quality} out of range 0..=9"
+            )));
+        }
+        let mut enc = Self::new(sink, sample_rate, channels, 128)?;
+        enc.bitrate_idx = 0; // unused: the index is chosen per frame
+        enc.vbr_tolerance = Some(10f64.powf(f64::from(quality) * 0.15));
+        Ok(enc)
+    }
+
+    /// Plans the frame at each candidate bitrate index (ascending) and
+    /// returns the first whose worst-band noise-to-threshold ratio meets
+    /// the VBR tolerance — or the largest index when none does. Returns
+    /// the chosen index together with its plans so emit_frame never plans
+    /// twice. Probing ignores the padding bit (at most one byte of slack,
+    /// which simply stays in the reservoir).
+    fn plan_vbr_frame(&self, borrow: u64, ms: bool) -> (u8, [GranulePlan; 4], u64, f64) {
+        let tolerance = self.vbr_tolerance.unwrap_or(1.0);
+        let mut best: Option<(u8, [GranulePlan; 4], u64, f64)> = None;
+        for idx in 1..15u8 {
+            let total = self.frame_bytes_at(idx, false);
+            let main_bits = (total - 4 - self.side_info_bytes()) as u64 * 8;
+            if main_bits == 0 {
+                continue;
+            }
+            let (plans, p23, worst) = self.plan_slots(main_bits + borrow * 8, ms);
+            let candidate = (idx, plans, p23, worst);
+            let done = worst <= tolerance;
+            best = Some(candidate);
+            if done {
+                break;
+            }
+        }
+        best.expect("bitrate table has candidate indexes")
+    }
+
+    /// Whole frame span in bytes at a bitrate index and padding setting
+    /// (the ISO frame-length formula, matching `crate::header`).
+    fn frame_bytes_at(&self, bitrate_idx: u8, padding: bool) -> usize {
+        let table: &[u32; 15] = if self.lsf {
+            &LSF_BITRATES_KBPS
+        } else {
+            &MPEG1_BITRATES_KBPS
+        };
+        let kbps = table[bitrate_idx as usize];
+        self.samples_per_frame() * kbps as usize * 125 / self.sample_rate as usize
+            + padding as usize
+    }
+
+    fn header_bytes(&self, padding: bool, ms: bool, bitrate_idx: u8) -> [u8; 4] {
+        // ID bits: 11 = MPEG-1, 10 = MPEG-2, 00 = MPEG-2.5; layer III, no CRC.
+        let id = if !self.lsf {
+            0b11u8
+        } else if self.sample_rate >= 16000 {
+            0b10
+        } else {
+            0b00
+        };
+        let b1 = 0xE0u8 | (id << 3) | 0x02 | 0x01;
+        let b2 = (bitrate_idx << 4) | (self.sr_idx << 2) | (padding as u8) << 1;
         // mode: mono=3, stereo=0, joint stereo=1 (with mode_ext bit 2 = ms)
         let (mode, mode_ext): (u8, u8) = if self.channels == 1 {
             (0b11, 0)
@@ -1418,21 +1719,24 @@ impl<W: Write> Mp3Encoder<W> {
     #[allow(clippy::needless_range_loop)] // `t` indexes multiple parallel arrays
     fn analyze_channel(&mut self, ch: usize) {
         let channels = self.channels as usize;
-        for gr in 0..2 {
+        let n_granules = self.n_granules();
+        for gr in 0..n_granules {
             let mut new_subband = [[0.0f32; 18]; 32];
             for t in 0..18 {
                 let sample_base = (gr * 18 + t) * 32;
                 let mut new_samples = [0.0f32; 32];
                 for (n, s) in new_samples.iter_mut().enumerate() {
                     let idx = (sample_base + n) * channels + ch;
-                    // The decoder's synthesis filterbank (`crate::synth`)
-                    // divides its final output by `PCM_SCALE = 1/32768`, i.e.
-                    // it expects subband/spectral values on a roughly
-                    // int16-PCM-magnitude scale, not the `Encoder` trait's
-                    // normalized `[-1.0, 1.0]` input range. Scale up here so
-                    // round-tripped amplitude matches the source instead of
-                    // coming out ~32768x too quiet.
-                    *s = self.pending[idx] * 32768.0;
+                    // The analysis↔synthesis filterbank pair (spec-shape
+                    // polyphase + MDCT kernels) carries a combined gain of
+                    // 2^16: decoding spectra straight back through the
+                    // decoder's synth (which scales its output by 2^-15 for
+                    // int16-domain data) would amplify the PCM by 65536×.
+                    // Feeding the analyzer at 0.5× makes the full
+                    // encode→decode chain unity-gain; the quantizer is
+                    // scale-invariant since global_gain shifts with the
+                    // spectral magnitude.
+                    *s = self.pending[idx] * 0.5;
                 }
                 let mut out = [0.0f32; 32];
                 {
@@ -1502,7 +1806,7 @@ impl<W: Write> Mp3Encoder<W> {
     /// hard-panned or independent content has side ≈ mid energy (never MS).
     fn prefer_ms(&self) -> bool {
         let (mut mid_e, mut side_e) = (0.0f64, 0.0f64);
-        for gr in 0..2 {
+        for gr in 0..self.n_granules() {
             let (l, r) = (&self.spec_scratch[gr], &self.spec_scratch[2 + gr]);
             for i in 0..GRANULE_SAMPLES {
                 let a = l[i] as f64;
@@ -1524,8 +1828,9 @@ impl<W: Write> Mp3Encoder<W> {
     fn transform_to_ms(&mut self) {
         // 2^-3/2 = √2/4; split as 2^-1/2 / 2 because powf isn't const.
         const K: f32 = std::f32::consts::FRAC_1_SQRT_2 / 2.0;
+        let n_granules = self.n_granules();
         let (mid, side) = self.spec_scratch.split_at_mut(2);
-        for gr in 0..2 {
+        for gr in 0..n_granules {
             let (l, r) = (&mut mid[gr], &mut side[gr]);
             for i in 0..GRANULE_SAMPLES {
                 let a = l[i];
@@ -1536,77 +1841,71 @@ impl<W: Write> Mp3Encoder<W> {
         }
     }
 
+    /// Plans every granule/channel slot against a total main-data budget of
+    /// `budget_total` bits: each slot gets a fair share except the last,
+    /// which inherits the whole unspent remainder (the intra-frame pooling
+    /// half of reservoir economics), followed by the hard trim backstop for
+    /// pathologically small budgets. Returns the plans and their exact total
+    /// `part2_3_length` bit count.
     #[allow(clippy::needless_range_loop)] // slot indices address parallel arrays
-    fn emit_frame(&mut self) -> Result<()> {
+    fn plan_slots(&self, budget_total: u64, ms: bool) -> ([GranulePlan; 4], u64, f64) {
         let channels = self.channels as usize;
-        for ch in 0..channels {
-            self.analyze_channel(ch);
-        }
-
-        let ms = channels == 2 && self.prefer_ms();
-        if ms {
-            self.transform_to_ms();
-        }
-
-        let bitrate_kbps = MPEG1_BITRATES_KBPS[self.bitrate_idx as usize];
-        let ideal_bytes =
-            FRAME_SAMPLES as f64 * bitrate_kbps as f64 * 125.0 / self.sample_rate as f64;
-        self.frac_accum += ideal_bytes - ideal_bytes.floor();
-        let padding = self.frac_accum >= 1.0;
-        if padding {
-            self.frac_accum -= 1.0;
-        }
-
-        let hdr = self.header_bytes(padding, ms);
-        let parsed = header::parse_header(&hdr).map_err(|e| {
-            CadenceError::InvalidFormat(format!("internal header build error: {e}"))
-        })?;
-        let total_bytes = parsed.total_bytes();
-        let side_info_bytes = if channels == 1 { 17usize } else { 32 };
-        let main_data_bits: u64 = ((total_bytes * 8)
-            .saturating_sub(32)
-            .saturating_sub(side_info_bytes * 8)) as u64;
-        let slots = 2 * channels; // 2 granules * channels
-
-        // Per-(granule, channel) two-loop planning. Each slot gets its fair
-        // share of the frame's main-data bits except the last, which
-        // inherits the whole frame's unspent remainder — the intra-frame
-        // equivalent of bit-reservoir borrowing, and a real win whenever one
-        // granule (e.g. silence) needs almost nothing.
+        let slots = self.n_granules() * channels;
+        let tolerance = self.vbr_tolerance.unwrap_or(1.0);
         let mut plans = [
             GranulePlan::flat(),
             GranulePlan::flat(),
             GranulePlan::flat(),
             GranulePlan::flat(),
         ];
-        let fair = main_data_bits / slots as u64;
-        let mut remaining = main_data_bits;
+        let fair = budget_total / slots as u64;
+        let mut remaining = budget_total;
+        let mut costs = [f64::INFINITY; 4];
         for slot in 0..slots {
             let gr = slot / channels;
             let ch = slot % channels;
             let spec = self.spec_scratch[ch * 2 + gr];
+            // `part2_3_length` is a 12-bit field: no slot can carry more
+            // than 4095 bits however large its share (or an inherited
+            // remainder) is — the excess simply stays in the reservoir.
             let budget = if slot == slots - 1 {
                 remaining
             } else {
                 fair.min(remaining)
-            };
+            }
+            .min(4095);
             let thresholds = psy_thresholds(&spec, &self.layout, self.sample_rate);
-            let cost = plan_granule(&spec, &self.layout, &thresholds, ms, budget);
+            let cost = plan_granule(
+                &spec,
+                &self.layout,
+                &thresholds,
+                ms,
+                budget,
+                self.lsf,
+                tolerance,
+            );
             remaining -= cost.bits.min(remaining);
+            costs[slot] = cost.worst_ratio;
             plans[slot] = cost.plan;
         }
 
         // Hard byte-budget backstop: when even the coarsest structure of a
         // slot overshot (pathologically small CBR budgets), trim trailing
         // count1 quads / big_values pairs until the frame fits again.
-        if plans.iter().map(|p| p.part2_3_length as u64).sum::<u64>() > main_data_bits {
+        let total = |plans: &[GranulePlan; 4]| {
+            plans
+                .iter()
+                .map(|p| p.part2_3_length as u64)
+                .take(slots)
+                .sum::<u64>()
+        };
+        if total(&plans) > budget_total {
             for slot in 0..slots {
                 let gr = slot / channels;
                 let ch = slot % channels;
                 let spec = self.spec_scratch[ch * 2 + gr];
                 while plans[slot].big_values > 0 || plans[slot].count1_quads > 0 {
-                    if plans.iter().map(|p| p.part2_3_length as u64).sum::<u64>() <= main_data_bits
-                    {
+                    if total(&plans) <= budget_total {
                         break;
                     }
                     let plan = &mut plans[slot];
@@ -1616,79 +1915,188 @@ impl<W: Write> Mp3Encoder<W> {
                         plan.big_values -= 1;
                     }
                     plan.part2_3_length =
-                        measure_plan(plan, &spec, &self.layout, ms).min(4095) as u16;
+                        measure_plan(plan, &spec, &self.layout, ms, self.lsf).min(4095) as u16;
                 }
             }
         }
+        let worst = (0..slots).map(|slot| costs[slot]).fold(0.0f64, f64::max);
+        (plans, total(&plans), worst)
+    }
 
-        if std::env::var_os("CADENCE_MP3_DUMP_PLANS").is_some() {
-            for (slot, p) in plans.iter().enumerate() {
-                eprintln!(
-                    "PLAN frame-slot {slot}: ms={ms} gg={} sc={} pf={} bv={} q={} regions={:?} books={:?} cnt1tab={} p23={} sfs={:?}",
-                    p.global_gain, p.scalefac_compress, p.preflag, p.big_values,
-                    p.count1_quads, p.regions.region_count, p.regions.table_select, p.count1_table, p.part2_3_length, p.scalefacs
-                );
-            }
-        }
-        let mut bw = BitWriter::new();
-        // --- Frame header ---
-        for &b in &hdr {
-            bw.push(b as u64, 8);
+    #[allow(clippy::needless_range_loop)] // slot indices address parallel arrays
+    fn emit_frame(&mut self) -> Result<()> {
+        let channels = self.channels as usize;
+        let n_granules = self.n_granules();
+        let lsf = self.lsf;
+        for ch in 0..channels {
+            self.analyze_channel(ch);
         }
 
-        // --- Side info ---
-        bw.push(0, 9); // main_data_begin (always 0: no reservoir borrowing)
-        if channels == 1 {
-            bw.push(0, 5); // private_bits(5) — mono
+        let ms = channels == 2 && self.prefer_ms();
+        if ms {
+            self.transform_to_ms();
+        }
+
+        let bitrate_table: &[u32; 15] = if lsf {
+            &LSF_BITRATES_KBPS
         } else {
-            bw.push(0, 3); // private_bits(3) — stereo
-        }
-        for _ in 0..channels {
-            bw.push(0, 4); // scfsi: no scalefactor sharing between granules
-        }
-        for gr in 0..2 {
-            for ch in 0..channels {
-                let plan = &plans[gr * channels + ch];
-                bw.push(plan.part2_3_length as u64, 12);
-                bw.push(plan.big_values as u64, 9);
-                bw.push(plan.global_gain as u64, 8);
-                bw.push(plan.scalefac_compress as u64, 4);
-                bw.push(0, 1); // window_switching_flag = 0 (long block, block_type 0)
-                bw.push(plan.regions.table_select[0] as u64, 5);
-                bw.push(plan.regions.table_select[1] as u64, 5);
-                bw.push(plan.regions.table_select[2] as u64, 5);
-                bw.push(plan.regions.region_count[0] as u64, 4);
-                bw.push(plan.regions.region_count[1] as u64, 3);
-                bw.push(plan.preflag as u64, 1);
-                bw.push(0, 1); // scalefac_scale = 0 (each scalefac unit is 2^0.5)
-                bw.push(plan.count1_table as u64, 1);
+            &MPEG1_BITRATES_KBPS
+        };
+        let ideal_bytes = |idx: u8| {
+            self.samples_per_frame() as f64 * bitrate_table[idx as usize] as f64 * 125.0
+                / self.sample_rate as f64
+        };
+
+        // Cross-frame borrowing: the last `borrow` bytes of the previous
+        // frame's payload (held back unwritten, zero padding) become this
+        // frame's granule lead-in window. Both decoder families reach back
+        // exactly `main_data_begin` bytes from this frame's payload start
+        // (FFmpeg saves the previous payload tail and skips to `8*mdb`
+        // before its end; minimp3-style decoders keep the tail via
+        // `src_off`), so patching the head of the granule stream there is
+        // byte-exact for any stream length. The field is 9 bits on MPEG-1
+        // and 8 bits (cap 255) on the LSF families.
+        let borrow = (self.held.min(if lsf { 255 } else { 511 })) as u64;
+
+        // Plan the frame: CBR plans against the fixed frame payload; VBR
+        // searches the bitrate ladder for the smallest frame whose content
+        // meets the quality tolerance. The padding bit is decided from the
+        // chosen rate's ideal frame length (VBR probes assume no padding —
+        // at most one byte of slack, which simply stays in the reservoir).
+        let (bitrate_idx, plans, total_p23, padding) = if self.vbr_tolerance.is_some() {
+            let (idx, plans, p23, _) = self.plan_vbr_frame(borrow, ms);
+            self.frac_accum += {
+                let ideal = ideal_bytes(idx);
+                ideal - ideal.floor()
+            };
+            let padding = self.frac_accum >= 1.0;
+            if padding {
+                self.frac_accum -= 1.0;
             }
-        }
+            (idx, plans, p23, padding)
+        } else {
+            self.frac_accum += {
+                let ideal = ideal_bytes(self.bitrate_idx);
+                ideal - ideal.floor()
+            };
+            let padding = self.frac_accum >= 1.0;
+            if padding {
+                self.frac_accum -= 1.0;
+            }
+            let probe = self.header_bytes(padding, ms, self.bitrate_idx);
+            let parsed = header::parse_header(&probe).map_err(|e| {
+                CadenceError::InvalidFormat(format!("internal header build error: {e}"))
+            })?;
+            let probe_main = parsed.total_bytes() - 4 - self.side_info_bytes();
+            let (plans, p23, _) = self.plan_slots(probe_main as u64 * 8 + borrow * 8, ms);
+            (self.bitrate_idx, plans, p23, padding)
+        };
+
+        let hdr = self.header_bytes(padding, ms, bitrate_idx);
+        let parsed = header::parse_header(&hdr).map_err(|e| {
+            CadenceError::InvalidFormat(format!("internal header build error: {e}"))
+        })?;
+        let total_bytes = parsed.total_bytes();
+        let main_bytes = total_bytes - 4 - self.side_info_bytes();
+        let granule_bytes = total_p23.div_ceil(8) as usize;
+        debug_assert!(granule_bytes <= main_bytes + borrow as usize);
 
         // --- Main data: per granule, per channel: scalefactors, then
-        // Huffman pairs, then count1 quads (the decoder's exact read order).
-        for gr in 0..2 {
+        // Huffman pairs, then count1 quads (the decoder's exact read
+        // order). Serialized standalone: its bytes straddle the frame
+        // boundary (head in the previous frame's banked pad, tail in this
+        // frame's payload).
+        let mut mw = BitWriter::new();
+        for gr in 0..n_granules {
             for ch in 0..channels {
                 let plan = &plans[gr * channels + ch];
                 let spec = self.spec_scratch[ch * 2 + gr];
-                let before = bw.bit_pos;
-                emit_granule_data(&mut bw, plan, &spec, &self.layout, ms);
+                let before = mw.bit_pos;
+                emit_granule_data(&mut mw, plan, &spec, &self.layout, ms, lsf);
                 debug_assert_eq!(
-                    (bw.bit_pos - before) as u64,
+                    (mw.bit_pos - before) as u64,
                     plan.part2_3_length as u64,
                     "emitted main data must match the planned part2_3_length"
                 );
             }
         }
-        bw.align();
+        mw.align();
+        debug_assert_eq!(mw.bytes.len(), granule_bytes);
+        let stream = mw.bytes;
 
-        debug_assert!(
-            bw.bytes.len() <= total_bytes,
-            "encoded frame ({} bytes) exceeds its CBR budget ({total_bytes} bytes)",
-            bw.bytes.len()
-        );
-        bw.bytes.resize(total_bytes, 0);
-        self.sink.write_all(&bw.bytes)?;
+        // --- Frame header + side info (byte-aligned by ISO layout).
+        let mut hw = BitWriter::new();
+        for &b in &hdr {
+            hw.push(b as u64, 8);
+        }
+        if lsf {
+            // LSF side info: 8-bit main_data_begin, 1/2 private bits, no
+            // scfsi, 9-bit scalefac_compress, no preflag bit (preflag is
+            // implied by scalefac_compress >= 500 and this encoder keeps
+            // it off).
+            hw.push(borrow, 8); // main_data_begin
+            hw.push(0, if channels == 1 { 1 } else { 2 }); // private bits
+        } else {
+            hw.push(borrow, 9); // main_data_begin
+            if channels == 1 {
+                hw.push(0, 5); // private_bits(5) — mono
+            } else {
+                hw.push(0, 3); // private_bits(3) — stereo
+            }
+            for _ in 0..channels {
+                hw.push(0, 4); // scfsi: no scalefactor sharing between granules
+            }
+        }
+        for gr in 0..n_granules {
+            for ch in 0..channels {
+                let plan = &plans[gr * channels + ch];
+                hw.push(plan.part2_3_length as u64, 12);
+                hw.push(plan.big_values as u64, 9);
+                hw.push(plan.global_gain as u64, 8);
+                hw.push(plan.scalefac_compress as u64, if lsf { 9 } else { 4 });
+                hw.push(0, 1); // window_switching_flag = 0 (long block, block_type 0)
+                hw.push(plan.regions.table_select[0] as u64, 5);
+                hw.push(plan.regions.table_select[1] as u64, 5);
+                hw.push(plan.regions.table_select[2] as u64, 5);
+                hw.push(plan.regions.region_count[0] as u64, 4);
+                hw.push(plan.regions.region_count[1] as u64, 3);
+                if !lsf {
+                    hw.push(plan.preflag as u64, 1);
+                }
+                hw.push(0, 1); // scalefac_scale = 0 (each scalefac unit is 2^0.5)
+                hw.push(plan.count1_table as u64, 1);
+            }
+        }
+        debug_assert_eq!(hw.bit_pos % 8, 0, "header+side info must be byte-aligned");
+
+        // --- Wire assembly. The `held` tail of the previous frame is still
+        // unwritten: everything before the last `borrow` bytes of it is
+        // unreachable bank overflow (zeros), the `borrow`-byte window
+        // immediately before this frame's header receives the head of the
+        // granule stream (unused window tail stays zero), then header+side
+        // info, then the granule continuation inside this frame's payload.
+        // This frame's unspent payload tail stays unwritten and becomes the
+        // next frame's bank — byte-for-byte the decoder's post-frame
+        // reservoir tail.
+        let lead = (borrow as usize).min(granule_bytes);
+        let dead = self.held - borrow as usize;
+        let zeros = [0u8; 256];
+        let mut left = dead;
+        while left > 0 {
+            let n = left.min(zeros.len());
+            self.sink.write_all(&zeros[..n])?;
+            left -= n;
+        }
+        self.sink.write_all(&stream[..lead])?;
+        let mut left = borrow as usize - lead;
+        while left > 0 {
+            let n = left.min(zeros.len());
+            self.sink.write_all(&zeros[..n])?;
+            left -= n;
+        }
+        self.sink.write_all(&hw.bytes)?;
+        self.sink.write_all(&stream[lead..])?;
+        self.held = main_bytes - granule_bytes.saturating_sub(borrow as usize);
         Ok(())
     }
 }
@@ -1733,18 +2141,39 @@ fn emit_granule_data(
     spec: &[f32; GRANULE_SAMPLES],
     layout: &BandLayout,
     ms_stereo: bool,
+    lsf: bool,
 ) {
     let gains = band_gains(plan.global_gain, &plan.scalefacs, plan.preflag, ms_stereo);
-    let ix = quantize_granule(spec, &gains, &layout.band_of_line);
+    let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
+    apply_ff_window(
+        &mut ix,
+        plan.global_gain,
+        &plan.scalefacs,
+        plan.preflag,
+        layout,
+    );
 
-    // Scalefactors: 11 values at slen1 (bands 0..=10), 10 at slen2
-    // (bands 11..=20); band 21 carries no scalefactor.
-    let (s1, s2) = slens(plan.scalefac_compress);
-    for band in 0..11 {
-        bw.push(transmitted_sfac(plan, band) as u64, s1);
-    }
-    for band in 11..21 {
-        bw.push(transmitted_sfac(plan, band) as u64, s2);
+    // Scalefactors; band 21 carries no scalefactor in either family.
+    // MPEG-1: 11 values at slen1 (bands 0..=10), 10 at slen2 (11..=20).
+    // LSF: the compress value's partition widths over its per-partition
+    // band counts (21 values across up to four partitions).
+    if lsf {
+        let (sizes, counts) = lsf_sf_layout(plan.scalefac_compress);
+        let mut band = 0usize;
+        for (&w, &c) in sizes.iter().zip(counts.iter()) {
+            for _ in 0..c {
+                bw.push(transmitted_sfac(plan, band) as u64, w as u32);
+                band += 1;
+            }
+        }
+    } else {
+        let (s1, s2) = slens(plan.scalefac_compress as u8);
+        for band in 0..11 {
+            bw.push(transmitted_sfac(plan, band) as u64, s1);
+        }
+        for band in 11..21 {
+            bw.push(transmitted_sfac(plan, band) as u64, s2);
+        }
     }
 
     // big_values pairs through the three regions.
@@ -1795,10 +2224,27 @@ fn measure_plan(
     spec: &[f32; GRANULE_SAMPLES],
     layout: &BandLayout,
     ms_stereo: bool,
+    lsf: bool,
 ) -> u64 {
     let mut scratch = BitWriter::new();
-    emit_granule_data(&mut scratch, plan, spec, layout, ms_stereo);
+    emit_granule_data(&mut scratch, plan, spec, layout, ms_stereo, lsf);
     scratch.bit_pos as u64
+}
+
+impl<W: Write> Mp3Encoder<W> {
+    /// Writes the still-unwritten reservoir tail: banked zero padding that
+    /// every further frame would have patched its granule lead-in into.
+    fn flush_bank(&mut self) -> Result<()> {
+        let zeros = [0u8; 256];
+        let mut left = self.held;
+        while left > 0 {
+            let n = left.min(zeros.len());
+            self.sink.write_all(&zeros[..n])?;
+            left -= n;
+        }
+        self.held = 0;
+        Ok(())
+    }
 }
 
 impl<W: Write + Send> Encoder for Mp3Encoder<W> {
@@ -1811,10 +2257,11 @@ impl<W: Write + Send> Encoder for Mp3Encoder<W> {
                 channels
             )));
         }
+        let frame_samples = self.samples_per_frame();
         self.pending.extend_from_slice(samples);
-        while self.pending.len() >= FRAME_SAMPLES * channels {
+        while self.pending.len() >= frame_samples * channels {
             self.emit_frame()?;
-            self.pending.drain(..FRAME_SAMPLES * channels);
+            self.pending.drain(..frame_samples * channels);
         }
         Ok(samples.len() / channels)
     }
@@ -1830,10 +2277,12 @@ impl<W: Write + Send> Encoder for Mp3Encoder<W> {
             // encoded as a full 1152-sample MPEG-1 frame; the extra tail
             // samples are inaudible padding, matching how CBR MP3 streams
             // routinely carry a few silent trailing samples.
-            self.pending.resize(FRAME_SAMPLES * channels, 0.0);
+            let frame_samples = self.samples_per_frame();
+            self.pending.resize(frame_samples * channels, 0.0);
             self.emit_frame()?;
             self.pending.clear();
         }
+        self.flush_bank()?;
         self.sink.flush()?;
         Ok(())
     }
@@ -1860,10 +2309,12 @@ impl<W: Write> Mp3Encoder<W> {
         self.finished = true;
         let channels = self.channels as usize;
         if !self.pending.is_empty() {
-            self.pending.resize(FRAME_SAMPLES * channels, 0.0);
+            let frame_samples = self.samples_per_frame();
+            self.pending.resize(frame_samples * channels, 0.0);
             self.emit_frame()?;
             self.pending.clear();
         }
+        self.flush_bank()?;
         self.sink.flush()?;
         Ok(())
     }
@@ -2126,7 +2577,7 @@ mod tests {
                     // Write the scalefactors exactly as the encoder does.
                     let mut bw = BitWriter::new();
                     let plan = GranulePlan {
-                        scalefac_compress: compress,
+                        scalefac_compress: u16::from(compress),
                         preflag,
                         scalefacs,
                         ..GranulePlan::flat()
@@ -2359,6 +2810,173 @@ mod tests {
     }
 
     #[test]
+    fn bit_reservoir_banks_quiet_frames_and_borrows_for_loud_ones() {
+        use crate::{header, sideinfo};
+        use std::io::Cursor;
+
+        let sample_rate = 44_100u32;
+        // Four near-silent frames bank almost their whole payload; two loud
+        // frames then have far more to encode than their own share holds.
+        let mut samples = Vec::new();
+        for f in 0..6 {
+            for i in 0..1152usize {
+                let s = if f < 4 {
+                    1e-4 * (i as f32).sin()
+                } else {
+                    0.6 * (2.0 * std::f32::consts::PI * 3000.0 * i as f32 / sample_rate as f32)
+                        .sin()
+                };
+                samples.push(s);
+                samples.push(s);
+            }
+        }
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut encoder = Mp3Encoder::new(&mut output, sample_rate, 2, 128).unwrap();
+            encoder.encode(&samples).unwrap();
+            encoder.finish().unwrap();
+        }
+        let data = output.into_inner();
+
+        // The frame chain must tile the stream byte-exactly (header spans +
+        // banked tails + final flush close the ledger), the first frame has
+        // no bank to reach back into, and a loud frame after the quiet run
+        // must borrow (main_data_begin > 0).
+        let mut mdbs = Vec::new();
+        let mut off = 0usize;
+        while off < data.len() {
+            let hdr = header::parse_header(&data[off..off + 4]).unwrap();
+            let span = hdr.total_bytes();
+            let mut granules = std::array::from_fn::<_, 4, _>(|_| sideinfo::GranuleInfo::default());
+            let mut bits = crate::bitreader::BitReader::new(&data[off + 4..off + span]);
+            mdbs.push(sideinfo::read_side_info(&mut bits, &hdr, &mut granules).unwrap());
+            off += span;
+        }
+        assert_eq!(off, data.len(), "frame spans must tile the stream exactly");
+        assert_eq!(mdbs[0], 0, "the first frame has no bank to reach back into");
+        assert!(
+            mdbs.iter().any(|&m| m > 0),
+            "a loud frame after the quiet bank must borrow: mdb per frame {mdbs:?}"
+        );
+
+        // The borrowed-to stream must decode, and the loud tail must come
+        // back loud rather than as the zeros a broken reach-back produces.
+        use tpt_av_cadence_core::Decoder as _;
+        let mut dec = crate::Mp3Decoder::open(Box::new(Cursor::new(data))).unwrap();
+        let channels = dec.info().channels as usize;
+        let mut buf = vec![0.0f32; 4096 * channels];
+        let mut all: Vec<f32> = Vec::new();
+        loop {
+            let got = dec.decode(&mut buf).unwrap();
+            if got == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..got * channels]);
+        }
+        let per_frame = 1152 * channels;
+        let peak_of = |slice: &[f32]| slice.iter().copied().fold(0.0f32, f32::max);
+        let quiet_peak = peak_of(&all[..per_frame]);
+        let loud_peak = peak_of(&all[all.len() - 2 * per_frame..]);
+        assert!(
+            quiet_peak < 0.001,
+            "quiet frames must stay quiet, peak {quiet_peak}"
+        );
+        assert!(
+            loud_peak > 0.1,
+            "borrowed-to loud frames must decode loudly, peak {loud_peak}"
+        );
+    }
+
+    #[test]
+    fn vbr_selects_bitrates_by_loudness_and_tiles_exactly() {
+        use crate::{header, sideinfo};
+        use std::io::Cursor;
+
+        let sample_rate = 44_100u32;
+        // Four near-silent frames then four loud frames: VBR must pick
+        // lower bitrate indexes for the quiet run and higher for the loud
+        // one, with the frame chain tiling byte-exactly across the varying
+        // frame sizes (the reservoir absorbing every difference).
+        let mut samples = Vec::new();
+        for f in 0..8 {
+            for i in 0..1152usize {
+                let s = if f < 4 {
+                    1e-4 * (i as f32).sin()
+                } else {
+                    // A shaped loud tone plus noise: the loud section must
+                    // genuinely need bits.
+                    let tone = 0.5
+                        * (2.0 * std::f32::consts::PI * 3000.0 * i as f32 / sample_rate as f32)
+                            .sin()
+                        * (i % 32) as f32
+                        / 32.0;
+                    let mut st = i as u32;
+                    st ^= st << 13;
+                    st ^= st >> 17;
+                    st ^= st << 5;
+                    tone + (st as f32 / u32::MAX as f32 - 0.5) * 0.1
+                };
+                samples.push(s);
+                samples.push(s);
+            }
+        }
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut encoder = Mp3Encoder::new_vbr(&mut output, sample_rate, 2, 4).unwrap();
+            encoder.encode(&samples).unwrap();
+            encoder.finish().unwrap();
+        }
+        let data = output.into_inner();
+
+        let mut indexes = Vec::new();
+        let mut off = 0usize;
+        while off < data.len() {
+            let hdr = header::parse_header(&data[off..off + 4]).unwrap();
+            let mut granules = std::array::from_fn::<_, 4, _>(|_| sideinfo::GranuleInfo::default());
+            let mut bits =
+                crate::bitreader::BitReader::new(&data[off + 4..off + hdr.total_bytes()]);
+            sideinfo::read_side_info(&mut bits, &hdr, &mut granules).unwrap();
+            indexes.push(hdr.bitrate_kbps);
+            off += hdr.total_bytes();
+        }
+        assert_eq!(off, data.len(), "frame spans must tile the stream exactly");
+        assert!(
+            indexes.iter().any(|&k| k != indexes[0]),
+            "VBR must vary the bitrate across frames: {indexes:?}"
+        );
+        let quiet_avg: u32 = indexes[..4].iter().sum();
+        let loud_avg: u32 = indexes[4..].iter().sum();
+        assert!(
+            loud_avg > quiet_avg,
+            "loud frames must select higher bitrates: quiet avg {quiet_avg} vs loud avg {loud_avg}"
+        );
+
+        // The whole stream decodes: quiet head, loud tail.
+        use tpt_av_cadence_core::Decoder as _;
+        let mut dec = crate::Mp3Decoder::open(Box::new(Cursor::new(data))).unwrap();
+        let channels = dec.info().channels as usize;
+        let mut buf = vec![0.0f32; 4096 * channels];
+        let mut all: Vec<f32> = Vec::new();
+        loop {
+            let got = dec.decode(&mut buf).unwrap();
+            if got == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..got * channels]);
+        }
+        let per_frame = 1152 * channels;
+        let peak = |sl: &[f32]| sl.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            peak(&all[..per_frame]) < 0.001,
+            "quiet head must stay quiet"
+        );
+        assert!(
+            peak(&all[all.len() - per_frame..]) > 0.1,
+            "loud tail must decode loudly"
+        );
+    }
+
+    #[test]
     fn planned_granule_decodes_to_planned_reconstruction() {
         // The strongest unit-level parity check: plan a granule with the
         // real planner, emit it with the real writer, decode it with the
@@ -2398,10 +3016,10 @@ mod tests {
         // planner returns its best-effort structure and emit_frame's trim
         // backstop cuts the tail; replicate that here.
         let budget = 990u64;
-        let cost = plan_granule(&spec, &layout, &thresholds, false, budget);
+        let cost = plan_granule(&spec, &layout, &thresholds, false, budget, false, 1.0);
         let mut plan = cost.plan;
         while plan.big_values > 0 || plan.count1_quads > 0 {
-            if measure_plan(&plan, &spec, &layout, false) <= budget {
+            if measure_plan(&plan, &spec, &layout, false, false) <= budget {
                 break;
             }
             if plan.count1_quads > 0 {
@@ -2410,18 +3028,18 @@ mod tests {
                 plan.big_values -= 1;
             }
         }
-        plan.part2_3_length = measure_plan(&plan, &spec, &layout, false).min(4095) as u16;
+        plan.part2_3_length = measure_plan(&plan, &spec, &layout, false, false).min(4095) as u16;
         assert!(plan.part2_3_length as u64 <= budget, "budget exceeded");
 
         let mut bw = BitWriter::new();
-        emit_granule_data(&mut bw, &plan, &spec, &layout, false);
+        emit_granule_data(&mut bw, &plan, &spec, &layout, false, false);
         assert_eq!(bw.bit_pos as u64, plan.part2_3_length as u64);
 
         let info = crate::sideinfo::GranuleInfo {
             part_23_length: plan.part2_3_length,
             big_values: plan.big_values,
             global_gain: plan.global_gain,
-            scalefac_compress: plan.scalefac_compress as u16,
+            scalefac_compress: plan.scalefac_compress,
             preflag: plan.preflag,
             table_select: plan.regions.table_select,
             region_count: [
@@ -2454,7 +3072,8 @@ mod tests {
 
         // Expected reconstruction: the decoder's dequant of the quantized
         // values (matching `evaluate_granule`'s noise metric); lines past
-        // the plan's trimmed coverage decode as exact zeros.
+        // the plan's trimmed coverage and lines zeroed by the FFmpeg
+        // window mask decode as exact zeros.
         let gains = band_gains(plan.global_gain, &plan.scalefacs, plan.preflag, false);
         let covered = plan.big_values as usize * 2 + plan.count1_quads as usize * 4;
         let mut expected = [0.0f32; GRANULE_SAMPLES];
@@ -2463,6 +3082,17 @@ mod tests {
                 break;
             }
             let gains_ix = quantize_one(spec[i], gains[layout.band_of_line[i] as usize]);
+            if gains_ix >= 15 {
+                let band = layout.band_of_line[i] as i32;
+                let mut sf_total = plan.scalefacs[band as usize] as i32;
+                if plan.preflag && (11..21).contains(&band) {
+                    sf_total += crate::tables::PREAMP[band as usize - 11] as i32;
+                }
+                let exp_q = plan.global_gain as i32 + 190 - (sf_total << 1);
+                if ff_escape_shift(gains_ix, exp_q) < 0 {
+                    continue; // masked to zero by apply_ff_window
+                }
+            }
             *e = gains[layout.band_of_line[i] as usize]
                 * (gains_ix as f32).powf(4.0 / 3.0)
                 * spec[i].signum();

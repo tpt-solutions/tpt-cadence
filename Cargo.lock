@@ -755,6 +755,7 @@ dependencies = [
  "proptest",
  "tpt-av-cadence-core",
  "tpt-av-cadence-ogg",
+ "tpt-av-cadence-test-utils",
 ]
 
 [[package]]

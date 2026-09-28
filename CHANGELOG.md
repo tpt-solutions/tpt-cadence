@@ -8,6 +8,33 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 ## [Unreleased]
 
 ### Added
+- SILK noise-shaping analysis (`tpt-av-cadence-opus`): a new
+  `silk::noise_shape` module ports
+  `silk_noise_shape_analysis_FLP`, `silk_warped_autocorrelation_FLP` and
+  the `silk_NSQ_wrapper_FLP` float-to-fixed conversion — per-subframe
+  shaping filters from a *frequency-warped* autocorrelation (order 16,
+  5 ms look-ahead, `WARPING_MULTIPLIER` warping, the reference's
+  `warped_gain`/`warped_true2monic_coefs`/`limit_coefs` magnitude
+  limiting), the smoothed spectral tilt and harmonic shaping gain, and the
+  rate/distortion factor `Lambda`. The per-subframe **gains** it produces
+  replace the encoder's frame-level "shaping proxy" and are measured
+  **+0.8 to +1.2 dB SNR** on synthetic speech across 8–48 kbps (8 kbps
+  5.99 -> 6.82, 16 kbps 12.29 -> 13.36, 24 kbps 16.17 -> 17.29, 32 kbps
+  19.30 -> 20.45, 48 kbps 24.53 -> 25.70 dB at 16 kHz/20 ms) for +5-8%
+  payload, with the encoder's simulated reconstruction still bit-identical
+  to the real decoder. New: a frame-RMS-derived `speech_activity_Q8`
+  stand-in (which also feeds the analysis's activity-dependent terms), the
+  5 ms shaping look-ahead region in the encoder's `x_buf` (zero-filled past
+  the frame, which is what the reference reads past the end of a packet),
+  and `smlawt` in `sigproc` (see Fixed).
+  The shaping filter, tilt, harmonic gain and `Lambda` are computed and
+  range-checked but not yet closed into the NSQ's error-feedback loop: both
+  that loop and the RD rate term were implemented and measured, and without
+  the reference's per-frame rate-control loop they cost 8-29 dB (level
+  runaway on non-speech content, payload starvation from the rate term).
+  `todo.md` records the measurements and pairs the work with the
+  rate-control loop.
+
 - MP3 systematic FFmpeg-oracle conformance matrix (`tpt-av-cadence-mp3`):
   with the official ISO/IEC 11172-4 conformance bitstreams still
   unobtainable (re-verified 2026-09-27: mpg123 SVN `test/` only, no
@@ -32,6 +59,122 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   test. Remaining documented oracle gaps: Layer III intensity stereo,
   CRC-protected whole streams (separately covered by `crc_streams.rs`),
   and free-format bitrates.
+- Perceptual quality metrics (`tpt-av-cadence-test-utils`): a shared
+  `quality` module with A-weighted SNR (IEC 61672 error-spectrum
+  weighting via per-segment spectral analysis) and ITU-T P.561-style
+  segmental SNR (per-20 ms SNR clamped to [-10, +35] dB, averaged). The
+  SILK encoder suite gains a perceptual regression test (A-weighted SNR
+  > 10 dB, segmental > 5 dB on shaped speech at 32 kbps), making
+  noise-shaping quality — and any future `silk_NSQ_del_dec` work —
+  measurable beyond waveform SNR.
+- NLSF interpolation search (`tpt-av-cadence-opus`): the SILK encoder
+  now implements `silk_find_LPC_FLP`'s second half — for 20 ms frames
+  with established prediction state, a second Burg run over the last
+  10 ms produces a last-half NLSF vector, and interpolation coefficients
+  k = 3..0 are evaluated by filtering the first 10 ms with the
+  interpolated filter (`silk_interpolate` between the previous quantized
+  NLSF and the last-half NLSF) and comparing first-half residual
+  energies; the winning coefficient (or 4 = no interpolation) is
+  transmitted, and the encoder builds PredCoef[0] from the interpolated
+  NLSF exactly as the decoder reconstructs it. The NSQ's per-subframe
+  A_Q12 selection and rewhitening schedule already handle
+  `LSF_interpolation_flag` (ported with `nsq_ref`).
+- Modified Burg LPC analysis (`tpt-av-cadence-opus`):
+  `src/silk/lpc_analysis.rs` ports `silk/float/burg_modified_FLP.c`
+  exactly — the incremental correlation-row updates (C_first_row /
+  C_last_row / CAf / CAb), the per-order reflection coefficient with the
+  `minInvGain` prediction-gain cap, and the residual-energy fallback
+  when the cap is hit — replacing the autocorrelation+Schur+k2a stand-in
+  in the SILK encoder's LPC analysis (`silk_find_LPC_FLP` structure).
+  The reference conditions the analysis on the previous NLSF vector;
+  the foundation's variant applies the stability cap via `min_inv_gain`
+  (1e-4, ~80 dB max prediction gain) and keeps A2NLSF's own bandwidth
+  expansion, both documented. Payloads at fixed bitrates shift slightly
+  (different LPC residuals change the NSQ excitation), and the bitrate
+  tracking test was rewritten for the now-active per-frame rate control:
+  payloads land on the caller's budget (32 kbps mono → ~80 B ±35%,
+  48 kbps → 120 B ±35%) with a monotonicity check across budgets,
+  replacing the old over-delivery ratio test. The SILK-mode stereo CBR
+  total range extends to 128 kbps (per-channel rate control enforces
+  the budget).
+- Reference 4-band voice-activity detection (`tpt-av-cadence-opus`):
+  `src/silk/vad.rs` ports `silk/VAD.c` exactly — the `silk_ana_filt_bank_1`
+  two-band allpass filterbank cascade (0-1/1-2/2-4/4-8 kHz bands), the
+  differentiator HP filter on the lowest band, per-subframe band energies,
+  `silk_VAD_GetNoiseLevels`' inverse-energy noise smoothing with
+  fast-initial and high-energy update coefficients, the SNR-based
+  `speech_activity_Q8` sigmoid with power scaling, `input_tilt_Q15`, and
+  the per-band `input_quality_bands_Q15` sigmoids. The encoder's
+  `speech_activity_q8` now comes from the VAD (replacing the smoothed
+  frame-RMS stand-in), and `noise_shape_analysis` consumes the real band
+  qualities (previously held at the maximum), so the background-SNR
+  reduction, LF shaping strength, harmonic HP noise, and Lambda all key
+  off the genuine activity/quality measures as the reference intends.
+  Supporting helpers ported: `silk_sigm_Q15`, `silk_lin2log`,
+  `silk_CLZ_FRAC`/`silk_SQRT_APPROX` (`silk/Inlines.h`),
+  `silk_ana_filt_bank_1` (`silk/ana_filt_bank_1.c`). Waveform-SNR floors
+  re-baselined fractionally (the genuine activity measure reads lower
+  than the stand-in on synthetic speech, enabling the intended
+  background-SNR reduction).
+- Reference noise-shaping quantizer + per-frame rate control
+  (`tpt-av-cadence-opus`): the SILK quality-iteration item is closed.
+  `src/silk/nsq_ref.rs` ports `silk/NSQ.c` exactly — `silk_nsq_state`
+  (xq/sLTP_shp_Q14/sLPC_Q14/sAR2 shaping states), the two-candidate
+  `Lambda`-rate-distortion `silk_noise_shape_quantizer` with the full
+  n_AR/n_LF/n_LTP shaping error-feedback loop, the voiced rewhitening
+  path, and `silk_nsq_scale_states`' gain-change adjustments — replacing
+  the foundation's simplified candidate-window quantizer. The encoder's
+  frame encode now runs `silk_encode_frame_FLP`'s per-frame rate-control
+  loop: gains are re-quantized per iteration at a bisected `gainMult`
+  scale (×3/2 up, ×4/5 down, bounds interpolation, Lambda ×1.5 bump with
+  quantizer-offset zeroing when only over-budget attempts are found),
+  measured on a scratch range coder (bit deltas are position-
+  independent), with per-channel state snapshots rolled back between
+  attempts and only the accepted attempt committed. Payloads now land on
+  the caller's bitrate budget instead of ~60-100% over; all existing
+  bit-exactness, SNR, and integration gates pass unchanged. The port's
+  first integration attempt was unstable (inflated payloads, overflow
+  aborts) — root cause was `scale_states` consuming the whole frame
+  instead of the per-subframe slice; fixed and verified via the
+  bit-exactness differential.
+- SILK low-bitrate redundancy / FEC (`tpt-av-cadence-opus`):
+  `SilkEncoder::set_packet_loss_perc` and
+  `OggOpusEncoder::set_packet_loss_perc` implement LBRR encoding — each
+  payload carries re-serialized copies of the previous packet's ACTIVE
+  coded frames (side-info indices + excitation pulses, plus the stereo
+  MS predictor and mid-only flag), written in the decoder's exact
+  normal-decode LBRR skip order (per-channel VAD + packet-LBRR flags,
+  per-frame LBRR flags with the side's flag gated on its coded/mid-only
+  decision, then frame-major / channel-minor with per-channel
+  conditional coding chained along the LBRR flags). The LBRR chain is
+  self-consistent by construction: it ends exactly at the previous
+  packet's last-frame decoder state (`LastGainIndex`, `ec_prev`), so the
+  regular frames' conditional decisions are unaffected. Two reference
+  behaviors pinned during development: LBRR covers ACTIVE frames only
+  (an inactive frame's signal-type symbol has no LBRR encoding — the
+  naive copy underflows the type-symbol arithmetic), and the stored
+  frames serialize from the CBR retry loop's FINAL attempt so the
+  redundancy always matches the emitted payload. Tests: LBRR streams
+  decode bit-identically to non-LBRR streams (regular frames untouched)
+  with ~1.4x packet growth, DTX+LBRR interop, and the full suite.
+- SILK discontinuous transmission (`tpt-av-cadence-opus`):
+  `SilkEncoder::set_dtx` and `OggOpusEncoder::new_silk_dtx` implement the
+  reference's DTX schedule (`silk_Encode`'s `noSpeechCounter`/`inDTX`
+  pair, `NB_SPEECH_FRAMES_BEFORE_DTX` = 10 / `MAX_CONSECUTIVE_DTX` = 20,
+  driven by the mid channel's activity): the first 10 inactive frames are
+  still coded, and once 20 consecutive inactive frames have passed,
+  every-silent packets are emitted as 1-byte packets (TOC byte only) —
+  which decoders answer with comfort-noise generation (this crate's
+  decoder PLC/CNG paths are already exercised by the conformance suite).
+  The input pipeline (resampler, MS transform, history buffering) keeps
+  running through skipped packets, so coding resumes seamlessly when
+  speech returns; a packet is skipped only when EVERY frame is inactive
+  (partial-DTX multi-frame packets are coded in full, since the decoder
+  reads per-frame side info for any packet that carries a payload).
+  Tests: speech→silence→speech streams show 1-byte packets exactly in
+  the deep-silence region (none without DTX, none in the first 20
+  inactive frames), exact sample-count recovery, near-silent CNG decode,
+  post-gap speech energy, and determinism.
 - CBR payload sizing for the SILK encoder (`tpt-av-cadence-opus`):
   `SilkEncoder::set_cbr_bytes` / `set_max_payload_bytes` and
   `OggOpusEncoder::new_silk_cbr` close the SILK CBR-sizing gap. Every
@@ -248,6 +391,18 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   scope.
 
 ### Fixed
+- `tpt-av-cadence-opus`'s SILK `smlawt` truncated its third operand to the
+  low 16 bits like `smlawb`; the reference's `silk_SMLAWT` uses the *top*
+  16 bits. The pair together decodes the reference's packed LF-shaping
+  coefficient pair (`LF_AR_shp` high, `LF_MA_shp` low), so the mistake fed
+  the LF feedback loop `LF_MA_shp` twice (loop gain -1.79 instead of
+  -0.33) and the reconstruction diverged within one frame. `sigproc` now has
+  a unit test pinning the top-half/low-half split.
+- The SILK encoder's pitch analysis read out of bounds once `x_buf` grew by
+  the 5 ms shaping look-ahead region: `pitch_residual`'s last window and its
+  `lpc_analysis_filter` call both assumed `x_buf.len() == ltp_mem + frame`,
+  which surfaced as a `STATUS_STACK_BUFFER_OVERRUN` abort in the hybrid
+  tests. Both now slice the history+frame region explicitly.
 - The SBR extension parser matched the wrong extension id for Parametric
   Stereo (1 instead of the normative 2), so in-band PS payloads were never
   decoded at all; every previous PS test wrote the same wrong id, so the

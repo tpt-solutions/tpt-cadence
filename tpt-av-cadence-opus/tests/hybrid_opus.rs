@@ -208,7 +208,7 @@ fn hybrid_pre_skip_pins_the_measured_alignment() {
     // the SNR-optimal integer shift must equal the signalled pre-skip.
     let n_samples = 960 * 16;
     let original = speech_like(n_samples, 120.0);
-    let out = hybrid_stream(16_000, 24_000, 20, false, &original);
+    let out = hybrid_stream(24_000, 32_000, 20, false, &original);
     let head = OpusHead::parse(&page_packets(&out, 0)[0]).unwrap();
 
     let n_pages = out.windows(4).filter(|w| *w == b"OggS").count();
@@ -268,7 +268,7 @@ fn hybrid_silk_prefix_decodes_consistently() {
     let n_samples = frame_samples * n_packets;
     let original = speech_like(n_samples, 120.0);
 
-    let out = hybrid_stream(16_000, 24_000, 20, false, &original);
+    let out = hybrid_stream(24_000, 32_000, 20, false, &original);
     let n_pages = out.windows(4).filter(|w| *w == b"OggS").count();
     let mut silk = SilkDecoder::new(1).unwrap();
     let mut decoded_all: Vec<i16> = Vec::new();
@@ -320,8 +320,8 @@ fn hybrid_silk_prefix_decodes_consistently() {
 fn hybrid_is_deterministic() {
     let n_samples = 960 * 6;
     let original = speech_like(n_samples, 120.0);
-    let a = hybrid_stream(16_000, 24_000, 20, false, &original);
-    let b = hybrid_stream(16_000, 24_000, 20, false, &original);
+    let a = hybrid_stream(24_000, 32_000, 20, false, &original);
+    let b = hybrid_stream(24_000, 32_000, 20, false, &original);
     assert_eq!(a, b);
 }
 

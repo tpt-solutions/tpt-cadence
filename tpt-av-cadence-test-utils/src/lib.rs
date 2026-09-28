@@ -2,6 +2,8 @@
 //!
 //! Shared conformance-testing harness for the `tpt-cadence` codec crates.
 //!
+//! - [`quality`]: perceptually weighted quality metrics (A-weighted SNR,
+//!   segmental SNR) shared by the codec test suites.
 //! - [`reference`]: decode a file with FFmpeg (CLI subprocess) and assert the
 //!   suite's decoder output is bit-exact against it.
 //! - [`fuzz`]: deterministic pseudo-random generators and byte-mutation
@@ -11,4 +13,5 @@
 
 pub mod fuzz;
 pub mod md5;
+pub mod quality;
 pub mod reference;

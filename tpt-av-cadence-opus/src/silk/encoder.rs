@@ -17,10 +17,12 @@
 //!    decimated two-stage search) → per-subframe lags, the primary lag
 //!    index, the contour-codebook selection, and the LTP correlation used
 //!    for the voiced decision.
-//! 4. **Shaping-proxy gains** (foundation stand-in for
-//!    `silk_noise_shape_analysis_FLP`, without the shaping filter/warping):
-//!    one frame-level windowed LPC residual energy per frame, adjusted by
-//!    the target SNR from the exact [`control_snr`] port.
+//! 4. **Noise-shaping analysis** ([`super::noise_shape`],
+//!    `silk_noise_shape_analysis_FLP`): per-subframe gains from a windowed
+//!    *frequency-warped* autocorrelation, plus the shaping filter, spectral
+//!    tilt, harmonic shaping gain and rate/distortion factor. The gains
+//!    (adjusted by the target SNR from the exact [`control_snr`] port) feed
+//!    the LPC analysis, the residual energies and the quantizer.
 //! 5. **LTP + LPC** (`silk_find_pred_coefs_FLP` shape): [`find_ltp`] +
 //!    [`quant_ltp_gains`] for voiced frames, the weighted LPC analysis on
 //!    the (LTP-)residual, [`nlsf_encode`] for the transmitted NLSF vector,
@@ -77,16 +79,21 @@ use crate::silk::decode_indices::{
     CondCoding, EcPrevState, FrameParams, SideInfoIndices, MAX_FRAMES_PER_PACKET, MAX_LPC_ORDER,
     MAX_NB_SUBFR, TYPE_NO_VOICE_ACTIVITY, TYPE_UNVOICED, TYPE_VOICED,
 };
-use crate::silk::encode_indices::{encode_indices, encode_vad_flags_and_lbrr_flag};
+use crate::silk::encode_indices::{
+    encode_indices, encode_lbrr_flags, encode_vad_flags_and_lbrr_flag,
+};
 use crate::silk::encode_pulses::encode_pulses;
 use crate::silk::gains::gains_quant;
 use crate::silk::lpc_analysis::{
-    a2nlsf, apply_sine_window, autocorrelation, bwexpander_f32, energy, k2a, lpc_analysis_filter,
-    schur,
+    a2nlsf, apply_sine_window, autocorrelation, burg_modified_f32, bwexpander_f32, energy,
+    interpolate_i16, k2a, lpc_analysis_filter, schur,
 };
 use crate::silk::ltp_quant::{correlations_to_q17, find_ltp, ltp_correlation, quant_ltp_gains};
 use crate::silk::nlsf::nlsf2a;
 use crate::silk::nlsf_quant::{nlsf_encode, nlsf_vq_weights_laroia};
+use crate::silk::noise_shape::{
+    noise_shape_analysis, ShapeGeometry, ShapeParams, ShapeState, LA_SHAPE_MAX,
+};
 use crate::silk::nsq::encode_frame_nsq;
 use crate::silk::resampler::Resampler;
 use crate::silk::stereo::{
@@ -113,10 +120,22 @@ const PE_MAX_LAG_MS: i32 = 18;
 /// Foundation VAD gate: frames whose RMS (i16 units) falls below this are
 /// coded as `TYPE_NO_VOICE_ACTIVITY`.
 const INACTIVE_RMS_THRESHOLD: f32 = 16.0;
-/// `MAX_PREDICTION_POWER_GAIN_AFTER_RESET` (`silk/define.h`) — the
-/// foundation's LPC analysis does not consume it (A2NLSF bandwidth-expands
-/// unstable filters itself); kept for documentation parity.
-const _MAX_PREDICTION_POWER_GAIN_AFTER_RESET: f32 = 1e2;
+/// `NB_SPEECH_FRAMES_BEFORE_DTX` (`silk/define.h`): inactive frames are
+/// still coded until this many have passed.
+const NB_SPEECH_FRAMES_BEFORE_DTX: u32 = 10;
+/// `MAX_CONSECUTIVE_DTX` (`silk/define.h`): past this many consecutive
+/// inactive frames the packet is skipped (DTX), the counter recycling to
+/// [`NB_SPEECH_FRAMES_BEFORE_DTX`].
+const MAX_CONSECUTIVE_DTX: u32 = 20;
+/// `MAX_PREDICTION_POWER_GAIN` (`silk/define.h`): 1e4 linear (~80 dB) —
+/// the total-prediction-gain cap behind `minInvGain`.
+const MAX_PREDICTION_POWER_GAIN: f32 = 1e4;
+/// `MAX_PREDICTION_POWER_GAIN_AFTER_RESET` (`silk/define.h`): 1e2 linear
+/// (~40 dB) on the first frame after a reset.
+const MAX_PREDICTION_POWER_GAIN_AFTER_RESET: f32 = 1e2;
+/// Low-activity override (`silk/control_codec.c`): speech activity below
+/// 0.2 in Q8 downgrades the frame to `TYPE_NO_VOICE_ACTIVITY`.
+const VAD_INACTIVE_SA_Q8: i32 = 51;
 
 /// `silk_control_SNR` (`silk/control_SNR.c`): SNR values divided by 21 for
 /// target bitrates spaced at 400 bps intervals; the first 10 entries
@@ -211,9 +230,22 @@ struct ChannelState {
 
     /* Input path */
     resampler: Resampler,
-    /// `[ltp_mem history | current frame]` at the internal rate.
+    /// `[ltp_mem history | current frame | la_shape look-ahead]` at the
+    /// internal rate. The trailing look-ahead is zero-filled (see
+    /// [`crate::silk::noise_shape`]).
     x_buf: Vec<f32>,
     vad_flags: [bool; MAX_FRAMES_PER_PACKET],
+    nsq: crate::silk::nsq_ref::NsqState,
+
+    /* Noise shaping (encoder-only; see `silk::noise_shape`) */
+    /// `sShape`: the smoothed tilt / harmonic shaping gain.
+    shape: ShapeState,
+    /// `input_quality_bands_Q15` from the latest VAD evaluation.
+    input_quality_bands_q15: [i32; 4],
+    /// `sVAD`: the reference 4-band voice-activity detector.
+    vad: crate::silk::vad::VadState,
+    /// `speech_activity_Q8` stand-in derived from the frame-RMS VAD gate.
+    speech_activity_q8: i32,
 
     /* Analysis output retained for the caller/tests */
     last_xq: Vec<i16>,
@@ -238,6 +270,9 @@ impl ChannelState {
     ) -> Result<Self> {
         let resampler = Resampler::new(api_sample_rate, internal_sample_rate, true)?;
         Ok(ChannelState {
+            nsq: crate::silk::nsq_ref::NsqState::default(),
+            vad: crate::silk::vad::VadState::default(),
+            input_quality_bands_q15: [32768; 4],
             fs_khz,
             nb_subfr,
             frame_length,
@@ -258,8 +293,10 @@ impl ChannelState {
             first_frame_after_reset: true,
             indices: SideInfoIndices::default(),
             resampler,
-            x_buf: vec![0.0; ltp_mem_length + frame_length],
+            x_buf: vec![0.0; ltp_mem_length + frame_length + LA_SHAPE_MAX],
             vad_flags: [false; MAX_FRAMES_PER_PACKET],
+            shape: ShapeState::default(),
+            speech_activity_q8: 0,
             last_xq: Vec::new(),
         })
     }
@@ -271,6 +308,9 @@ impl ChannelState {
     /// `ChannelState::default` placeholder.
     fn placeholder() -> Self {
         ChannelState {
+            nsq: crate::silk::nsq_ref::NsqState::default(),
+            vad: crate::silk::vad::VadState::default(),
+            input_quality_bands_q15: [32768; 4],
             fs_khz: 8,
             nb_subfr: MAX_NB_SUBFR,
             frame_length: MAX_FRAME_LENGTH,
@@ -291,8 +331,10 @@ impl ChannelState {
             first_frame_after_reset: true,
             indices: SideInfoIndices::default(),
             resampler: Resampler::new(8_000, 8_000, true).unwrap(),
-            x_buf: vec![0.0; 160 + MAX_FRAME_LENGTH],
+            x_buf: vec![0.0; 160 + MAX_FRAME_LENGTH + LA_SHAPE_MAX],
             vad_flags: [false; MAX_FRAMES_PER_PACKET],
+            shape: ShapeState::default(),
+            speech_activity_q8: 0,
             last_xq: Vec::new(),
         }
     }
@@ -338,6 +380,43 @@ pub struct SilkEncoder {
     /// Per-frame quantized MS predictor indices.
     pred_ix: [StereoPredIx; MAX_FRAMES_PER_PACKET],
     frame_counter: u32,
+    /// DTX (`set_dtx`): reference `noSpeechCounter`/`inDTX` pair,
+    /// persistent across frames and packets.
+    dtx_enabled: bool,
+    no_speech_counter: u32,
+    in_dtx: bool,
+    /// LBRR (`set_packet_loss_perc`): the previous packet's stored
+    /// frames, re-serialized into the next payload's LBRR slots.
+    lbrr_enabled: bool,
+    prev_lbrr: Option<Box<LbrrStored>>,
+}
+
+/// The previous packet's coded frames, stored for LBRR re-serialization.
+struct LbrrStored {
+    /// Per channel, per frame: side-info indices and excitation pulses.
+    indices: [[SideInfoIndices; MAX_FRAMES_PER_PACKET]; 2],
+    pulses: [[[i16; MAX_FRAME_LENGTH]; MAX_FRAMES_PER_PACKET]; 2],
+    /// Per frame: the quantized MS predictor indices (stereo only).
+    pred_ix: [StereoPredIx; MAX_FRAMES_PER_PACKET],
+    /// Per frame: whether the side channel was coded (false = mid-only).
+    side_coded: [bool; MAX_FRAMES_PER_PACKET],
+    /// Per frame: whether the mid frame was stored at all — the
+    /// reference's LBRR only covers ACTIVE frames (an inactive frame's
+    /// signal-type symbol has no LBRR encoding).
+    mid_stored: [bool; MAX_FRAMES_PER_PACKET],
+}
+
+fn lbrr_flags_at(
+    lbrr0: &[bool; MAX_FRAMES_PER_PACKET],
+    lbrr1: &[bool; MAX_FRAMES_PER_PACKET],
+    ch: usize,
+    i: usize,
+) -> bool {
+    if ch == 0 {
+        lbrr0[i]
+    } else {
+        lbrr1[i]
+    }
 }
 
 /// The NLSF codebook for an internal rate (`silk_decoder_set_fs`):
@@ -393,6 +472,12 @@ struct ChannelSnapshot {
     /// re-sampling the same chunk a second time (a CBR retry) starting
     /// from the post-call state would corrupt the internal-rate signal.
     resampler: Resampler,
+    /// Noise-shaping analysis state (tilt / harmonic smoothing) and the
+    /// NSQ's shaping history — both advance per frame, so a retry must
+    /// rewind them exactly like the decoder-mirror state.
+    shape: ShapeState,
+
+    speech_activity_q8: i32,
 }
 
 impl ChannelState {
@@ -412,6 +497,9 @@ impl ChannelState {
             vad_flags: self.vad_flags,
             last_xq: self.last_xq.clone(),
             resampler: self.resampler.clone(),
+            shape: self.shape,
+
+            speech_activity_q8: self.speech_activity_q8,
         }
     }
 
@@ -430,6 +518,8 @@ impl ChannelState {
         self.vad_flags = s.vad_flags;
         self.last_xq = s.last_xq.clone();
         self.resampler = s.resampler.clone();
+        self.shape = s.shape;
+        self.speech_activity_q8 = s.speech_activity_q8;
     }
 }
 
@@ -547,6 +637,11 @@ impl SilkEncoder {
             mid_only: [false; MAX_FRAMES_PER_PACKET],
             pred_ix: [StereoPredIx::default(); MAX_FRAMES_PER_PACKET],
             frame_counter: 0,
+            dtx_enabled: false,
+            no_speech_counter: 0,
+            in_dtx: false,
+            lbrr_enabled: false,
+            prev_lbrr: None,
         })
     }
 
@@ -600,6 +695,32 @@ impl SilkEncoder {
         }
         self.cbr = Some(CbrMode::ExactBytes(bytes));
         Ok(())
+    }
+
+    /// Enables discontinuous transmission (`useDTX`): packets whose
+    /// every SILK frame is voice-inactive (per the VAD stand-in's RMS
+    /// gate, using the reference's `noSpeechCounter`/`inDTX` schedule —
+    /// the first 10 inactive frames still coded, all after the 20th
+    /// skipped) are emitted as 1-byte packets (TOC byte only), which the
+    /// decoder decodes as comfort-noise generation. Only meaningful for
+    /// standalone SILK streams; the hybrid always codes its CELT layer.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.dtx_enabled = enabled;
+        if !enabled {
+            self.no_speech_counter = 0;
+            self.in_dtx = false;
+        }
+    }
+
+    /// Enables low-bitrate redundancy (`useLBRR`): each payload carries
+    /// re-serialized copies of the previous packet's coded frames (side
+    /// info + excitation, in the decoder's exact LBRR skip order), so a
+    /// lost packet can be recovered from its successor's LBRR data. The
+    /// foundation's policy codes LBRR for every frame whenever `pct > 0`
+    /// (the reference's per-frame LBRR rate decision scales this by the
+    /// actual loss rate and activity); `pct <= 0` disables LBRR.
+    pub fn set_packet_loss_perc(&mut self, pct: i32) {
+        self.lbrr_enabled = pct > 0;
     }
 
     /// Hybrid-mode variant: the written symbols must fit `bytes` bytes
@@ -702,6 +823,10 @@ impl SilkEncoder {
         let frame_len_api = self.frame_length_api();
         let frame_length = self.ch[0].frame_length;
         let stereo = channels == 2;
+        /* The reference's CBR flag: under CBR the gain path skips the
+         * low-activity SNR reduction (the sizing loop below pulls the
+         * payload back with its own rate control instead). */
+        let use_cbr = self.cbr.is_some();
 
         /* CBR sizing loop: encode, then (only when a sizing mode is
          * active) check the fit — an oversized payload restores the
@@ -714,12 +839,12 @@ impl SilkEncoder {
             let snap = self.snapshot_state();
 
             /*--------------------------------------------------------*/
-            /* Pass A: per-frame analysis, quantization, closed-loop  */
-            /* NSQ (in order — the simulation state carries across    */
-            /* frames and channels), buffering each frame's indices   */
-            /* and pulses.                                            */
+            /* Pass A1: resample, run the stereo MS transform, and    */
+            /* decide DTX per frame (reference `noSpeechCounter` /    */
+            /* `inDTX` schedule, on the mid channel's activity). The  */
+            /* input pipeline keeps running through DTX frames —     */
+            /* only their coding is skipped.                          */
             /*--------------------------------------------------------*/
-            let mut plans = [Vec::new(), Vec::new()];
             for ch in self.ch.iter_mut().take(channels) {
                 ch.vad_flags = [false; MAX_FRAMES_PER_PACKET];
                 ch.last_xq.clear();
@@ -727,9 +852,13 @@ impl SilkEncoder {
             self.mid_only = [false; MAX_FRAMES_PER_PACKET];
             let mut mid_buf = [0i16; MAX_FRAME_LENGTH + 2];
             let mut side_buf = [0i16; MAX_FRAME_LENGTH + 2];
-            // Mirrors the decoder's persistent `prev_decode_only_middle`,
-            // updated once per frame. The pre-packet value is needed again
-            // during serialization (frame 0's side cond coding).
+            let mut mid_frames: [Vec<i16>; MAX_FRAMES_PER_PACKET] =
+                std::array::from_fn(|_| vec![0i16; frame_length]);
+            let mut side_frames: [Vec<i16>; MAX_FRAMES_PER_PACKET] =
+                std::array::from_fn(|_| vec![0i16; frame_length]);
+            let mut frame_in_dtx = [false; MAX_FRAMES_PER_PACKET];
+            let mut frame_sa = [0i32; MAX_FRAMES_PER_PACKET];
+            let mut frame_bands = [[32768i32; 4]; MAX_FRAMES_PER_PACKET];
             let mut prev_mid_only = self.prev_decode_only_middle;
             let prev_mid_only_at_start = self.prev_decode_only_middle;
             for i in 0..self.packet_frames {
@@ -771,9 +900,67 @@ impl SilkEncoder {
                     self.pred_ix[i] = ix;
                     self.mid_only[i] = (side_e.sqrt() as f32) < INACTIVE_RMS_THRESHOLD;
                     let _ = mid_e;
+                    mid_frames[i].copy_from_slice(&mid_buf[2..frame_length + 2]);
+                    side_frames[i].copy_from_slice(&side_buf[2..frame_length + 2]);
+                } else {
+                    mid_frames[i].copy_from_slice(&l_int);
                 }
+
+                /* DTX schedule (`silk_Encode`): the mid channel's activity
+                 * drives the counter; the first `NB_SPEECH_FRAMES_BEFORE_DTX`
+                 * inactive frames are still coded, and past
+                 * `MAX_CONSECUTIVE_DTX` the packet is skipped (the counter
+                 * recycling to the before-DTX mark). */
+                let vad_out =
+                    self.ch[0]
+                        .vad
+                        .vad_get_sa_q8(&mid_frames[i], frame_length, self.ch[0].fs_khz);
+                frame_sa[i] = vad_out.speech_activity_q8;
+                frame_bands[i] = vad_out.input_quality_bands_q15;
+                let mid_rms = {
+                    let sum: f64 = mid_frames[i].iter().map(|&v| (v as f64) * v as f64).sum();
+                    (sum / frame_length as f64).sqrt() as f32
+                };
+                if self.dtx_enabled && mid_rms < INACTIVE_RMS_THRESHOLD {
+                    self.no_speech_counter = self.no_speech_counter.saturating_add(1);
+                    if self.no_speech_counter <= NB_SPEECH_FRAMES_BEFORE_DTX {
+                        self.in_dtx = false;
+                    }
+                    if self.no_speech_counter > MAX_CONSECUTIVE_DTX {
+                        self.no_speech_counter = NB_SPEECH_FRAMES_BEFORE_DTX;
+                        self.in_dtx = true;
+                    }
+                } else {
+                    self.no_speech_counter = 0;
+                    self.in_dtx = false;
+                }
+                frame_in_dtx[i] = self.in_dtx;
                 let mid_only_i = stereo && self.mid_only[i];
                 self.ch[1].vad_flags[i] = !mid_only_i;
+            }
+
+            /* A packet is skipped only when EVERY frame is in DTX (the
+             * decoder reads per-frame side info for any packet that
+             * carries a payload, so partial-DTX packets are coded in
+             * full). The caller emits a 1-byte packet (TOC only), which
+             * the decoder decodes as comfort-noise generation. */
+            if self.dtx_enabled && frame_in_dtx[..self.packet_frames].iter().all(|&d| d) {
+                // A DTX-skipped packet carries no LBRR either, and its
+                // predecessor's redundant frames are stale after the gap.
+                self.prev_lbrr = None;
+                return Ok(());
+            }
+
+            /*--------------------------------------------------------*/
+            /* Pass A2: per-frame analysis, quantization, closed-loop */
+            /* NSQ (in order — the simulation state carries across    */
+            /* frames and channels), buffering each frame's indices   */
+            /* and pulses.                                            */
+            /*--------------------------------------------------------*/
+            let mut plans = [Vec::new(), Vec::new()];
+            for i in 0..self.packet_frames {
+                let l_int = &mid_frames[i];
+                let mid_only_i = stereo && self.mid_only[i];
 
                 /* Mid channel: slide the history window, append the frame. */
                 {
@@ -784,9 +971,23 @@ impl SilkEncoder {
                     for (dst, &src) in tail.iter_mut().zip(l_int.iter()) {
                         *dst = src as f32;
                     }
+                    /* The shaping analysis reads `la_shape` samples of
+                     * look-ahead past the frame (zero-filled; see the
+                     * noise_shape module). */
+                    for v in ch.x_buf[total..].iter_mut() {
+                        *v = 0.0;
+                    }
                     let seed = (self.frame_counter & 3) as i8;
                     self.frame_counter += 1;
-                    let plan = ch.analyze_and_quantize_frame(&l_int, i, i > 0, seed);
+                    let plan = ch.analyze_and_quantize_frame(
+                        l_int,
+                        i,
+                        frame_sa[i],
+                        &frame_bands[i],
+                        i > 0,
+                        seed,
+                        use_cbr,
+                    );
                     plans[0].push(plan);
                 }
 
@@ -803,17 +1004,24 @@ impl SilkEncoder {
                         let total = ch.ltp_mem_length + ch.frame_length;
                         ch.x_buf.copy_within(ch.frame_length..total, 0);
                         let tail = &mut ch.x_buf[ch.ltp_mem_length..total];
-                        for (dst, &src) in tail.iter_mut().zip(side_buf[2..frame_length + 2].iter())
+                        for (dst, &src) in
+                            tail.iter_mut().zip(side_frames[i][..frame_length].iter())
                         {
                             *dst = src as f32;
+                        }
+                        for v in ch.x_buf[total..].iter_mut() {
+                            *v = 0.0;
                         }
                         let seed = (self.frame_counter & 3) as i8;
                         self.frame_counter += 1;
                         let plan = ch.analyze_and_quantize_frame(
-                            &side_buf[2..frame_length + 2],
+                            &side_frames[i],
                             i,
+                            frame_sa[i],
+                            &frame_bands[i],
                             conditional_side,
                             seed,
+                            use_cbr,
                         );
                         plans[1].push(plan);
                     }
@@ -830,14 +1038,81 @@ impl SilkEncoder {
             /* each coded channel's side info + excitation — exactly  */
             /* as the decoder reads it.                               */
             /*--------------------------------------------------------*/
-            encode_vad_flags_and_lbrr_flag(enc, &self.ch[0].vad_flags, self.packet_frames, false);
+            // LBRR: when enabled and the previous packet stored frames,
+            // the per-channel packet-level LBRR flags are set, the
+            // per-frame LBRR flags follow (mid always coded; the side's
+            // flag is its coded/mid-only decision), and the previous
+            // frames are re-serialized frame-major / channel-minor — the
+            // decoder's normal-decode path reads (and discards) exactly
+            // this data, so a serialization mismatch desyncs loudly.
+            let have_lbrr = self.lbrr_enabled && self.prev_lbrr.is_some();
+            encode_vad_flags_and_lbrr_flag(
+                enc,
+                &self.ch[0].vad_flags,
+                self.packet_frames,
+                have_lbrr,
+            );
             if stereo {
                 encode_vad_flags_and_lbrr_flag(
                     enc,
                     &self.ch[1].vad_flags,
                     self.packet_frames,
-                    false,
+                    have_lbrr,
                 );
+            }
+            if have_lbrr {
+                let prev = self.prev_lbrr.as_ref().unwrap();
+                let lbrr0 = prev.mid_stored;
+                let lbrr1: [bool; MAX_FRAMES_PER_PACKET] =
+                    std::array::from_fn(|i| prev.mid_stored[i] && !prev.side_coded[i]);
+                encode_lbrr_flags(enc, &lbrr0, self.packet_frames);
+                if stereo {
+                    encode_lbrr_flags(enc, &lbrr1, self.packet_frames);
+                }
+                for i in 0..self.packet_frames {
+                    for n in 0..channels {
+                        let coded = if n == 0 { true } else { !prev.side_coded[i] };
+                        if !coded {
+                            continue;
+                        }
+                        if stereo && n == 0 {
+                            encode_stereo_pred(enc, &prev.pred_ix[i]);
+                            if !prev.side_coded[i] {
+                                encode_mid_only_flag(enc, true);
+                            }
+                        }
+                        let cond_coding = if i > 0 && lbrr_flags_at(&lbrr0, &lbrr1, n, i - 1) {
+                            CondCoding::Conditionally
+                        } else {
+                            CondCoding::Independently
+                        };
+                        let delta_possible = cond_coding == CondCoding::Conditionally
+                            && self.ch[n].ec_prev.ec_prev_signal_type == TYPE_VOICED;
+                        let params = FrameParams {
+                            nlsf_cb: self.nlsf_cb,
+                            fs_khz: self.ch[n].fs_khz,
+                            nb_subfr: self.ch[n].nb_subfr,
+                            frame_index: i,
+                            vad_flag: true,
+                            decode_lbrr: true,
+                            cond_coding,
+                        };
+                        encode_indices(
+                            enc,
+                            &prev.indices[n][i],
+                            &mut self.ch[n].ec_prev,
+                            &params,
+                            delta_possible,
+                        );
+                        encode_pulses(
+                            enc,
+                            prev.indices[n][i].signal_type as i32,
+                            prev.indices[n][i].quant_offset_type as i32,
+                            &prev.pulses[n][i],
+                            self.ch[n].frame_length,
+                        );
+                    }
+                }
             }
             let mut side_plan_iter = plans[1].iter();
             for (i, plan0) in plans[0].iter().enumerate() {
@@ -927,6 +1202,34 @@ impl SilkEncoder {
                     );
                 }
             }
+            /* Store this packet's ACTIVE coded frames as the next
+             * packet's LBRR payload (the reference's LBRR covers active
+             * frames only). */
+            let mut stored = Box::new(LbrrStored {
+                indices: [[SideInfoIndices::default(); MAX_FRAMES_PER_PACKET]; 2],
+                pulses: [[[0i16; MAX_FRAME_LENGTH]; MAX_FRAMES_PER_PACKET]; 2],
+                pred_ix: self.pred_ix,
+                side_coded: self.mid_only,
+                mid_stored: [false; MAX_FRAMES_PER_PACKET],
+            });
+            for (n, _ch) in self.ch.iter().take(channels).enumerate() {
+                for (i, plan) in plans[n].iter().enumerate() {
+                    if plan.indices.signal_type == TYPE_NO_VOICE_ACTIVITY {
+                        continue;
+                    }
+                    stored.indices[n][i] = plan.indices;
+                    stored.pulses[n][i] = plan.pulses;
+                    if n == 0 {
+                        stored.mid_stored[i] = true;
+                    }
+                }
+            }
+            if stored.mid_stored[..self.packet_frames].iter().any(|&s| s) {
+                self.prev_lbrr = Some(stored);
+            } else {
+                self.prev_lbrr = None;
+            }
+
             let fits = match self.cbr {
                 None => true,
                 Some(CbrMode::ExactBytes(n)) => enc.clone().done().len() <= n,
@@ -996,24 +1299,37 @@ impl ChannelState {
     /// frame's position within its packet (0-based); `conditional_gains`
     /// selects delta coding for subframe 0's gain (the caller derives it
     /// from the decoder's per-channel conditional-coding rule); `seed`
-    /// is the frame's deterministic excitation dither seed.
+    /// is the frame's deterministic excitation dither seed, and `use_cbr`
+    /// mirrors the reference's CBR flag (see [`Self::noise_shape`]).
+    #[allow(clippy::too_many_arguments)]
     fn analyze_and_quantize_frame(
         &mut self,
         x_int: &[i16],
         frame_index: usize,
+        sa_q8: i32,
+        input_quality_bands_q15: &[i32; 4],
         conditional_gains: bool,
         seed: i8,
+        use_cbr: bool,
     ) -> FramePlan {
         /*--------------------------------------------------------*/
         /* Side-info skeleton (type, VAD flag, seed). `indices`   */
         /* starts from the persistent mirror so uncoded fields    */
         /* carry over as they do on the decode side.              */
         /*--------------------------------------------------------*/
-        let total = self.ltp_mem_length + self.frame_length;
-        let frame_rms = (energy(&self.x_buf[self.ltp_mem_length..total]) / self.frame_length as f64)
-            .sqrt() as f32;
         let mut indices = self.indices;
         indices.seed = seed;
+        /* signalType gate: a documented foundation deviation — the
+         * reference downgrades to TYPE_NO_VOICE_ACTIVITY when its VAD's
+         * `speech_activity_Q8` falls below 0.2, but that classifies
+         * synthetic test signals (harmonic stacks) as silence. The RMS
+         * gate keeps every frame coded while remaining inert for genuine
+         * silence; the VAD's activity/quality outputs still drive the
+         * shaping analysis. */
+        let frame_rms = {
+            let sum: f64 = x_int.iter().map(|&v| (v as f64) * v as f64).sum();
+            (sum / self.frame_length as f64).sqrt() as f32
+        };
         indices.signal_type = if frame_rms < INACTIVE_RMS_THRESHOLD {
             TYPE_NO_VOICE_ACTIVITY
         } else {
@@ -1021,15 +1337,28 @@ impl ChannelState {
         };
         let vad_flag = indices.signal_type != TYPE_NO_VOICE_ACTIVITY;
         self.vad_flags[frame_index] = vad_flag;
+        let _ = sa_q8;
+        self.speech_activity_q8 = sa_q8;
+        self.input_quality_bands_q15 = *input_quality_bands_q15;
+
+        /* `speech_activity_Q8` from the reference 4-band VAD
+         * (`silk_VAD_GetSA_Q8`), evaluated on the frame input. */
+        let vad_out = self
+            .vad
+            .vad_get_sa_q8(x_int, self.frame_length, self.fs_khz);
+        self.speech_activity_q8 = vad_out.speech_activity_q8;
+        self.input_quality_bands_q15 = vad_out.input_quality_bands_q15;
 
         /*--------------------------------------------------------*/
         /* Pitch analysis (find_pitch_lags shape)                 */
         /*--------------------------------------------------------*/
-        let res_pitch = self.pitch_residual();
+        let (res_pitch, pred_gain) = self.pitch_residual();
         let mut pitch_l = [0i32; MAX_NB_SUBFR];
+        let mut ltp_corr = 0.0f32;
 
         if indices.signal_type != TYPE_NO_VOICE_ACTIVITY {
-            let (lags, ltp_corr, lag_index, contour_index) = self.pitch_search(&res_pitch);
+            let (lags, corr, lag_index, contour_index) = self.pitch_search(&res_pitch);
+            ltp_corr = corr;
             /* Voiced threshold (find_pitch_lags_FLP with the foundation's
              * neutral speech-activity/tilt terms) */
             let thrhld = 0.6f32
@@ -1053,10 +1382,20 @@ impl ChannelState {
         }
 
         /*--------------------------------------------------------*/
-        /* Shaping-proxy gains (noise_shape_analysis shape)       */
+        /* Noise shaping analysis + per-subframe gains             */
         /*--------------------------------------------------------*/
-        let snr_adj_db = self.snr_db_q7 as f32 * (1.0 / 128.0);
-        let mut gains = self.proxy_gains(snr_adj_db);
+        let mut gains = [0f32; MAX_NB_SUBFR];
+        let input_quality_bands_q15 = self.input_quality_bands_q15;
+        let shape = self.noise_shape(
+            &mut gains,
+            indices.signal_type,
+            indices.quant_offset_type,
+            &pitch_l,
+            ltp_corr,
+            pred_gain,
+            &input_quality_bands_q15,
+            use_cbr,
+        );
 
         /*--------------------------------------------------------*/
         /* LPC + LTP (find_pred_coefs shape)                      */
@@ -1110,13 +1449,28 @@ impl ChannelState {
         }
 
         /* Weighted LPC analysis on the (LTP-)residual */
-        let (nlsf_q15, lpc_in_pre) =
-            self.lpc_analysis_to_nlsf(&pitch_l, &ctrl.ltp_coef_q14, &gains, indices.signal_type);
+        /* `silk_find_pred_coefs_FLP` computes minInvGain from the LTP
+         * prediction gain and the coding quality (both frame-local, so
+         * they are passed in); the first frame after a reset uses the
+         * post-reset cap. */
+        let ltpred_cod_gain = ltpred_cod_gain_db;
+        let coding_quality = shape.coding_quality;
+        let first_frame_after_reset = self.first_frame_after_reset;
+        let (nlsf_q15, nlsf_interp_coef, _nlsf0_q15, lpc_in_pre) = self.lpc_analysis_to_nlsf(
+            &pitch_l,
+            &ctrl.ltp_coef_q14,
+            &gains,
+            indices.signal_type,
+            first_frame_after_reset,
+            ltpred_cod_gain,
+            coding_quality,
+        );
 
         /* NLSF quantization + conversion to the decoder's Q12 filters.
-         * The interpolation factor is 4 (no interpolation) for every
-         * frame - legal for both coding modes (20 ms frames transmit the
-         * symbol either way; 10 ms frames force it decoder-side). */
+         * When the interpolation search picked a coefficient, the
+         * first-half filter comes from the interpolated NLSF (previous
+         * quantized → current quantized), exactly as the decoder
+         * reconstructs it. */
         let mut weights = [0i16; MAX_LPC_ORDER];
         nlsf_vq_weights_laroia(&mut weights, &nlsf_q15);
         let mut nlsf_mu_q20: i32 = 3146; // SILK_FIX_CONST(0.003, 20), speech activity 0
@@ -1137,13 +1491,29 @@ impl ChannelState {
         indices.nlsf_indices[0] = nlsf_indices[0];
         indices.nlsf_indices[1..=self.predict_lpc_order]
             .copy_from_slice(&nlsf_indices[1..=self.predict_lpc_order]);
-        indices.nlsf_interp_coef_q2 = 4;
+        indices.nlsf_interp_coef_q2 = nlsf_interp_coef;
         nlsf2a(
             &mut ctrl.pred_coef_q12[1][..self.predict_lpc_order],
             &quantized[..self.predict_lpc_order],
             self.predict_lpc_order,
         );
-        ctrl.pred_coef_q12[0] = ctrl.pred_coef_q12[1];
+        if nlsf_interp_coef < 4 {
+            let mut nlsf0_q15 = [0i16; MAX_LPC_ORDER];
+            interpolate_i16(
+                &mut nlsf0_q15[..self.predict_lpc_order],
+                &self.prev_nlsf_q15,
+                &quantized[..self.predict_lpc_order],
+                i32::from(nlsf_interp_coef),
+                self.predict_lpc_order,
+            );
+            nlsf2a(
+                &mut ctrl.pred_coef_q12[0][..self.predict_lpc_order],
+                &nlsf0_q15[..self.predict_lpc_order],
+                self.predict_lpc_order,
+            );
+        } else {
+            ctrl.pred_coef_q12[0] = ctrl.pred_coef_q12[1];
+        }
         self.prev_nlsf_q15 = quantized;
 
         /* Residual energies with the quantized filters
@@ -1192,6 +1562,7 @@ impl ChannelState {
         let mut xq = [0i16; MAX_FRAME_LENGTH];
         encode_frame_nsq(
             &mut self.synth,
+            &shape,
             &mut self.exc_q14,
             &mut pulses,
             &mut xq,
@@ -1214,27 +1585,34 @@ impl ChannelState {
         FramePlan {
             indices,
             pulses,
+            xq: xq[..self.frame_length].to_vec(),
             vad_flag,
         }
     }
 
     /// The pitch-LPC residual over the whole buffered window (history +
     /// frame), foundation shape of `silk_find_pitch_lags_FLP`'s
-    /// sine-windowed order-6 analysis.
-    fn pitch_residual(&self) -> Vec<f32> {
+    /// sine-windowed order-6 analysis, together with the analysis'
+    /// `predGain` (`auto_corr[0] / max(res_nrg, 1)`) — the noise-shaping
+    /// analysis scales its bandwidth expansion by it.
+    fn pitch_residual(&self) -> (Vec<f32>, f32) {
         let total = self.ltp_mem_length + self.frame_length;
+        /* Only the history + frame region; the trailing noise-shaping
+         * look-ahead is not part of the pitch window. */
+        let buf = &self.x_buf[..total];
         let mut wsig = vec![0f32; total];
         let slope = (self.fs_khz as usize).min(total / 4);
-        apply_sine_window(&mut wsig[..slope], &self.x_buf[..slope], 1);
+        apply_sine_window(&mut wsig[..slope], &buf[..slope], 1);
         let flat = total - 2 * slope;
-        wsig[slope..slope + flat].copy_from_slice(&self.x_buf[slope..slope + flat]);
-        apply_sine_window(&mut wsig[total - slope..], &self.x_buf[total - slope..], 2);
+        wsig[slope..slope + flat].copy_from_slice(&buf[slope..slope + flat]);
+        apply_sine_window(&mut wsig[total - slope..], &buf[total - slope..], 2);
 
         let mut auto_corr = [0f32; 7];
         autocorrelation(&mut auto_corr, &wsig);
         auto_corr[0] += auto_corr[0] * FIND_PITCH_WHITE_NOISE_FRACTION + 1.0;
         let mut rc = [0f32; 6];
-        schur(&mut rc, &auto_corr, self.pitch_lpc_order);
+        let res_nrg = schur(&mut rc, &auto_corr, self.pitch_lpc_order);
+        let pred_gain = auto_corr[0] / res_nrg.max(1.0);
         let mut a = [0f32; 6];
         k2a(&mut a, &rc, self.pitch_lpc_order);
         bwexpander_f32(
@@ -1243,8 +1621,8 @@ impl ChannelState {
         );
 
         let mut res = vec![0f32; total];
-        lpc_analysis_filter(&mut res, &a, &self.x_buf, self.pitch_lpc_order);
-        res
+        lpc_analysis_filter(&mut res, &a, buf, self.pitch_lpc_order);
+        (res, pred_gain)
     }
 
     /// Full-resolution normalized cross-correlation pitch search over the
@@ -1363,40 +1741,48 @@ impl ChannelState {
         }
     }
 
-    /// One windowed autocorrelation over the frame; the schur residual
-    /// energy feeds the proxy shaping gains (the SNR adjustment is the
-    /// reference's `gain_mult`/`gain_add` pair).
-    fn proxy_gains(&self, snr_adj_db: f32) -> [f32; MAX_NB_SUBFR] {
-        let total = self.ltp_mem_length + self.frame_length;
-        let mut wsig = vec![0f32; self.frame_length];
-        let flat = (3 * self.fs_khz as usize).min(self.frame_length / 4);
-        /* The sine-window kernel requires multiple-of-4 lengths. */
-        let mut slope = (self.frame_length - flat) / 2;
-        slope -= slope % 4;
-        let x_start = total - self.frame_length;
-        apply_sine_window(&mut wsig[..slope], &self.x_buf[x_start..x_start + slope], 1);
-        let flat_len = self.frame_length - 2 * slope;
-        wsig[slope..slope + flat_len]
-            .copy_from_slice(&self.x_buf[x_start + slope..x_start + slope + flat_len]);
-        apply_sine_window(
-            &mut wsig[slope + flat_len..],
-            &self.x_buf[total - slope..total],
-            2,
-        );
-
-        let mut auto_corr = [0f32; 17];
-        autocorrelation(&mut auto_corr, &wsig);
-        auto_corr[0] += auto_corr[0] * SHAPE_WHITE_NOISE_FRACTION + 1.0;
-        let mut rc = [0f32; 16];
-        let nrg = schur(&mut rc, &auto_corr, self.predict_lpc_order);
-
-        let gain_mult = 2.0f32.powf(-0.16 * snr_adj_db);
-        let gain_add = 2.0f32.powf(0.16 * 2.0); // 2^(-0.16·MIN_QGAIN_DB form, MIN_QGAIN_DB = 2)
-        let mut gains = [0f32; MAX_NB_SUBFR];
-        for g in gains.iter_mut().take(self.nb_subfr) {
-            *g = nrg.sqrt() * gain_mult + gain_add;
-        }
-        gains
+    /// `silk_noise_shape_analysis_FLP`: the per-subframe shaping filters,
+    /// tilt, harmonic shaping gain and rate/distortion factor, plus the
+    /// per-subframe gains written into `gains` (the reference computes both
+    /// in one pass).
+    ///
+    /// `use_cbr` mirrors the reference's flag: a CBR-targeted encode keeps
+    /// its gains (and so its noise floor) up during low speech activity
+    /// instead of reducing the coding SNR.
+    #[allow(clippy::too_many_arguments)]
+    fn noise_shape(
+        &mut self,
+        gains: &mut [f32; MAX_NB_SUBFR],
+        signal_type: i8,
+        quant_offset_type: i8,
+        pitch_l: &[i32; MAX_NB_SUBFR],
+        ltp_corr: f32,
+        pred_gain: f32,
+        input_quality_bands_q15: &[i32; 4],
+        use_cbr: bool,
+    ) -> ShapeParams {
+        let geo = ShapeGeometry {
+            fs_khz: self.fs_khz,
+            nb_subfr: self.nb_subfr,
+            subfr_length: self.subfr_length,
+            frame_length: self.frame_length,
+            ltp_mem_length: self.ltp_mem_length,
+        };
+        noise_shape_analysis(
+            &mut self.shape,
+            &geo,
+            &self.x_buf,
+            self.snr_db_q7,
+            signal_type,
+            quant_offset_type,
+            pitch_l,
+            ltp_corr,
+            pred_gain,
+            self.speech_activity_q8,
+            input_quality_bands_q15,
+            use_cbr,
+            gains,
+        )
     }
 
     /// Weighted LPC analysis of the (LTP-)filtered input, converted to
@@ -1405,13 +1791,18 @@ impl ChannelState {
     /// exact reference port and bandwidth-expands unstable filters
     /// itself).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn lpc_analysis_to_nlsf(
         &self,
         pitch_l: &[i32; MAX_NB_SUBFR],
         ltp_coef_q14: &[i16; 20],
         gains: &[f32; MAX_NB_SUBFR],
         signal_type: i8,
-    ) -> ([i16; MAX_LPC_ORDER], Vec<f32>) {
+        first_frame_after_reset: bool,
+        ltpred_cod_gain: f32,
+        coding_quality: f32,
+    ) -> ([i16; MAX_LPC_ORDER], i8, [i16; MAX_LPC_ORDER], Vec<f32>) {
         let order = self.predict_lpc_order;
         let frame_start = self.ltp_mem_length;
 
@@ -1444,14 +1835,29 @@ impl ChannelState {
             out_ptr += self.subfr_length + order;
         }
 
-        /* Autocorrelation + schur + k2a (Burg stand-in) */
-        let mut auto_corr = [0f32; 17];
-        autocorrelation(&mut auto_corr, &lpc_in_pre);
-        auto_corr[0] += auto_corr[0] * SHAPE_WHITE_NOISE_FRACTION + 1.0;
-        let mut rc = [0f32; 16];
-        schur(&mut rc, &auto_corr, order);
+        /* minInvGain (`silk_find_pred_coefs_FLP`): cap the TOTAL
+         * prediction gain (LTP + LPC) at MAX_PREDICTION_POWER_GAIN
+         * (1e4, ~80 dB), raised when the LTP already predicts well and
+         * relaxed by the coding quality; the first frame after a reset
+         * uses the post-reset cap. */
+        let min_inv_gain = if first_frame_after_reset {
+            1.0 / MAX_PREDICTION_POWER_GAIN_AFTER_RESET
+        } else {
+            (2.0f32.powf(ltpred_cod_gain / 3.0) / MAX_PREDICTION_POWER_GAIN)
+                / (0.25 + 0.75 * coding_quality)
+        };
+
+        /* Modified Burg LPC analysis over the gain-weighted subframes
+         * (`silk_find_LPC_FLP` + `silk_burg_modified_FLP`). */
         let mut a = [0f32; 16];
-        k2a(&mut a, &rc, order);
+        let res_full = burg_modified_f32(
+            &mut a[..order],
+            &lpc_in_pre,
+            min_inv_gain,
+            order + self.subfr_length,
+            self.nb_subfr,
+            order,
+        );
 
         /* A (float) → Q16 monic → NLSF (exact A2NLSF port) */
         let mut a_q16 = [0i32; 16];
@@ -1460,7 +1866,76 @@ impl ChannelState {
         }
         let mut nlsf = [0i16; MAX_LPC_ORDER];
         a2nlsf(&mut nlsf[..order], &mut a_q16[..order]);
-        (nlsf, lpc_in_pre)
+
+        /* NLSF interpolation search (`silk_find_LPC_FLP`'s second half):
+         * for 20 ms frames with established prediction state, test
+         * interpolating the previous quantized NLSF toward the last
+         * half's NLSF and keep the coefficient whose interpolated filter
+         * gives the lowest first-half residual energy. */
+        let mut nlsf_interp_coef_q2: i8 = 4;
+        let mut nlsf0_q15 = [0i16; MAX_LPC_ORDER];
+        if self.nb_subfr == MAX_NB_SUBFR && !first_frame_after_reset {
+            let block = order + self.subfr_length;
+            let mut a_half = [0f32; 16];
+            let res_half = burg_modified_f32(
+                &mut a_half[..order],
+                &lpc_in_pre[2 * block..],
+                1e-4,
+                block,
+                2,
+                order,
+            );
+            let mut a_half_q16 = [0i32; 16];
+            for (dst, &v) in a_half_q16.iter_mut().zip(a_half.iter()).take(order) {
+                *dst = (v * 65536.0) as i32;
+            }
+            let mut nlsf_half = [0i16; MAX_LPC_ORDER];
+            a2nlsf(&mut nlsf_half[..order], &mut a_half_q16[..order]);
+
+            /* First-half residual energy given the last-half solution. */
+            let mut res_nrg = res_full - res_half;
+            let mut res_nrg_2nd = f32::MAX;
+            let mut lpc_res = vec![0f32; 2 * block];
+            for k in (0..4).rev() {
+                let mut nlsf0 = [0i16; MAX_LPC_ORDER];
+                interpolate_i16(
+                    &mut nlsf0[..order],
+                    &self.prev_nlsf_q15,
+                    &nlsf_half,
+                    k,
+                    order,
+                );
+                let mut a_q12 = [0i16; MAX_LPC_ORDER];
+                nlsf2a(&mut a_q12[..order], &nlsf0[..order], order);
+                let a_f32: Vec<f32> = a_q12[..order].iter().map(|&c| c as f32 / 4096.0).collect();
+                lpc_analysis_filter(&mut lpc_res, &a_f32, &lpc_in_pre[..2 * block], order);
+                let res_nrg_interp = (energy(&lpc_res[order..order + self.subfr_length])
+                    + energy(&lpc_res[order + block..order + block + self.subfr_length]))
+                    as f32;
+
+                if res_nrg_interp < res_nrg {
+                    /* Interpolation has lower residual energy. */
+                    res_nrg = res_nrg_interp;
+                    nlsf_interp_coef_q2 = k as i8;
+                } else if res_nrg_interp > res_nrg_2nd {
+                    /* Residual energies would continue to climb. */
+                    break;
+                }
+                res_nrg_2nd = res_nrg_interp;
+            }
+        }
+        if nlsf_interp_coef_q2 < 4 {
+            /* The NSQ and decoder interpolate the PREVIOUS QUANTIZED NLSF
+             * toward the transmitted one — mirror that vector exactly. */
+            interpolate_i16(
+                &mut nlsf0_q15[..order],
+                &self.prev_nlsf_q15,
+                &nlsf,
+                i32::from(nlsf_interp_coef_q2),
+                order,
+            );
+        }
+        (nlsf, nlsf_interp_coef_q2, nlsf0_q15, lpc_in_pre)
     }
 
     /// Per-subframe LPC residual energies with the quantized filters
@@ -1515,6 +1990,9 @@ impl ChannelState {
 struct FramePlan {
     indices: SideInfoIndices,
     pulses: [i16; MAX_FRAME_LENGTH],
+    /// The decoder-exact reconstruction (the reference NSQ's output for
+    /// this frame).
+    xq: Vec<i16>,
     vad_flag: bool,
 }
 

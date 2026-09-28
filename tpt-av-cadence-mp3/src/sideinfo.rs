@@ -47,13 +47,19 @@ pub(crate) fn sr_table_idx(hdr: &FrameHeader) -> usize {
 }
 
 /// Encoder-side variant: the same table index selected directly from a
-/// sample rate (the encoder only supports the MPEG-1 rates, rows 5–7).
+/// sample rate, covering all three version families (MPEG-1 rows 5–7,
+/// MPEG-2 rows 2–4, MPEG-2.5 rows 0–1).
 pub(crate) fn sr_table_idx_for_sr(sample_rate: u32) -> usize {
     match sample_rate {
         44100 => 5,
         48000 => 6,
         32000 => 7,
-        _ => unreachable!("encoder rejects non-MPEG-1 rates at open"),
+        22050 => 2,
+        24000 => 3,
+        16000 => 4,
+        11025 | 12000 => 0,
+        8000 => 1,
+        _ => 0, // the encoder rejects unsupported rates at open
     }
 }
 

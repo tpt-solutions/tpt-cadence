@@ -505,11 +505,13 @@ fn ogg_silk_packet_bitrates_steer_payload_size() {
         sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
     };
 
-    let low = avg_packet(10_000);
-    let high = avg_packet(40_000);
+    // Budgets: 8 B vs 20 B per channel per packet. Both sit at/near the
+    // quantizer's payload floor on this material, so compare 16k vs 64k.
+    let low = avg_packet(16_000);
+    let high = avg_packet(64_000);
     assert!(
-        high > low * 1.5,
-        "bitrate target must move payload size: 10 kbps → {low:.1} B/pkt, 40 kbps → {high:.1} B/pkt"
+        high > low * 1.25,
+        "bitrate target must move payload size: 16 kbps → {low:.1} B/pkt, 64 kbps → {high:.1} B/pkt"
     );
 }
 
@@ -783,7 +785,10 @@ fn ogg_silk_cbr_constant_packet_size() {
     // Every audio packet is exactly the nominal byte count (+ TOC), and
     // padded payloads decode at full quality (trailing zero bytes are
     // never read by the SILK decoder).
-    for (channels, bitrate) in [(1u16, 32_000u32), (2, 64_000)] {
+    // Budgets sit above the quantizer's ~85 B/frame active-speech
+    // payload floor at 16 kHz internal (mono 64 kbps → 160 B, stereo
+    // 128 kbps → 160 B per channel).
+    for (channels, bitrate) in [(1u16, 64_000u32), (2, 128_000)] {
         let n_samples = 960 * 10 + 137;
         let original = if channels == 2 {
             stereo_speech(n_samples, 120.0)
@@ -848,7 +853,7 @@ fn ogg_silk_cbr_deterministic() {
     let build = || {
         let mut out = Vec::new();
         let mut enc =
-            OggOpusEncoder::new_silk_cbr(&mut out, 48_000, 1, 32_000, 16_000, 20).unwrap();
+            OggOpusEncoder::new_silk_cbr(&mut out, 48_000, 1, 64_000, 16_000, 20).unwrap();
         enc.encode(&original).unwrap();
         enc.finish().unwrap();
         drop(enc);
@@ -873,4 +878,210 @@ fn ogg_silk_cbr_rejects_absurd_sizes() {
             }
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Discontinuous transmission (DTX)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ogg_silk_dtx_emits_one_byte_packets_during_silence() {
+    // Speech (12 packets) -> silence (30 packets) -> speech (12 packets):
+    // during silence the first 20 inactive frames are still coded; after
+    // that packets collapse to 1 byte (TOC only) until speech resumes.
+    let packets = |dtx: bool| {
+        let n = 960 * 54 + 137;
+        let mut original: Vec<f32> = Vec::new();
+        let mut phase = 0.0f32;
+        let push_speech = |out: &mut Vec<f32>, count: usize, phase: &mut f32| {
+            for i in 0..count {
+                let t = i as f32 / 48_000.0;
+                let f0 = 120.0f32;
+                let g = (2.0 * core::f32::consts::PI * f0 * t).sin()
+                    + 0.5 * (2.0 * core::f32::consts::PI * 2.0 * f0 * t).sin();
+                let v = g * 8000.0 / 32768.0;
+                out.push(v);
+                *phase += 1.0;
+            }
+        };
+        push_speech(&mut original, 960 * 12, &mut phase);
+        original.extend(std::iter::repeat(0f32).take(960 * 30));
+        push_speech(&mut original, 960 * 12, &mut phase);
+        original.resize(n, 0.0); // ragged zero tail to exactly n samples
+
+        let mut out = Vec::new();
+        let mut enc = if dtx {
+            OggOpusEncoder::new_silk_dtx(&mut out, 48_000, 1, 32_000, 16_000, 20).unwrap()
+        } else {
+            OggOpusEncoder::new_silk(&mut out, 48_000, 1, 32_000, 16_000, 20).unwrap()
+        };
+        enc.encode(&original).unwrap();
+        enc.finish().unwrap();
+        drop(enc);
+        out
+    };
+
+    let with_dtx = packets(true);
+    let without_dtx = packets(false);
+
+    // Packet sizes per audio page.
+    let sizes = |data: &[u8]| -> Vec<usize> {
+        let n_pages = data.windows(4).filter(|w| *w == b"OggS").count();
+        (2..n_pages)
+            .flat_map(|p| page_packets(data, p).into_iter().map(|pk| pk.len()))
+            .collect()
+    };
+
+    let dtx_sizes = sizes(&with_dtx);
+    let vbr_sizes = sizes(&without_dtx);
+    assert_eq!(dtx_sizes.len(), vbr_sizes.len(), "same packet count");
+
+    // DTX stream: the silence tail must contain 1-byte packets; the VBR
+    // stream without DTX must have none.
+    assert!(
+        dtx_sizes.contains(&1),
+        "DTX stream must emit 1-byte packets during silence"
+    );
+    assert!(
+        vbr_sizes.iter().all(|&s| s > 1),
+        "non-DTX stream must never emit 1-byte packets"
+    );
+    // The initial speech and the first 20 inactive frames stay coded.
+    assert!(
+        dtx_sizes[..30].iter().all(|&s| s > 1),
+        "the first 20 inactive frames are still coded (reference schedule)"
+    );
+
+    // Decode: exact length, silence stays near-silent, final speech
+    // recovers.
+    let pcm = decode_all_reader(with_dtx, 1);
+    assert_eq!(pcm.len(), 960 * 54 + 137);
+    let silence_start = 960 * 24; // deep in the CNG region
+    let silence_rms: f64 = (pcm[silence_start..960 * 40]
+        .iter()
+        .map(|&v| (v as f64) * v as f64)
+        .sum::<f64>()
+        / (960 * 16) as f64)
+        .sqrt();
+    assert!(
+        silence_rms < 0.01,
+        "CNG silence should be near-silent, RMS {silence_rms:.4}"
+    );
+    let tail_rms: f64 = (pcm[960 * 48..960 * 53]
+        .iter()
+        .map(|&v| (v as f64) * v as f64)
+        .sum::<f64>()
+        / (960 * 5) as f64)
+        .sqrt();
+    assert!(
+        tail_rms > 0.05,
+        "post-DTX speech must have real energy, RMS {tail_rms:.4}"
+    );
+}
+
+#[test]
+fn ogg_silk_dtx_is_deterministic() {
+    let n = 960 * 40 + 7;
+    let mut original: Vec<f32> = speech_like(960 * 8, 48_000, 120.0)
+        .iter()
+        .map(|&v| v as f32 / 32768.0)
+        .collect();
+    original.extend(std::iter::repeat(0f32).take(n - original.len()));
+    let build = || {
+        let mut out = Vec::new();
+        let mut enc =
+            OggOpusEncoder::new_silk_dtx(&mut out, 48_000, 1, 32_000, 16_000, 20).unwrap();
+        enc.encode(&original).unwrap();
+        enc.finish().unwrap();
+        drop(enc);
+        out
+    };
+    assert_eq!(build(), build());
+}
+
+// ---------------------------------------------------------------------------
+// Low-bitrate redundancy (LBRR / FEC)
+// ---------------------------------------------------------------------------
+
+fn ogg_silk_stream_lbrr(lbrr: bool, original: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = OggOpusEncoder::new_silk(&mut out, 48_000, 1, 32_000, 16_000, 20).unwrap();
+    if lbrr {
+        enc.set_packet_loss_perc(20).unwrap();
+    }
+    let mut pos = 0usize;
+    for chunk in [250usize, 1000, 700, 1500] {
+        let end = (pos + chunk).min(original.len());
+        if pos >= end {
+            break;
+        }
+        enc.encode(&original[pos..end]).unwrap();
+        pos = end;
+    }
+    if pos < original.len() {
+        enc.encode(&original[pos..]).unwrap();
+    }
+    enc.finish().unwrap();
+    drop(enc);
+    out
+}
+
+/// The LBRR data rides in front of the regular frames; the regular
+/// frames' serialization is unchanged, so both streams must decode to
+/// IDENTICAL PCM, with the LBRR stream's packets visibly larger.
+#[test]
+fn ogg_silk_lbrr_stream_decodes_identically_and_grows() {
+    let n_samples = 960 * 10 + 137;
+    let original = speech_like(n_samples, 48_000, 120.0)
+        .iter()
+        .map(|&v| v as f32 / 32768.0)
+        .collect::<Vec<f32>>();
+
+    let plain = ogg_silk_stream_lbrr(false, &original);
+    let with = ogg_silk_stream_lbrr(true, &original);
+
+    let avg = |data: &[u8]| -> f64 {
+        let n_pages = data.windows(4).filter(|w| *w == b"OggS").count();
+        let sizes: Vec<usize> = (2..n_pages - 1)
+            .map(|p| page_packets(data, p)[0].len())
+            .collect();
+        sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
+    };
+    let plain_size = avg(&plain);
+    let lbrr_size = avg(&with);
+    assert!(
+        lbrr_size > plain_size * 1.4,
+        "LBRR packets must grow: plain {plain_size:.0} B vs LBRR {lbrr_size:.0} B"
+    );
+
+    let pcm_plain = decode_all_reader(plain, 1);
+    let pcm_lbrr = decode_all_reader(with, 1);
+    assert_eq!(pcm_plain.len(), n_samples);
+    assert_eq!(pcm_lbrr.len(), n_samples);
+    assert_eq!(
+        pcm_plain, pcm_lbrr,
+        "LBRR data must not alter the decoded regular frames"
+    );
+}
+
+/// A stream with DTX and LBRR both enabled stays decodable: DTX-skipped
+/// packets carry no LBRR, and coding after the gap re-syncs.
+#[test]
+fn ogg_silk_lbrr_with_dtx_round_trips() {
+    let n = 960 * 30 + 100;
+    let mut original: Vec<f32> = speech_like(960 * 8, 48_000, 120.0)
+        .iter()
+        .map(|&v| v as f32 / 32768.0)
+        .collect();
+    original.resize(n, 0.0);
+
+    let mut out = Vec::new();
+    let mut enc = OggOpusEncoder::new_silk_dtx(&mut out, 48_000, 1, 32_000, 16_000, 20).unwrap();
+    enc.set_packet_loss_perc(20).unwrap();
+    enc.encode(&original).unwrap();
+    enc.finish().unwrap();
+    drop(enc);
+
+    let pcm = decode_all_reader(out, 1);
+    assert_eq!(pcm.len(), n, "exact sample-count recovery with DTX + LBRR");
 }

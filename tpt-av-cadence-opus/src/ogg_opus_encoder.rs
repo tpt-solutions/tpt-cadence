@@ -306,6 +306,37 @@ impl<W: Write> OggOpusEncoder<W> {
         )
     }
 
+    /// Discontinuous-transmission variant of [`OggOpusEncoder::new_silk`]:
+    /// packets whose every SILK frame is voice-inactive are emitted as
+    /// 1-byte packets (TOC byte only), which decoders answer with
+    /// comfort-noise generation — silence costs one byte per 20 ms
+    /// instead of a full payload. Uses the reference's DTX schedule (the
+    /// first 10 inactive frames still coded; all frames after 20
+    /// consecutive inactive ones skipped until activity resumes).
+    /// Standalone SILK mode only; the hybrid always codes its CELT layer.
+    pub fn new_silk_dtx(
+        sink: W,
+        sample_rate: u32,
+        channels: u16,
+        bitrate_bps: u32,
+        internal_sample_rate: i32,
+        packet_ms: i32,
+    ) -> Result<Self> {
+        let mut enc = Self::new_silk_impl(
+            sink,
+            sample_rate,
+            channels,
+            bitrate_bps,
+            internal_sample_rate,
+            packet_ms,
+            false,
+        )?;
+        if let CodingMode::Silk { silk, .. } = &mut enc.mode {
+            silk.set_dtx(true);
+        }
+        Ok(enc)
+    }
+
     /// CBR counterpart to [`OggOpusEncoder::new_silk`]: every audio
     /// packet is exactly `bitrate_bps·packet_ms/8000` bytes (plus the
     /// TOC byte). The SILK layer starts at the nominal rate and, when a
@@ -363,9 +394,12 @@ impl<W: Write> OggOpusEncoder<W> {
                 "SILK packet duration must be 10, 20, 40, or 60 ms, got {packet_ms}"
             )));
         }
-        if !(5_000..=64_000).contains(&bitrate_bps) {
+        // The per-channel rate control enforces the budget, so the
+        // stereo total extends to 2x the mono ceiling.
+        let max_total = 64_000u32 * u32::from(channels);
+        if !(5_000..=max_total).contains(&bitrate_bps) {
             return Err(CadenceError::InvalidFormat(format!(
-                "SILK target bitrate {bitrate_bps} bps is outside the supported 5000–64000 bps range"
+                "SILK target bitrate {bitrate_bps} bps is outside the supported 5000–{max_total} bps range for {channels} channel(s)"
             )));
         }
 
@@ -548,6 +582,25 @@ impl<W: Write> OggOpusEncoder<W> {
             buffered_granule: 0,
             finished: false,
         })
+    }
+
+    /// Enables low-bitrate redundancy for SILK-mode streams (`pct > 0`):
+    /// each payload carries re-serialized copies of the previous packet's
+    /// coded frames, so a lost packet can be recovered from its
+    /// successor's LBRR data. The foundation codes LBRR for every frame
+    /// when enabled (the reference scales the per-frame decision by the
+    /// actual loss rate and activity). Payloads grow accordingly.
+    /// SILK mode only; the hybrid and CELT modes reject the setting.
+    pub fn set_packet_loss_perc(&mut self, pct: i32) -> Result<()> {
+        match &mut self.mode {
+            CodingMode::Silk { silk, .. } => {
+                silk.set_packet_loss_perc(pct);
+                Ok(())
+            }
+            _ => Err(CadenceError::UnsupportedFeature(
+                "LBRR is SILK-mode only in this foundation".to_string(),
+            )),
+        }
     }
 
     /// Samples per channel of one coding frame (CELT: 960; SILK: the

@@ -37,9 +37,25 @@ intensity stereo (Y = ±X, phase discarded) for the high bands of
 channel-similar content, and energy-adaptive dynamic-allocation boosts for
 spectral peaks. RFC 7845 pre-skip and granule positions include the
 measured 120-sample CELT overlap delay; `finish()` flushes the delayed
-tail so decoders recover the exact original sample count. Remaining:
-SILK/hybrid encoding and psychoacoustic-model tuning, tracked in
-[`todo.md`](../todo.md) at the repository root.
+tail so decoders recover the exact original sample count.
+
+A SILK encoder (`SilkEncoder`) and hybrid SILK+CELT packets are also
+implemented: mono or adaptive mid/side stereo SILK at 8/12/16 kHz internal
+rate in 10/20/40/60 ms packets, VBR payloads plus constant-size CBR
+(`new_silk_cbr`), SILK-only and hybrid Ogg Opus streams, and stereo hybrid
+(split per-channel rate targets). Its analysis includes the reference's
+noise-shaping *analysis* — per-subframe gains from a frequency-warped
+autocorrelation, smoothed spectral tilt, harmonic shaping gain and the
+rate/distortion factor — which is worth roughly +1 dB SNR over the
+frame-level gain proxy it replaced; the shaping filter itself is not yet
+closed into the quantizer's error-feedback loop (see
+[`todo.md`](../todo.md) for the measurements). The encoder's simulated
+reconstruction is bit-identical to the real decoder's output, which the
+test suite pins for every rate and packet-size combination.
+
+Remaining: the per-frame rate-control ramp, the SILK shaping feedback loop
+and LBRR/FEC/DTX, psychoacoustic-model tuning, and the other format
+encoders — tracked in [`todo.md`](../todo.md) at the repository root.
 
 ## License
 
