@@ -5,15 +5,25 @@
 //! foundation's simplified candidate-window loop when the shaping
 //! analysis drives the quantizer.
 //!
-//! **STATUS: WIRED into the live encode path** via
-//! `ChannelState::quantize_and_nsq` behind the per-frame `gainMult`
-//! bisection rate control. The remaining reference variant is
-//! `silk_NSQ_del_dec` (delayed decision across 2-4 quantization states,
-//! `silk/NSQ_del_dec.c`), whose port was drafted and reverted once
-//! (2026-09-27): the state-partial-copy at the pruning point and the
-//! negative-index deferred writes need a fresh session with the
-//! perceptual metrics in `tpt-av-cadence-test-utils::quality` for
-//! validation.
+//! **STATUS: bit-exact, not yet wired.** The encoder still calls
+//! [`crate::silk::nsq::encode_frame_nsq`], the foundation's simplified
+//! closed-loop candidate search; `NsqState` exists and is advanced only by
+//! this module's own tests. The contract that makes wiring safe is
+//! established by `tests::reference_nsq_xq_equals_decode_core`: for every
+//! signal type / seed / interpolation combination, the `xq` this port
+//! produces is sample-for-sample identical to what `silk_decode_core`
+//! reconstructs from the pulses it emitted. The remaining work is the
+//! per-frame `gainMult` bisection rate control around it
+//! (`silk_encode_frame_FLP`), after which the shaping filter, tilt, harmonic
+//! gain and `Lambda` computed by [`crate::silk::noise_shape`] can be closed
+//! into the error-feedback loop.
+//!
+//! The other remaining reference variant is `silk_NSQ_del_dec` (delayed
+//! decision across 2-4 quantization states, `silk/NSQ_del_dec.c`), whose
+//! port was drafted and reverted once (2026-09-27): the state-partial-copy
+//! at the pruning point and the negative-index deferred writes need a fresh
+//! session with the perceptual metrics in
+//! `tpt-av-cadence-test-utils::quality` for validation.
 //!
 //! SOURCE: Xiph.Org libopus 1.5.2, `silk/NSQ.c`, `silk/NSQ.h`
 //! (`silk_noise_shape_quantizer_short_prediction_c`,
@@ -196,9 +206,19 @@ pub(crate) fn nsq(
             if (k & (3 - ((lsf_interpolation_flag as usize) << 1))) == 0 {
                 let start_idx = ltp_mem_length - lag - frame.lpc_order - 5 / 2;
                 debug_assert!(start_idx > 0);
+                /* The reference hands the filter two same-size arrays
+                 * (`sLTP` and `NSQ->xq` are both
+                 * `MAX_FRAME_LENGTH + MAX_SUB_FRAME_LENGTH`), so it filters
+                 * the whole remaining tail of each. Rust slices have
+                 * independent lengths, so the common extent is taken
+                 * explicitly. Only `sLTP[..ltp_mem_length]` is ever read back,
+                 * so the extra tail is inert — but it must be *filtered*, not
+                 * skipped, to stay faithful. */
+                let in_start = start_idx + k * subfr_length;
+                let len = (s_ltp.len() - start_idx).min(nsq.xq.len() - in_start);
                 lpc_analysis_filter(
-                    &mut s_ltp[start_idx..],
-                    &nsq.xq[start_idx + k * subfr_length..],
+                    &mut s_ltp[start_idx..start_idx + len],
+                    &nsq.xq[in_start..in_start + len],
                     a_q12,
                     frame.lpc_order,
                 );
@@ -514,5 +534,160 @@ fn scale_states(
         }
 
         nsq.prev_gain_q16 = gain_q16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::silk::decode_indices::{TYPE_UNVOICED, TYPE_VOICED};
+    use crate::silk::noise_shape::MAX_SHAPE_LPC_ORDER;
+    use crate::silk::synthesis::{decode_core, DecoderControl, SynthesisState};
+
+    /// A bounded but non-trivial shaping configuration, so the differential
+    /// test exercises the AR/LF/harmonic feedback paths rather than a
+    /// degenerate all-zero filter.
+    fn shaping() -> (
+        [i16; MAX_NB_SUBFR * MAX_SHAPE_LPC_ORDER],
+        [i32; MAX_NB_SUBFR],
+        [i32; MAX_NB_SUBFR],
+        [i32; MAX_NB_SUBFR],
+    ) {
+        let mut ar_q13 = [0i16; MAX_NB_SUBFR * MAX_SHAPE_LPC_ORDER];
+        for (i, v) in ar_q13.iter_mut().enumerate() {
+            // A gentle, decaying coefficient set (well inside the 3.999 limit).
+            *v = (((i % 8) as f32 - 3.5) * 900.0) as i16;
+        }
+        (
+            ar_q13,
+            [(-2000i32) << 16 | (0xF000u16 as i16) as i32; MAX_NB_SUBFR],
+            [-1200; MAX_NB_SUBFR],
+            [3000; MAX_NB_SUBFR],
+        )
+    }
+
+    /// The encoder's core contract for the reference NSQ port: given the
+    /// same parameters, gains and starting state, `silk_NSQ`'s `xq` must be
+    /// bit-identical to what `silk_decode_core` reconstructs from the pulses
+    /// `silk_NSQ` emitted. Any divergence here is a port bug (state layout,
+    /// Q-format or pointer-arithmetic semantics), not a quality question.
+    #[test]
+    fn reference_nsq_xq_equals_decode_core() {
+        let frame = FrameInfo::new(16, 4);
+        let frame_length = frame.frame_length();
+        let history = frame.ltp_mem_length + frame_length;
+        let (ar_q13, lf_shp_q14, tilt_q14, harm_q14) = shaping();
+
+        for signal_type in [TYPE_UNVOICED, TYPE_VOICED] {
+            for seed in [0i8, 2] {
+                for nlsf_interp in [4i8, 2] {
+                    let mut ctrl = DecoderControl::default();
+                    for (k, g) in ctrl.gains_q16.iter_mut().enumerate().take(4) {
+                        *g = if k == 2 { 4_000_000 } else { 1_500_000 };
+                    }
+                    for v in ctrl.pred_coef_q12[1].iter_mut().take(16) {
+                        *v = -1200;
+                    }
+                    // `decode_parameters` only builds a distinct
+                    // `PredCoef_Q12[0]` when the frame interpolates the NLSFs;
+                    // otherwise it copies `[1]`. The encoder's selection,
+                    // `(k >> 1) | (1 - NLSFInterp)`, must agree with that.
+                    ctrl.pred_coef_q12[0] = ctrl.pred_coef_q12[1];
+                    if nlsf_interp < 4 {
+                        for v in ctrl.pred_coef_q12[0].iter_mut().take(16) {
+                            *v += 300;
+                        }
+                    }
+                    if signal_type == TYPE_VOICED {
+                        for k in 0..4 {
+                            ctrl.pitch_l[k] = 100 + 10 * k as i32;
+                        }
+                        for (i, v) in ctrl.ltp_coef_q14[..4 * 5].iter_mut().enumerate() {
+                            *v = [0, 1000, 8000, 1000, 0][i % 5];
+                        }
+                    }
+                    ctrl.ltp_scale_q14 = 15565;
+
+                    let indices = SideInfoIndices {
+                        signal_type,
+                        quant_offset_type: 1,
+                        seed,
+                        nlsf_interp_coef_q2: nlsf_interp,
+                        ..SideInfoIndices::default()
+                    };
+
+                    // Warm history, so the LPC state, the shaped-LTP
+                    // feedback and the gain-change rescaling are all active.
+                    let mut state = NsqState::default();
+                    state.s_lpc_q14[..NSQ_LPC_BUF_LENGTH]
+                        .copy_from_slice(&[1234; NSQ_LPC_BUF_LENGTH]);
+                    state.prev_gain_q16 = 900_000;
+                    for (i, v) in state.xq[..history].iter_mut().enumerate() {
+                        *v = ((i as f32) * 7.0).sin() as i16 * 40;
+                    }
+                    for (i, v) in state.s_ltp_shp_q14[..history].iter_mut().enumerate() {
+                        *v = ((i as f32) * 3.0).cos() as i32 * 500;
+                    }
+                    // `nsq()` slides `xq` at the end of the frame, so the
+                    // decoder's mirror of the starting history is captured
+                    // here rather than read back afterwards.
+                    let xq_history = state.xq;
+
+                    let x: Vec<i16> = (0..frame_length)
+                        .map(|i| (2000.0 * (i as f32 * 0.05).sin()) as i16)
+                        .collect();
+
+                    let res = nsq(
+                        &mut state,
+                        &indices,
+                        &x,
+                        &ctrl,
+                        &frame,
+                        &ar_q13,
+                        &lf_shp_q14,
+                        &tilt_q14,
+                        &harm_q14,
+                        1000,
+                        i32::from(ctrl.ltp_scale_q14),
+                        &ctrl.gains_q16,
+                    );
+
+                    // Decoder side: same parameters, same starting LPC state,
+                    // gain history and reconstruction history, fed the pulses
+                    // the NSQ emitted. (`out_buf` mirrors `NsqState::xq`.)
+                    let mut dec = SynthesisState::default();
+                    dec.s_lpc_q14_buf[..NSQ_LPC_BUF_LENGTH]
+                        .copy_from_slice(&[1234; NSQ_LPC_BUF_LENGTH]);
+                    dec.prev_gain_q16 = 900_000;
+                    // Only the `ltp_mem_length` samples of reconstruction
+                    // history are shared: at subframe 2 the decoder stages
+                    // the first two subframes' `xq` into its own scratch.
+                    dec.out_buf[..frame.ltp_mem_length]
+                        .copy_from_slice(&xq_history[..frame.ltp_mem_length]);
+                    let mut dec_ctrl = ctrl;
+                    let mut xq_dec = [0i16; MAX_FRAME_LENGTH];
+                    let mut exc_dec = [0i32; MAX_FRAME_LENGTH];
+                    decode_core(
+                        &mut dec,
+                        &mut dec_ctrl,
+                        &indices,
+                        &res.pulses,
+                        &mut xq_dec,
+                        &mut exc_dec,
+                        &frame,
+                        0,
+                        0,
+                        0,
+                    );
+
+                    assert_eq!(
+                        &res.xq[..frame_length],
+                        &xq_dec[..frame_length],
+                        "signal_type {signal_type}, seed {seed}, interp {nlsf_interp}"
+                    );
+                }
+            }
+        }
     }
 }

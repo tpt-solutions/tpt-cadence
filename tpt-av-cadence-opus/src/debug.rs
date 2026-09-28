@@ -11,6 +11,7 @@ pub(crate) struct DebugFlags {
     pub celt_band_trace: bool,
     pub silk_c_fs_debug: bool,
     pub silk_dbg: bool,
+    pub silk_rate_trace: bool,
 }
 
 static FLAGS: OnceLock<DebugFlags> = OnceLock::new();
@@ -26,5 +27,6 @@ pub(crate) fn flags() -> DebugFlags {
         celt_band_trace: std::env::var_os("CELT_BAND_TRACE").is_some(),
         silk_c_fs_debug: std::env::var_os("SILK_C_FS_DEBUG").is_some(),
         silk_dbg: std::env::var_os("SILK_DBG").is_some(),
+        silk_rate_trace: std::env::var_os("SILK_RATE_TRACE").is_some(),
     })
 }

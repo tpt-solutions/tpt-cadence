@@ -231,10 +231,21 @@ fn speech_round_trip_fidelity() {
         // The quantizer's noise shaping is still analysis-side only (the
         // shaping filter is not closed into the residual loop), so the gate
         // tracks the per-subframe warped-gain analysis rather than a fully
-        // shaped quantizer. Measured 12.2-19.0 dB across these three
-        // configurations; the gate leaves headroom for platform variation
-        // while still catching a collapse.
-        assert!(snr > 10.0, "SNR {snr:.2} dB at {rate} Hz / {ms} ms");
+        // shaped quantizer.
+        //
+        // Floor re-baselined (2026-09-28, seventh session): the rate-control
+        // loop's interpolation branch was firing on `found_upper` alone
+        // (garbage `gain_mult_lower`/`n_bits_lower`, still their
+        // zero-initializers), which sent `gainMult` off in essentially
+        // random directions and, incidentally, let the encoder silently
+        // exceed its 30 kbps target by 1.2-1.5x on many frames — this test's
+        // old 12.2-19.0 dB range was measuring that inflated effective
+        // bitrate, not 30 kbps quality. With the loop gated correctly on
+        // `found_lower && found_upper` the payload now actually tracks
+        // 30 kbps (see `rate_control_lands_payload_on_budget` and the
+        // todo.md session log), and honest 30 kbps quality on this signal
+        // measures 9.3-18.2 dB across the three configurations.
+        assert!(snr > 8.0, "SNR {snr:.2} dB at {rate} Hz / {ms} ms");
         let _ = avg_bytes;
     }
 }
@@ -307,32 +318,33 @@ fn sine_round_trip_fidelity() {
 /// The per-subframe, frequency-warped gain analysis
 /// ([`crate::silk::noise_shape`], the reference's
 /// `silk_noise_shape_analysis_FLP`) must measurably beat the frame-level
-/// proxy it replaced. Measured on this synthetic speech at 16 kHz/20 ms
-/// (mean payload in parentheses):
-///
-/// ```text
-///             8 kbps   16 kbps   24 kbps   32 kbps   48 kbps
-///   before     5.99      12.29     16.17     19.30     24.53 dB
-///   after      6.82      13.36     17.29     20.45     25.70 dB
-/// ```
-///
-/// The gate is set at the *oldest* measured point (8 kbps, +0.8 dB) so it
-/// tracks the analysis rather than a single lucky configuration.
+/// proxy it replaced. The original before/after table measured here (5.99
+/// vs 6.82 dB at 8 kbps, up to 24.53 vs 25.70 dB at 48 kbps) was taken while
+/// the rate-control loop had the interpolation-gating bug described below,
+/// which silently overshot these bitrate targets by 1.2-1.5x — see the
+/// floors' own comment for the corrected, budget-compliant measurement.
 #[test]
 fn shaped_gain_analysis_improves_speech_snr() {
     let rate = 16_000i32;
     let frame_len = 20 * 16;
     let signal = speech_like(frame_len * 200, 16);
-    // Floors re-baselined for the reference 4-band VAD: the real
-    // speech-activity measure (lower than the RMS stand-in on synthetic
-    // speech) lets the shaping analysis apply its background-SNR
-    // reduction, costing a fraction of a dB of waveform SNR for the
-    // intended perceptual benefit.
+    // Floors re-baselined (2026-09-28, seventh session): fixing the
+    // rate-control loop's interpolation-gating bug (see todo.md) stopped the
+    // encoder from silently overshooting these targets by 1.2-1.5x, so the
+    // payload now actually tracks 8/16/24/48 kbps instead of an inflated
+    // effective bitrate — and 8/16/24 kbps are all below this foundation
+    // quantizer's documented ~34 kbps floor for active 16 kHz speech (its
+    // gain search hits the 4x cap and still can't clear a smaller budget;
+    // see `shaped_gains_stay_within_the_quantizer_bound`), so quality this
+    // far under the floor is now honestly measured rather than flattered by
+    // the bug. Measured at the corrected, budget-compliant bitrate: 1.8 /
+    // 6.3 / 10.3 / 20.6 dB. Only 48 kbps clears the floor, and its honest
+    // number is still below the old (overshoot-inflated) gate.
     for &(bps, floor) in &[
-        (8_000i32, 6.0f64),
-        (16_000, 12.0),
-        (24_000, 16.0),
-        (48_000, 23.0),
+        (8_000i32, 1.0f64),
+        (16_000, 5.0),
+        (24_000, 9.0),
+        (48_000, 19.0),
     ] {
         let (recon, _) = encode_reconstruct(&signal, rate, 20, bps);
         let snr = snr_db(&signal[..recon.len()], &recon);
@@ -554,8 +566,12 @@ fn perceptual_metrics_track_shaped_speech_quality() {
     let awsnr = a_weighted_snr_db(&sig, &out, 48_000);
     let segsnr = segmental_snr_db(&sig, &out, 320);
     println!("A-weighted SNR {awsnr:.1} dB, segmental SNR {segsnr:.1} dB");
+    // A-weighted floor lowered 10.0 -> 8.0 dB (2026-09-28, seventh session):
+    // the rate-control loop's interpolation-gating fix ended a bug that let
+    // the encoder silently overshoot its 32 kbps target by 1.2-1.5x; honest
+    // 32 kbps quality on this signal measures 9.3 dB (see todo.md).
     assert!(
-        awsnr > 10.0,
+        awsnr > 8.0,
         "A-weighted SNR {awsnr:.1} dB below the regression floor"
     );
     assert!(

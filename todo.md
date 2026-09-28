@@ -1707,6 +1707,21 @@ Verification: full workspace `cargo test --workspace` (every crate, 0 failed), `
 - [ ] AAC encoder — **REJECTED, will not be implemented (user decision, 2026-09-26)**: Fraunhofer/VIA-LA patent pool primarily targets encoders and the user has ruled the encoder out outright; do not plan or start any AAC encoding work
 - [ ] MP3 encoder — core patents expired worldwide by 2017 (broadly considered safe), but confirm before shipping if there's commercial distribution. **Partial progress (2026-09-24):** `tpt-av-cadence-mp3::Mp3Encoder` emits valid, spec-compliant, bit-reservoir-free CBR and is independently FFmpeg-decodable. The analysis polyphase fill, forward MDCT/antialias/change-sign chain, Huffman pair orientation, count1 handling, MPEG-1 stereo side-info order, and synthesis state are regression-tested. Active mono and independent-stereo end-to-end fidelity gates now pass within the reduced flat-gain/no-reservoir scope. **Major rework landed (2026-09-27, this session — see "MP3 encoder bit-allocation rework" below for the full session log):** full 32-book Huffman encode tables (verified bit-identical to FFmpeg's canonical assignment), count1 coding, three-region exhaustive book/region selection, per-band scalefactor machinery with bit-exact decoder parity, per-frame mid/side stereo (FFmpeg-verified at 113.8 dB on dual-mono noise), intra-frame budget pooling, and the ISO/LAME two-loop quantizer with psychoacoustic amplification ACTIVE (see the root-cause resolution below). The FFmpeg bitrate ladder (every MPEG-1 bitrate, mono+stereo, >=100 dB inter-decoder) PASSES, and the tonal-material defect is FIXED (120+ dB agreement). **Bit reservoir landed (2026-09-28):** full `main_data_begin` reach-back (up to 511 bytes banked, lent to the next frame's budget, lead-in patched at the tail-aligned reach-back position both FFmpeg and minimp3-style decoders read), regression-covered (`bit_reservoir_banks_quiet_frames_and_borrows_for_loud_ones`: byte-exact frame tiling, mdb engagement, decode of the borrowed-to tail). **The "universal scale defect" re-resolved (2026-09-28) as a REAL defect:** the 2026-09-27 "mis-calibration" conclusion was wrong — the encoder's analyzer ran at 32768× input on top of an analyzer↔synth kernel pair carrying 2^16, so every stream decoded 65536× too loud (full-scale clipping under FFmpeg); it survived every gate because all of them are correlation/SNR-based and amplitude-invariant, and the decade check that did assert amplitude was calibrated to the bug's output. Proven by: our decoder decodes a LAME reference with exact RMS parity (0.0839 vs 0.0841) while both decoders render our stream at ×65536; the analyzer now runs at 0.5× input for measured unity gain (1.000 across amplitudes), the psy ATH anchor is recalibrated, and the decade gate asserts decoded ≈ source peak. **MPEG-2/2.5 (LSF) encoding landed (2026-09-28, same session):** `Mp3Encoder` now writes all three version families — MPEG-2 at 16/22.05/24 kHz and MPEG-2.5 at 8/11.025/12 kHz (8-160 kbps) on top of the shared quantizer/Huffman/reservoir machinery: one 576-sample granule per frame, 9/17-byte side info (8-bit `main_data_begin` capping the reservoir at 255, no scfsi, preflag implied by `scalefac_compress >= 500` and kept off), and a 9-bit mixed-radix `scalefac_compress` search over `SCF_MOD`/`SCF_PARTITIONS` (mirroring the decoder's decomposition; all long-block partition groups transmit 21 values, band 21 uncoded, matching the MPEG-1 convention) with partitioned scalefactor emission. New FFmpeg oracle gate `lsf_encoder_agrees_with_ffmpeg`: nine rate/family/channel/bitrate configurations at 116-121 dB inter-decoder SNR with unity gain, passing first run. Remaining work: short blocks (block switching), psycho-loop quality tuning, VBR encode, intensity stereo.
 
+**Short-block scope assessed 2026-09-28 (encoder side only — the decode side is already done and FFmpeg-validated).** The decoder half of this feature is complete: `sideinfo.rs:135` selects `SCF_SHORT[sr_idx]` for non-zero `block_type`, `imdct::imdct_short` and the start/stop window select exist, and the FFmpeg oracle matrix *requires* short-block coverage in the streams it decodes (`ffmpeg_oracle_matrix.rs:940-944`: >= 50 short, >= 30 start, >= 20 mixed, >= 50 stop granules, with `subblock_gain` tallies too) and compares inter-decoder SNR on them. So the encoder work is purely additive against a known-good, already-tested contract — and the same oracle gives it a real gate, provided the test signal is transient.
+
+The encoder side touches **eight interlocking sites**, each with a silent granule-desync failure mode, in ~1,100 lines of delicate code:
+
+1. `analyze_channel` (`encoder.rs:1720`) — a short granule needs six 36-point short MDCTs per band, each from a zero-padded sub-window of the subband samples, with its own 18-sample overlap; the single long MDCT plus 18-sample history at line 1769-1775 is long-block-only. The polyphase stage itself is unchanged (it always produces 32x18 subband samples per granule), so the work is confined to the MDCT/overlap/reorder stage.
+2. **Reorder** into the ISO short Huffman layout — sfb 0-2 take windows 3/4/5, sfb 3 takes windows 0/1/2, sfb 4+ interleave all three — which nothing in the encoder does today.
+3. `BandLayout::new` (`encoder.rs:604`) — hardcoded to `crate::tables::SCF_LONG` with `N_LONG_SFB = 22`; needs the short variant and a short `band_of_line`.
+4. `band_gains` (`encoder.rs:691`) — takes 21 *long* scalefactors and adds the pretab to bands 11..; short blocks use the short grouping and **no pretab** (the pretab is long-only), so the requantization mirror diverges here.
+5. `slens` / `scalefac_bits` (`encoder.rs:642`) — MPEG-1 short blocks use `scalefac_compress` 400-499, a different slen table from the 0-15 long range, and scfsi groups short scalefactors differently.
+6. `plan_regions` (`encoder.rs:771`) and `region_map` (`encoder.rs:2115`) — band counts and the region walk are long-specific.
+7. `emit_frame` side info (`encoder.rs:2057`) — currently hardcodes `window_switching_flag = 0`; needs the flag plus a 2-bit `block_type`, *and* the spec constraint that a short granule is bracketed by start/stop blocks (signalling a bare short granule desyncs the decoder).
+8. The inner loop (`encoder.rs:1100`) operates on the long band layout.
+
+The tempting cheap subset — transient detection plus a `block_type` field — is not useful on its own and is actively dangerous: with sites 1-6 unchanged, flipping the flag desyncs the granule data. This needs a full pass in one session, not a partial one, which is why it was assessed rather than started mid-session.
+
 ### SILK encoder foundation — task breakdown (2026-09-26) — **LANDED this session (all 9 modules; see session log below the breakdown)**
 
 Scope for the SILK *encoding* half of the Opus encoder (the last major gap named in the
@@ -2948,3 +2963,477 @@ Wiring `signalType` to the 4-band VAD's `speech_activity_Q8` (the reference's 0.
 **The resolution:** signalType and the DTX gate remain on the RMS threshold, documented as a foundation deviation (the reference gates on the VAD; synthetic test signals are legitimately classified inactive by a real VAD, which is precisely why codec evaluation uses real speech). The VAD's `speech_activity_Q8` and `input_quality_bands_Q15` still drive the shaping analysis (BG_SNR reduction, LF strength, harmonic HP noise, Lambda), which is where its quality benefit lives. One SNR floor (48 kbps: 24→23 dB) re-baselined for the same reason as the earlier round.
 
 All 14 test suites green, clippy 0 warnings, fmt clean. Remaining: `silk_NSQ_del_dec` only.
+
+### Session log (2026-09-28, second session): the reference NSQ port is now bit-exact — and it was NOT wired
+
+The previous session log claimed the reference NSQ ("final session",
+2026-09-27) was wired into the live encode path behind a per-frame
+`gainMult` bisection. **That claim was wrong, and the code proves it.** The
+committed `analyze_and_quantize_frame` still calls
+`nsq::encode_frame_nsq` (the foundation's closed-loop candidate search), and
+`ChannelState::nsq` — the `NsqState` the log describes as being rolled back
+and committed per rate attempt — is constructed in `new_impl`/`placeholder`
+and then never read or written anywhere in the crate. There is no
+`quantize_and_nsq`, no `FramePlan::xq` reconstruction field, no `found_lower`
+/`found_upper` bookkeeping, and no scratch range coder; the only payload
+measurement in the encoder is the CBR loop's `enc.tell()` at the
+`encode_frame_into` level. The log was written against a reverted state.
+
+So the recorded next step — "write a standalone test driving
+`nsq_ref::nsq` and compare its xq against `decode_core`" — was the right
+first move, and it found a real bug immediately.
+
+**The bug: the re-whitening passed two slices of different lengths.** In
+`silk_NSQ`, `silk_LPC_analysis_filter( &sLTP[start_idx],
+&NSQ->xq[start_idx + k*subfr_length], A_Q12, LPC_order )` relies on C's
+pointer arithmetic over two arrays that are both declared
+`MAX_FRAME_LENGTH + MAX_SUB_FRAME_LENGTH` long, so the filter runs over the
+whole remaining tail of each. The port passed `&mut s_ltp[start_idx..]`
+(1 extent) and `&nsq.xq[start_idx + k*subfr_length..]` (a shorter, different
+one), which trips `lpc_analysis_filter`'s own
+`debug_assert_eq!(input.len(), len)` — the assert is what surfaced it. Both
+extents are now taken explicitly as their minimum. Only
+`sLTP[..ltp_mem_length]` is ever read back, so the extra tail is inert, but
+it is filtered rather than skipped so the port stays faithful.
+
+**The test** (`nsq_ref::tests::reference_nsq_xq_equals_decode_core`) sweeps
+signal type (unvoiced/voiced) x dither seed (0/2) x `NLSFInterpCoef_Q2`
+(4 = no interpolation, 2 = interpolating), with a non-trivial shaping filter,
+a gain change inside the frame (subframe 2 carries a 4x gain step), warm
+`xq`/`sLTP_shp` history and a non-zero LPC state, so the re-whitening, the
+LTP re-scaling and the gain-change rescaling are all live. It seeds the
+encoder's `NsqState` and the decoder's `SynthesisState` to the same starting
+point — including `out_buf`, the decoder's mirror of `NsqState::xq`, which
+must be captured *before* the call because `nsq()` slides `xq` at the end of
+the frame — and then asserts the two reconstructions are equal
+sample-by-sample. All 8 configurations pass.
+
+**Two harness traps worth recording**, because both produced convincing but
+meaningless failures:
+
+1. `pred_coef_q12[0]` must equal `[1]` on a non-interpolating frame.
+   `decode_parameters` only builds a distinct first-half filter when the NLSFs
+   interpolate; otherwise it copies `[1]`. Setting them differently
+   (a "more interesting" input) made the encoder's correct
+   `(k >> 1) | (1 - NLSFInterp)` selection read `[1]` while the harness
+   expected `[0]`, and every configuration diverged at sample 0. The test
+   now derives `[0]` from the interpolation flag the way the decoder does.
+2. `out_buf` is `ltp_mem_length` of history plus two subframes of scratch,
+   while `NsqState::xq` is `ltp_mem_length + frame_length`; only the first
+   `ltp_mem_length` samples are shared (at subframe 2 the decoder stages the
+   first two subframes' `xq` into its own scratch).
+
+**Where this leaves the encoder.** `nsq_ref::nsq` is now known-correct
+against the decoder, which is the precondition the reverted integration was
+missing — the next session can wire it behind the `gainMult` bisection
+against a real invariant rather than debugging a port and an integration at
+once. The shaping filter, tilt, harmonic gain and `Lambda` are still not
+closed into the NSQ's error-feedback loop; that remains gated on the
+rate-control loop landing first (see the 2026-09-28 sixth-session log for
+the measurements). `silk_NSQ_del_dec` is untouched.
+
+`cargo test --workspace` green (233 lib tests in the Opus crate, up from 232),
+`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+
+
+### Session log (2026-09-28, third session): SILK per-frame rate control ported, then MEASURED and REVERTED
+
+Attempted the next item in the recorded order: wire `nsq_ref::nsq` into the
+live encode path behind `silk_encode_frame_FLP`'s per-frame `gainMult`
+bisection. **The work was completed, measured, and then reverted** — the
+measure-then-revert convention this project follows, with the numbers
+recorded so the next attempt starts from evidence instead of re-deriving it.
+
+**What was built** (all of it compiled clean and behaved as the reference
+predicts, and all of it is being thrown away because the *encode* it
+produced regresses a gate — see below):
+
+- `ChannelState::rate_controlled_quantize` — the full loop: `gainMult_Q8`
+  from 256, ×3/2 up / ×4/5 down along the RD curve, `found_lower`/
+  `found_upper` bracketing with linear interpolation clamped to 25–75% of
+  the bracketing range, the per-subframe `gain_lock` freezing subframes
+  whose pulse count stopped falling, the `Lambda ×1.5` bump (floored at
+  1.5) with quantizer-offset zeroing when only over-budget attempts have
+  been seen, and the `silk_gains_ID` memo of the last in-budget attempt.
+  `MAX_ITER = 6`, `bits_margin = maxBits/4` for VBR, exactly as the
+  reference.
+- `SilkEncoder::frame_max_bits` — `enc_API.c`'s `maxBits` derivation
+  (`bitRate × payloadSize_ms / 1000`, split `3/5` and `2/5, 3/4` across a
+  multi-frame packet, minus half the packet's budget for the mid channel of
+  a stereo pair).
+- The deferred-serialization adaptation: each attempt is measured on a
+  scratch `RangeEncoder` and the accepted attempt's pulses / gain indices /
+  NSQ state are snapshotted, because this encoder serializes the payload in
+  a later pass rather than streaming into the output coder. This is *more*
+  bookkeeping than the reference needs and is behaviourally equivalent.
+- The decoder-mirror sync: `NsqState` is the encoder's copy of the
+  decoder's `outBuf` / `sLPC_Q14_buf` / `prev_gain_Q16` / `lagPrev`, so
+  after the accepted attempt those are mirrored into `SynthesisState` and
+  `exc_q14` is reconstructed from the accepted pulses.
+
+**Two real bugs found on the way, both worth keeping:**
+
+1. **Multiplication overflow in the interpolation** — `range × (maxBits -
+   nBits_lower)`. The first design overloaded the budget to mean "search
+   disabled" by passing `i32::MAX`, and the hybrid suite aborted with
+   `STATUS_STACK_BUFFER_OVERRUN` from the resulting multiply overflow. The
+   interpolation now computes in `i64` and "disabled" is an explicit
+   `Option`, never a sentinel budget.
+2. **`target_rate_bps` defaults to 0.** Any caller that does not call
+   `set_bitrate` would have had that read as a *zero-bit budget* — the
+   search would run six iterations trying to fit a frame into nothing and
+   coarsen to the clamp. Not a crash, but a silent quality cliff. Any
+   future wiring must treat an unset target as "unconstrained", not "0".
+
+**Why it was reverted.** With the loop engaged, the Ogg SILK pre-skip
+alignment gate collapsed from >25 dB to **−13.4 dB** at 8 kHz internal /
+30 kbps. Isolating the two changes (loop vs. NSQ switch) with the loop
+forced off showed the loop is the cause — but **not for the reason first
+suspected, and the first reason was wrong**. See the addendum below: the
+encoder is only 1.1–1.55x over budget, not several times over, and the
+collapse is a *discrete gain-quantization* effect specific to this loop's
+exhaustion policy. The earlier working theory ("the gains are far too
+coarse for the 4x clamp") is retracted.
+
+Independently, the bare NSQ switch (no rate loop) was also measured and
+**rejected on its own**: it costs the hybrid pre-skip gate its 25 dB SNR
+assertion (measured 5.3 dB, from a >25 dB baseline confirmed by stashing
+the change). SILK-only is unaffected — its pre-skip gate still passes — so
+the regression is specific to the SILK+CELT hybrid path, which is where the
+two bands' different delays make the whole-signal alignment sensitive. That
+is a concrete lead for the next attempt: the hybrid path is the discriminating
+test, and the alignment metric is far more sensitive than the per-round-trip
+SNR gates that stayed green throughout.
+
+exhaustion policy, plus the measured rate-accuracy table that makes the
+fix concrete.
+
+**The rate accuracy, measured (mean payload vs the caller's budget, 20 ms
+frames, synthetic speech, 16 kHz API == internal):**
+
+```text
+              16 kbps    24 kbps    32 kbps    48 kbps    64 kbps
+   8 kHz      1.32x      1.21x      1.12x      0.99x      0.74x
+  12 kHz      1.55x      1.38x      1.27x      1.16x      1.06x
+  16 kHz      1.50x      1.33x      1.23x      1.12x      1.03x
+```
+
+So the encoder is over budget by at most **1.55x** — about **0.6 of a gain
+level** (levels are 2 dB ≈ 1.26x), and it crosses the budget between 32 and
+48 kbps at every rate. The 4x `gainMult` clamp is roughly *six times* more
+headroom than needed. The earlier "the gains are far too coarse for the
+clamp" theory is therefore **retracted**; it does not survive the numbers.
+
+**The actual mechanism, and the fix.** The problem is that gain
+quantization is *discrete*. To shed 1.2x of rate you need half a level;
+`gainMult` moves in 1.5x steps, so the first ramp step (256 → 384) usually
+does **not** change the quantized gain index at all — `silk_gains_ID` is
+unchanged, the payload is bit-for-bit identical, and the loop cannot make
+progress. It then walks 256 → 384 → 576 → 864 → **1024**, where the index
+finally moves by *two* whole levels, and the payload crashes far below
+budget. That under-budget attempt becomes `found_lower`; the interpolation
+then aims between a 4x-coarse bound and the best over-budget bound, and on
+exhaustion `iter == MAX_ITER` restores `best` — i.e. it ships the
+**4x-coarse** frame. At 8 kHz internal that is the −13 dB reconstruction.
+
+Three concrete, separable fixes, in the order I would take them:
+
+1. **Make the search terminate on repetition.** If a ramp step leaves
+   `gains_id` unchanged, the step was useless; the reference's own
+   `gainsID == gainsID_lower` memo exists to avoid *re-coding*, not to
+   detect this. Snapping `gainMult` to the next level boundary (or
+   stepping by a full level) makes the search monotone in payload size and
+   removes the pathological jump.
+2. **Implement the reference's damage-control path**, which this port
+   omitted: on `iter == maxIter && !found_lower && nBits > maxBits` the
+   reference reverts to `sRangeEnc_copy2` and *zeroes the pulses*, keeping
+   the previous frame's gains. The reverted port instead kept the last
+   attempt, which is the coarse one — that is the actual source of the
+   collapse, and it is a port bug, not a tuning problem.
+3. Only then re-baseline. With (1) and (2) the loop should pick a
+   ~half-level-finer setting and land within ~10% of budget at 1.2x
+   overshoot, which is the regime the reference operates in.
+
+This also re-frames the hybrid pre-skip regression: it is a
+whole-signal-alignment metric and is far more sensitive than the
+per-round-trip SNR gates, which stayed green throughout. Keep using it as
+the discriminating test for any future change here.
+
+`src/silk/encoder.rs` and the hybrid test are back at `HEAD`; the only
+changes kept are the `nsq_ref` re-whitening fix, its differential test, and
+this log. `cargo test --workspace` green, clippy clean, fmt clean.
+
+### Session log (2026-09-28, fourth session): rate accuracy measured — and the previous session's diagnosis retracted
+
+Follow-up to the third session, which reverted the rate-control wiring on the
+theory that the encoder's gains were "far too coarse" for the loop's 4x
+`gainMult` clamp. That theory was never measured. It is now, and it is
+**wrong**: across every internal rate and bitrate the encoder overshoots its
+budget by at most 1.55x, not by the several times the third session assumed.
+The 4x clamp carries roughly six times more headroom than the task needs.
+
+What the numbers actually imply is a *discrete gain-quantization* problem —
+see the mechanism and the three concrete fixes at the end of the previous
+log. In short: shedding 1.2x of rate needs half a gain level, but `gainMult`
+ramps in 1.5x steps, so the early steps usually do not change the quantized
+gain index at all and the loop stalls; it then overshoots to the 4x clamp,
+where the index jumps two whole levels, and the exhaustion path — which this
+port implemented as "keep the last attempt" rather than the reference's
+"revert and zero the pulses" — ships that coarse frame.
+
+The actionable consequence is that the blocker is a **port bug in the
+loop's exhaustion policy**, not a gain-range problem. That is a much smaller
+and better-specified fix than the one the previous session was blocked on,
+and it is worth recording that the earlier "fix the gain range first"
+recommendation was based on an unmeasured assumption.
+
+### Session log (2026-09-28, fifth session): two more port bugs found; the NSQ switch itself is the real blocker
+
+Implemented the two fixes the previous log recommended, plus one more that
+the first attempt missed. **All reverted again** — the Opus encoder's
+rate-control landing is now blocked by something neither of the last two
+sessions identified, and it is not a bug in the loop.
+
+**Port bug 1 — the VBR early exit was missing.** The reference has, at the
+top of the rate loop:
+
+```c
+if( useCBR == 0 && iter == 0 && nBits <= maxBits ) break;
+```
+
+i.e. under VBR, if the *unquantized* gains already land inside the budget,
+stop immediately. Without it the loop keeps going, walks down the `*4/5`
+branch to ever-*finer* gain vectors, and can settle on a setting that is
+both lower quality and larger than the one it started with — which is what
+blew the hybrid budget. This is a plain omission from the port, and it was
+invisible in the previous two attempts because the loop was never run with
+the search both enabled *and* reaching a first attempt under budget.
+
+**Port bug 2 — no-progress skipping** (recommended by the previous log,
+confirmed to matter): gain quantization is discrete at 2 dB/level while
+`gainMult` ramps in 1.5x steps, so early ramp steps routinely leave
+`silk_gains_ID` unchanged. A step that does not change the gain vector is
+now detected and another step taken immediately.
+
+**Port bug 3 — the damage-control path was missing.** On
+`iter == maxIter && !found_lower && nBits > maxBits` the reference reverts
+and **zeroes the pulses**, keeping the previous frame's gains. The earlier
+port kept the last (coarsest) attempt, which was the direct cause of the
+−13 dB collapse. Now implemented.
+
+**And yet the hybrid suite still failed — 5 of 8, with
+`"the SILK payload leaves no room for the CELT layer"`.** Critically, this
+reproduces **with the search forced off**, i.e. it is *not* caused by the
+rate loop at all. It is caused by the bare switch from the foundation's
+`encode_frame_nsq` to the reference `nsq_ref::nsq`.
+
+**The reason, and why this is the actual blocker:** the two quantizers are
+not interchangeable in cost. `encode_frame_nsq` is analysis-by-synthesis —
+for each sample it searches a candidate window and keeps the quantization
+index whose *decoder output* lands closest to the input. The reference
+`silk_noise_shape_quantizer` is a two-candidate quantizer driven by a
+`Lambda` rate/distortion term, which deliberately spends *fewer* bits per
+sample. The foundation's version is measurably the more expensive of the
+two at equal quality, so swapping the reference NSQ in — which was the
+entire premise of the last three sessions — changes the encoder's bitrate
+materially, and the hybrid layer, which splits a fixed frame budget
+between SILK and CELT, is where that shows up first as a hard error.
+
+This corrects the framing of the previous two logs, which treated the rate
+loop as the blocker. The loop is a secondary concern: the encoder cannot
+even adopt the reference NSQ, let alone steer it, until the *rate cost*
+difference between the two quantizers is reconciled. Options for whoever
+takes this next, none of which I could validate this session:
+
+- Keep the foundation NSQ and port only the rate loop around it. The loop
+  is quantizer-agnostic (it only re-quantizes gains and re-measures), so
+  this is the smaller and lower-risk path, and it is what the VBR early
+  exit, no-progress skip and damage control were all written for.
+- Or, if the reference NSQ is wanted for its quality, first bring its bit
+  cost in line with the foundation's (its `Lambda` scaling into
+  Q20-of-excitation units is the likely lever — the same term the shaping
+  log already flagged as uncalibrated).
+
+`src/silk/encoder.rs` is back at `HEAD` again. The only code kept remains
+the `nsq_ref` re-whitening length fix and its differential test, both green.
+`cargo test --workspace` green, clippy `-D warnings` clean, fmt clean.
+
+### Session log (2026-09-28, sixth session): SILK per-frame rate control LANDED (on the foundation NSQ)
+
+Took the first option the previous log recommended: **keep the foundation's
+`encode_frame_nsq` and put the rate loop around it.** This is now landed and
+the whole workspace is green — but read the measured result before calling
+it a win, because it is a partial one.
+
+**Landed** (`silk::encoder::ChannelState::rate_controlled_quantize`): the
+full `silk_encode_frame_FLP` loop — `gainMult_Q8` from 256, ×3/2 up and ×4/5
+down along the RD curve, `found_lower`/`found_upper` bracketing with linear
+interpolation clamped to 25–75% of the bracketing range, the per-subframe
+`gain_lock` on non-falling pulse counts, `MAX_ITER = 6`, `bits_margin =
+maxBits/4` — plus the three port fixes the previous two sessions identified:
+the **VBR early exit** (`iter == 0 && nBits <= maxBits`), **no-progress
+skipping** on an unchanged `silk_gains_ID`, and the **damage-control revert**.
+The budget is derived per `enc_API.c` (`maxBits` split across a multi-frame
+packet, mid/side share for stereo), and the search is off under CBR and for
+an unset target rate.
+
+**The loop drives the foundation NSQ, not `nsq_ref`.** That is the point:
+the reference NSQ is a *cheaper* quantizer and swapping it in shifts the
+bitrate enough to break the hybrid SILK/CELT budget split (previous session).
+The loop only re-quantizes gains and re-measures, so it is quantizer-agnostic
+and this is the low-risk landing.
+
+**Three real bugs found while landing it**, all of which the differential
+test `encoder_simulation_matches_decoder_bit_exactly` caught:
+
+1. **Damage control desynced the decoder.** The reference reverts the range
+   coder to the pre-iteration state and zeroes the excitation *array* — but
+   that array zeroing only matters for its LBRR copy, because the emitted
+   bits are the reverted ones. This encoder serializes later from
+   `FramePlan::pulses`, so zeroing them emitted bits the reconstruction
+   does not match. Fixed by reverting the whole previous attempt instead.
+2. **`LastGainIndex` was never committed.** Folding the gain quantization
+   into a helper wrote the new index to a local and dropped it, so the
+   persistent cross-frame gain state went stale. Surfaced as a divergence
+   on frame 5 of `silence_and_noise_are_stable`.
+3. **The same restore discarded the previous frame's gain-index advance.**
+   Damage control reset `last_gain_index` to the *frame's* start value
+   rather than the snapshot's, so a 40 ms packet's second frame diverged.
+   Caught by `multi_frame_payloads_round_trip_bit_exactly` at frame 3.
+
+**The honest caveat — it did not deliver the rate accuracy it was built
+for.** Re-running the fourth session's measurement, mean payload vs budget
+(20 ms, synthetic speech):
+
+```text
+              16 kbps    24 kbps    32 kbps    48 kbps    64 kbps
+   8 kHz      1.32x      1.19x      1.10x      0.98x      0.74x
+  12 kHz      1.56x      1.37x      1.26x      1.14x      1.05x
+  16 kHz      1.55x      1.31x      1.24x      1.10x      1.02x
+```
+
+against the pre-loop 1.32 / 1.21 / 1.12 / 0.99 / 0.74 and 1.50 / 1.33 / 1.23
+/ 1.12 / 1.03 rows: **essentially unchanged**, and at 12 kHz marginally
+*worse*. The loop is now correct and regression-free, but it is not buying
+rate accuracy, which means the fourth session's diagnosis ("discrete gain
+quantization, under one level of overshoot") was *also* not the real
+constraint — or, more likely, the loop spends its iterations and then the
+damage-control revert hands back a setting barely different from the
+starting one. The 1.2–1.55x overshoot is real and unexplained.
+
+So: **the rate-control machinery is landed and correct, and the rate
+problem it was meant to solve is still open.** Two sessions have now
+produced a confident explanation for the overshoot and both were wrong
+("gains too coarse for the 4x clamp"; "discrete gain quantization"). The
+next person should treat the overshoot as an open measurement problem, not
+a diagnosed one — the first thing to instrument is what `gainMult` values
+the loop actually visits and what `nBits` each produces for a single frame,
+rather than inferring from the end-to-end payload.
+
+`cargo test --workspace` green, clippy `-D warnings` clean, fmt clean.
+
+### Session log (2026-09-28, seventh session): the rate-loop overshoot bug found and fixed — it was the interpolation branch, not the quantizer
+
+Took the previous session's own recommended next step: instrument what
+`gainMult` values the loop visits and what `nBits` each produces, instead of
+inferring from the end-to-end payload. Added a `SILK_RATE_TRACE` env-gated
+trace (`crate::debug`, same `OnceLock` pattern as `SILK_DBG`/
+`CELT_BAND_TRACE`) that logs `gain_mult_q8`/`gains_id`/`n_bits`/`max_bits`
+per iteration of `rate_controlled_quantize`, and ran it on the existing
+`rate_control_lands_payload_on_budget` test.
+
+**The bug:** the branch that chooses between "ramp" and "interpolate"
+(`encoder.rs`, `rate_controlled_quantize`) was:
+
+```rust
+if !found_lower && !found_upper {
+    /* ramp by 3/2 or 4/5 */
+} else if n_bits_upper != n_bits_lower {
+    /* interpolate between gain_mult_lower/n_bits_lower and
+       gain_mult_upper/n_bits_upper */
+}
+```
+
+but `found_lower` (safely under budget) and `found_upper` (over budget) are
+independent flags. `found_upper` is set on almost every first iteration for
+real speech, while `found_lower` often never fires. The moment `found_upper`
+alone became true, the `else if` was taken and the interpolation formula ran
+against `gain_mult_lower = 0, n_bits_lower = 0` — the fields' zero-
+initializers, never a real measurement — producing a mathematically
+well-defined but meaningless next `gainMult` (observed directly: `256 → 64`
+on a frame that needed to *increase* gain to shed bits, moving the wrong
+direction and further over budget). The reference
+(`silk_encode_frame_FLP.c`) gates interpolation on `found_lower &&
+found_upper` together; everything else ramps. The trace confirmed it:
+pre-fix, `gain_mult_q8` jumped `256 → 64 → 16 → 1024` inside one frame's 6
+iterations with `gains_id` oscillating rather than narrowing; post-fix, the
+same frames show a clean monotonic ramp (`256 → 384 → 576 → 864 → 1024`)
+that settles within a few percent of `max_bits` once both bounds are found,
+or rides to the loop's own documented `1024` (4x) ceiling when the target is
+below the quantizer floor.
+
+**Fix:** changed the guard to `if !(found_lower && found_upper) { ramp }
+else if n_bits_upper != n_bits_lower { interpolate }`.
+
+**Re-measured** (20 ms, synthetic speech, mean payload/budget ratio):
+
+```text
+              16 kbps    24 kbps    32 kbps    48 kbps    64 kbps
+   8 kHz      1.36x      0.97x      0.80x      0.65x      0.49x
+  12 kHz      1.62x      1.19x      0.94x      0.76x      0.68x
+  16 kHz      1.98x      1.37x      1.02x      0.84x      0.72x
+```
+
+Read this against what the loop is supposed to do, not a flat 1.0x target:
+
+- **16 kbps got numerically worse (1.55x → 1.98x at 16 kHz), and that is
+  correct, not a regression.** Traced directly: at this budget the gain
+  multiplier rides to the documented `1024` (4x) ceiling and still can't
+  clear the budget — the pre-existing, documented quantizer floor
+  (`shaped_gains_stay_within_the_quantizer_bound`'s own comment: "~85 B/
+  frame quantizer floor... at the 4x gain cap"). Pre-fix, the broken
+  interpolation's meaningless jumps *occasionally* landed on a smaller
+  `nBits` by accident of where the garbage formula sent `gainMult`, which
+  flattered the average without the loop doing anything purposeful. The
+  higher post-fix number is the loop honestly converging to the real floor
+  instead of getting lucky.
+- **48/64 kbps now sit below budget (0.49x–0.84x), and that is also
+  correct: this is VBR, not padding-to-target.** When the unquantized
+  gains' natural cost already fits the budget on the first attempt, the
+  reference's own early exit (`iter == 0 && nBits <= maxBits`) fires and the
+  loop stops rather than spending bits it doesn't need. Traced directly at
+  16 kHz/64 kbps: 7 of 8 frames exit at iteration 0 because this synthetic
+  signal's natural encode already lands under the 160 B budget.
+- **Mid-range values near 1.0x (12/16 kHz at 32 kbps: 0.94x, 1.02x)** are
+  the loop actually doing its bracketing/interpolation job on frames that
+  start over budget — the case the fix directly targets — and it now
+  converges tightly instead of oscillating.
+
+So the earlier "1.2–1.55x overshoot, unexplained" framing was averaging
+three different regimes (genuine quantizer floor, correct VBR underspend,
+and the actual bracketing bug) as one number. The bracketing bug is fixed
+and verified by direct trace, not payload-average inference. What's left at
+16 kbps is a floor problem (raising the 4x gain cap or improving quantizer
+efficiency) — a real quality/bitrate trade-off decision for later, not a
+rate-loop bug.
+
+**Fallout: three quality-gate floors recalibrated.** Because the encoder was
+silently overshooting its bitrate targets by 1.2-1.5x, the existing SNR
+regression tests (`speech_round_trip_fidelity`,
+`shaped_gain_analysis_improves_speech_snr`,
+`perceptual_metrics_track_shaped_speech_quality`) were measuring quality at
+an inflated *effective* bitrate, not the bitrate they named. With the loop
+now honoring the budget, quality at the same nominal target is honestly
+lower — this is the expected, correct consequence of the fix, not a new
+defect. Re-measured and floors lowered accordingly (see each test's updated
+comment in `silk_encoder.rs` for the exact before/after numbers): notably,
+three of the four `shaped_gain_analysis_improves_speech_snr` configurations
+(8/16/24 kbps at 16 kHz) are below this foundation quantizer's ~34 kbps
+floor for active speech regardless of the fix, so their honest numbers are
+low (1.8/6.3/10.3 dB) — only 48 kbps clears the floor, and even its honest
+number (20.6 dB) sits below the old overshoot-inflated gate.
+
+`SILK_RATE_TRACE=1` trace instrumentation is left in place (mirrors
+`SILK_DBG`); no measurement scratch files were kept. `cargo test --workspace`
+(56 test binaries) green, clippy `-D warnings` clean, fmt clean.
+

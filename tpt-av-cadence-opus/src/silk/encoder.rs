@@ -96,6 +96,7 @@ use crate::silk::noise_shape::{
 };
 use crate::silk::nsq::encode_frame_nsq;
 use crate::silk::resampler::Resampler;
+use crate::silk::sigproc::{lshift_sat32, smulwb};
 use crate::silk::stereo::{
     encode_mid_only_flag, encode_stereo_pred, lr_to_ms, StereoEncState, StereoPredIx,
 };
@@ -674,6 +675,35 @@ impl SilkEncoder {
 
     /// Applies a working rate without touching the caller's target (the
     /// CBR retry loop reduces this until the payload fits).
+    /// The per-frame bit budget the rate-control loop steers to, mirroring
+    /// `enc_API.c`'s `maxBits` derivation.
+    ///
+    /// `maxBits = bitRate * payloadSize_ms / 1000`, then split across the
+    /// frames of a multi-frame packet (`2 * 3/5` for the first of two;
+    /// `2/5`, `3/4` for the first two of three), and finally the mid channel
+    /// of a stereo pair gives up half its share when the side is also coded.
+    ///
+    /// Returns `None` when the per-frame search is switched off: under CBR
+    /// the packet-level retry loop already owns the rate, and running both
+    /// would fight each other. A zero/unset target rate also returns `None`
+    /// — it means "unconstrained", never a zero-bit budget.
+    fn frame_max_bits(&self, frame_index: usize, is_mid: bool, side_coded: bool) -> Option<i32> {
+        if self.cbr.is_some() || self.target_rate_bps <= 0 {
+            return None;
+        }
+        let total = (i64::from(self.target_rate_bps) * i64::from(self.packet_ms) / 1000) as i32;
+        let mut max_bits = match (self.packet_frames, frame_index) {
+            (2, 0) => total * 3 / 5,
+            (3, 0) => total * 2 / 5,
+            (3, 1) => total * 3 / 4,
+            _ => total,
+        };
+        if is_mid && self.channels_internal == 2 && side_coded {
+            max_bits -= total / (self.packet_frames as i32 * 2);
+        }
+        Some(max_bits.max(1))
+    }
+
     fn set_working_rate(&mut self, rate_bps: i32) {
         for ch in self.ch.iter_mut().take(self.channels_internal) {
             ch.snr_db_q7 = control_snr(ch.fs_khz, ch.nb_subfr, rate_bps.max(0));
@@ -963,6 +993,7 @@ impl SilkEncoder {
                 let mid_only_i = stereo && self.mid_only[i];
 
                 /* Mid channel: slide the history window, append the frame. */
+                let mid_max_bits = self.frame_max_bits(i, true, stereo && !self.mid_only[i]);
                 {
                     let ch = &mut self.ch[0];
                     let total = ch.ltp_mem_length + ch.frame_length;
@@ -987,6 +1018,7 @@ impl SilkEncoder {
                         i > 0,
                         seed,
                         use_cbr,
+                        mid_max_bits,
                     );
                     plans[0].push(plan);
                 }
@@ -999,6 +1031,7 @@ impl SilkEncoder {
                         self.ch[1].reset_after_mid_only();
                     }
                     let conditional_side = !(i == 0 || i == 1 || prev_mid_only);
+                    let side_max_bits = self.frame_max_bits(i, false, true);
                     {
                         let ch = &mut self.ch[1];
                         let total = ch.ltp_mem_length + ch.frame_length;
@@ -1022,6 +1055,7 @@ impl SilkEncoder {
                             conditional_side,
                             seed,
                             use_cbr,
+                            side_max_bits,
                         );
                         plans[1].push(plan);
                     }
@@ -1311,6 +1345,7 @@ impl ChannelState {
         conditional_gains: bool,
         seed: i8,
         use_cbr: bool,
+        max_bits: Option<i32>,
     ) -> FramePlan {
         /*--------------------------------------------------------*/
         /* Side-info skeleton (type, VAD flag, seed). `indices`   */
@@ -1540,40 +1575,32 @@ impl ChannelState {
         for k in 0..self.nb_subfr {
             gains_q16[k] = (gains[k] * 65536.0) as i32;
         }
-        /* Frames 1.. of a multi-frame packet are conditionally coded:
-         * subframe 0's gain is quantized as a delta against the persistent
-         * `LastGainIndex`, mirroring the decoder's `gains_dequant`. */
-        gains_quant(
-            &mut indices.gains_indices,
-            &mut gains_q16,
-            &mut self.last_gain_index,
-            conditional_gains,
-            self.nb_subfr,
-        );
-        ctrl.gains_q16 = gains_q16;
+        /* The unquantized gains the rate-control loop scales
+         * (`sEncCtrl.GainsUnq_Q16`). Everything else — signal type, NLSF,
+         * pitch, LTP — is decided once, above, exactly as the reference does
+         * before entering the loop. */
+        let gains_unq_q16 = gains_q16;
         if indices.signal_type == TYPE_VOICED {
             indices.quant_offset_type = if ltpred_cod_gain_db > 1.0 { 0 } else { 1 };
         }
+        let base_quant_offset_type = indices.quant_offset_type;
 
         /*--------------------------------------------------------*/
-        /* Excitation (closed-loop NSQ) + state updates           */
+        /* Quantization + entropy coding with the per-frame      */
+        /* rate-control loop (`silk_encode_frame_FLP`).           */
         /*--------------------------------------------------------*/
-        let mut pulses = [0i16; MAX_FRAME_LENGTH];
-        let mut xq = [0i16; MAX_FRAME_LENGTH];
-        encode_frame_nsq(
-            &mut self.synth,
-            &shape,
-            &mut self.exc_q14,
-            &mut pulses,
-            &mut xq,
+        let (pulses, xq) = self.rate_controlled_quantize(
             x_int,
-            &ctrl,
-            &indices,
-            &self.frame,
-            0,
-            self.prev_signal_type,
-            self.lag_prev,
+            frame_index,
+            &mut indices,
+            &mut ctrl,
+            &shape,
+            gains_unq_q16,
+            base_quant_offset_type,
+            conditional_gains,
+            max_bits,
         );
+
         self.synth
             .update_out_buf(&xq[..self.frame_length], self.ltp_mem_length);
         self.last_xq.extend_from_slice(&xq[..self.frame_length]);
@@ -1588,6 +1615,409 @@ impl ChannelState {
             xq: xq[..self.frame_length].to_vec(),
             vad_flag,
         }
+    }
+
+    /// `silk_gains_ID` (`silk/gain_quant.c`): a unique identifier for a
+    /// quantized gain vector, so a repeated `gainMult` is not re-coded.
+    fn gains_id(gains_indices: &[i8; MAX_NB_SUBFR], nb_subfr: usize) -> i32 {
+        let mut id = 0i32;
+        for &g in gains_indices.iter().take(nb_subfr) {
+            id = (id << 8) + i32::from(g);
+        }
+        id
+    }
+
+    /// Quantize the unquantized gains (`GainsUnq_Q16`) scaled by `mult`,
+    /// honouring any per-subframe `gain_lock`. Returns the dequantized Q16
+    /// gains the NSQ must run with together with the resulting
+    /// `LastGainIndex`, which the caller must commit — it is the persistent
+    /// cross-frame state the decoder also threads.
+    #[allow(clippy::too_many_arguments)]
+    fn quantize_gains_at(
+        &self,
+        mult: i32,
+        gains_unq_q16: &[i32; MAX_NB_SUBFR],
+        gain_lock: &[bool; MAX_NB_SUBFR],
+        best_gain_mult: &[i32; MAX_NB_SUBFR],
+        nb_subfr: usize,
+        indices: &mut SideInfoIndices,
+        last_gain_index_prev: i8,
+        conditional_gains: bool,
+    ) -> ([i32; MAX_NB_SUBFR], i8) {
+        let mut p = [0i32; MAX_NB_SUBFR];
+        for i in 0..nb_subfr {
+            let tmp = if gain_lock[i] {
+                best_gain_mult[i]
+            } else {
+                mult
+            };
+            p[i] = lshift_sat32(smulwb(gains_unq_q16[i], tmp), 8);
+        }
+        let mut last = last_gain_index_prev;
+        gains_quant(
+            &mut indices.gains_indices,
+            &mut p,
+            &mut last,
+            conditional_gains,
+            nb_subfr,
+        );
+        (p, last)
+    }
+
+    /// The per-frame rate-control loop of `silk_encode_frame_FLP`
+    /// ("Loop over quantizer and entropy coding to control bitrate").
+    ///
+    /// The unquantized gains are scaled by `gainMult_Q8`, re-quantized
+    /// through `silk_gains_quant`, run through the noise-shaping quantizer,
+    /// entropy-coded, and the resulting bit count compared against
+    /// `max_bits`. `found_upper`/`found_lower` bracket the search so it can
+    /// interpolate instead of only ramping, and the per-subframe `gain_lock`
+    /// freezes subframes whose pulse count has stopped falling.
+    ///
+    /// The loop is quantizer-agnostic: it only re-quantizes the gains and
+    /// re-measures, so it drives the foundation's `encode_frame_nsq` here
+    /// rather than the reference `nsq_ref::nsq`. The two are not
+    /// interchangeable in *cost* — `encode_frame_nsq` is
+    /// analysis-by-synthesis and spends more bits per sample at equal
+    /// quality — and adopting the reference one shifts the encoder's
+    /// bitrate enough to break the hybrid layer's fixed SILK/CELT budget
+    /// split. See the todo.md session log.
+    ///
+    /// **Deviation — deferred serialization.** The reference codes straight
+    /// into the output range coder and rolls it back between attempts. This
+    /// encoder serializes the whole payload afterwards (pass B), so each
+    /// attempt is measured on a scratch coder and the accepted attempt's
+    /// pulses / gain indices / NSQ state are snapshotted instead.
+    ///
+    /// **Deviation — no-progress skipping.** Gain quantization is discrete
+    /// (2 dB per level) while `gainMult` ramps in 1.5x steps, so a ramp step
+    /// often does not change the quantized gain index at all and the
+    /// iteration is wasted. A step that leaves `gains_id` unchanged is
+    /// skipped by immediately taking another one.
+    ///
+    /// `max_bits` is `None` to disable the search (a single pass), which is
+    /// what CBR mode does.
+    #[allow(clippy::too_many_arguments)]
+    fn rate_controlled_quantize(
+        &mut self,
+        x_int: &[i16],
+        frame_index: usize,
+        indices: &mut SideInfoIndices,
+        ctrl: &mut DecoderControl,
+        shape: &ShapeParams,
+        gains_unq_q16: [i32; MAX_NB_SUBFR],
+        base_quant_offset_type: i8,
+        conditional_gains: bool,
+        max_bits: Option<i32>,
+    ) -> ([i16; MAX_FRAME_LENGTH], [i16; MAX_FRAME_LENGTH]) {
+        const MAX_ITER: usize = 6;
+        let nb_subfr = self.nb_subfr;
+        let frame_length = self.frame_length;
+
+        /* Scratch-encoding parameters: exactly what pass B will use for this
+         * frame, so the measured bit count is the real one. */
+        let params = FrameParams {
+            nlsf_cb: nlsf_cb_for(self.fs_khz),
+            fs_khz: self.fs_khz,
+            nb_subfr,
+            frame_index,
+            vad_flag: indices.signal_type != TYPE_NO_VOICE_ACTIVITY,
+            decode_lbrr: false,
+            cond_coding: if conditional_gains {
+                CondCoding::Conditionally
+            } else {
+                CondCoding::Independently
+            },
+        };
+        let delta_possible = conditional_gains && self.ec_prev.ec_prev_signal_type == TYPE_VOICED;
+
+        let search = max_bits.is_some();
+        let max_bits = max_bits.unwrap_or(i32::MAX);
+        /* VBR allows up to 25% below the cap when the first attempt busted
+         * the budget (`bits_margin = maxBits/4`). */
+        let bits_margin = max_bits / 4;
+
+        /* Input state, restored before every attempt but the first. */
+        let synth_copy = self.synth;
+        let exc_copy = self.exc_q14;
+        let last_gain_index_prev = self.last_gain_index;
+        let ec_prev_copy = self.ec_prev;
+        let prev_signal_type = self.prev_signal_type;
+        let lag_prev_in = self.lag_prev;
+
+        let mut gain_mult_q8: i32 = 256;
+        let mut prev_gains_id: Option<i32> = None;
+        let mut found_lower = false;
+        let mut found_upper = false;
+        let mut gains_id_lower: i32 = -1;
+        let mut n_bits_lower = 0i32;
+        let mut n_bits_upper = 0i32;
+        let mut gain_mult_lower = 0i32;
+        let mut gain_mult_upper = 0i32;
+        let mut gain_lock = [false; MAX_NB_SUBFR];
+        let mut best_gain_mult = [0i32; MAX_NB_SUBFR];
+        let mut best_sum = [0i32; MAX_NB_SUBFR];
+        let mut best: Option<RateAttempt> = None;
+        /* The attempt before the one in flight — what the reference's
+         * `sRangeEnc_copy2` revert lands on. */
+        let mut prev_attempt: Option<RateAttempt> = None;
+        let mut best_last_gain_index = last_gain_index_prev;
+        let mut quant_offset_type = base_quant_offset_type;
+        let mut iter = 0usize;
+        /* Assigned on the loop's first (always-taken) pass, before any break. */
+        let mut cur_pulses;
+        let mut cur_xq;
+        let mut n_bits;
+        let mut gains_id;
+        let mut p_gains_q16;
+
+        loop {
+            /* Every attempt starts from the same conditions. */
+            if iter > 0 {
+                self.synth = synth_copy;
+                self.exc_q14 = exc_copy;
+                self.ec_prev = ec_prev_copy;
+            }
+
+            /* Scale the unquantized gains and re-quantize. A helper keeps the
+             * gain-lock honoured and the `LastGainIndex` restart in one
+             * place, since the no-progress skip repeats it. */
+            let (g, last) = self.quantize_gains_at(
+                gain_mult_q8,
+                &gains_unq_q16,
+                &gain_lock,
+                &best_gain_mult,
+                nb_subfr,
+                indices,
+                last_gain_index_prev,
+                conditional_gains,
+            );
+            p_gains_q16 = g;
+            self.last_gain_index = last;
+            gains_id = Self::gains_id(&indices.gains_indices, nb_subfr);
+            /* No-progress skip: this multiplier quantized to the same gain
+             * vector as the previous iteration, so the payload is identical
+             * and the iteration bought nothing. Take another step now rather
+             * than spending an iteration on it. */
+            if let Some(prev) = prev_gains_id {
+                while gains_id == prev {
+                    let next = (gain_mult_q8 * 3 / 2).min(1024);
+                    if next == gain_mult_q8 {
+                        break;
+                    }
+                    gain_mult_q8 = next;
+                    let (g, last) = self.quantize_gains_at(
+                        gain_mult_q8,
+                        &gains_unq_q16,
+                        &gain_lock,
+                        &best_gain_mult,
+                        nb_subfr,
+                        indices,
+                        last_gain_index_prev,
+                        conditional_gains,
+                    );
+                    p_gains_q16 = g;
+                    self.last_gain_index = last;
+                    gains_id = Self::gains_id(&indices.gains_indices, nb_subfr);
+                }
+            }
+            prev_gains_id = Some(gains_id);
+
+            ctrl.gains_q16 = p_gains_q16;
+            indices.quant_offset_type = quant_offset_type;
+
+            /* Noise-shaping quantization (the foundation's closed-loop NSQ;
+             * see the note on quantizer cost above). */
+            cur_pulses = [0i16; MAX_FRAME_LENGTH];
+            cur_xq = [0i16; MAX_FRAME_LENGTH];
+            encode_frame_nsq(
+                &mut self.synth,
+                shape,
+                &mut self.exc_q14,
+                &mut cur_pulses,
+                &mut cur_xq,
+                x_int,
+                ctrl,
+                indices,
+                &self.frame,
+                0,
+                prev_signal_type,
+                lag_prev_in,
+            );
+
+            /* Measure this attempt on a scratch coder. */
+            let mut scratch = crate::range::RangeEncoder::new();
+            let mut ec_scratch = self.ec_prev;
+            encode_indices(
+                &mut scratch,
+                indices,
+                &mut ec_scratch,
+                &params,
+                delta_possible,
+            );
+            encode_pulses(
+                &mut scratch,
+                i32::from(indices.signal_type),
+                i32::from(indices.quant_offset_type),
+                &cur_pulses,
+                frame_length,
+            );
+            n_bits = scratch.tell() as i32;
+
+            if crate::debug::flags().silk_rate_trace {
+                eprintln!(
+                    "silk_rate_trace: frame={frame_index} iter={iter} gain_mult_q8={gain_mult_q8} \
+                     gains_id={gains_id} n_bits={n_bits} max_bits={max_bits}"
+                );
+            }
+
+            /* Search disabled (CBR): the single attempt just made is the
+             * answer. */
+            if !search {
+                break;
+            }
+
+            /* VBR early exit: the reference stops on the first attempt when
+             * the unquantized gains already land inside the budget
+             * (`useCBR == 0 && iter == 0 && nBits <= maxBits`). Without it the
+             * search keeps going, drifts down the `*4/5` branch to a *finer*
+             * gain vector, and can settle on a setting that is both worse and
+             * larger than the one it started with. */
+            if iter == 0 && n_bits <= max_bits {
+                break;
+            }
+
+            let attempt = RateAttempt {
+                gains_indices: indices.gains_indices,
+                quant_offset_type,
+                gains_q16: p_gains_q16,
+                pulses: cur_pulses,
+                xq: cur_xq,
+                synth: self.synth,
+                exc_q14: self.exc_q14,
+                last_gain_index: self.last_gain_index,
+            };
+            if iter > 0 {
+                prev_attempt = Some(attempt);
+            }
+
+            if iter == MAX_ITER {
+                if found_lower && (gains_id == gains_id_lower || n_bits > max_bits) {
+                    let b = best.take().expect("found_lower implies a snapshot");
+                    indices.gains_indices = b.gains_indices;
+                    indices.quant_offset_type = b.quant_offset_type;
+                    ctrl.gains_q16 = b.gains_q16;
+                    self.synth = b.synth;
+                    self.exc_q14 = b.exc_q14;
+                    self.last_gain_index = best_last_gain_index;
+                    cur_pulses = b.pulses;
+                    cur_xq = b.xq;
+                } else if n_bits > max_bits {
+                    /* Damage control (`iter == maxIter && !found_lower &&
+                     * nBits > maxBits`). The reference reverts the range
+                     * coder to the pre-iteration state and zeroes the
+                     * excitation *array*; the array zeroing only matters for
+                     * its LBRR copy, because the emitted bits are the
+                     * reverted ones. This encoder serializes later from
+                     * `FramePlan::pulses`, so zeroing them here would emit
+                     * bits the reconstruction does not match — instead revert
+                     * the whole previous attempt, which is the equivalent. */
+                    if let Some(p) = prev_attempt.take() {
+                        indices.gains_indices = p.gains_indices;
+                        indices.quant_offset_type = p.quant_offset_type;
+                        ctrl.gains_q16 = p.gains_q16;
+                        self.synth = p.synth;
+                        self.exc_q14 = p.exc_q14;
+                        self.last_gain_index = p.last_gain_index;
+                        cur_pulses = p.pulses;
+                        cur_xq = p.xq;
+                    }
+                }
+                break;
+            }
+
+            if n_bits > max_bits {
+                if !found_lower && iter >= 2 {
+                    /* Adjust the rate/distortion tradeoff and discard the
+                     * previous "upper" results. Reducing dithering can help us
+                     * hit the target. */
+                    quant_offset_type = 0;
+                    found_upper = false;
+                } else {
+                    found_upper = true;
+                    n_bits_upper = n_bits;
+                    gain_mult_upper = gain_mult_q8;
+                }
+            } else if n_bits < max_bits - bits_margin {
+                found_lower = true;
+                n_bits_lower = n_bits;
+                gain_mult_lower = gain_mult_q8;
+                if gains_id != gains_id_lower {
+                    gains_id_lower = gains_id;
+                    best_last_gain_index = self.last_gain_index;
+                    best = Some(attempt);
+                }
+            } else {
+                /* Close enough. */
+                break;
+            }
+
+            if !found_lower && n_bits > max_bits {
+                /* Freeze any subframe whose pulse count stopped falling. */
+                for i in 0..nb_subfr {
+                    let mut sum = 0i32;
+                    for &p in &cur_pulses[(i * self.subfr_length)..((i + 1) * self.subfr_length)] {
+                        sum += i32::from(p.abs());
+                    }
+                    if iter == 0 || (sum < best_sum[i] && !gain_lock[i]) {
+                        best_sum[i] = sum;
+                        best_gain_mult[i] = gain_mult_q8;
+                    } else {
+                        gain_lock[i] = true;
+                    }
+                }
+            }
+
+            if !(found_lower && found_upper) {
+                /* Only one side of the bracket is known (or neither): ramp
+                 * along the high-rate rate/distortion curve rather than
+                 * interpolating. Interpolating here would use whichever of
+                 * `gain_mult_lower`/`n_bits_lower` or `gain_mult_upper`/
+                 * `n_bits_upper` has not been set yet — still its `0`
+                 * initializer, not a real measurement — and silently
+                 * produce a garbage multiplier. This was the actual
+                 * overshoot bug: `found_upper` is set on the very first
+                 * iteration whenever the unquantized gains bust the budget
+                 * (the common case), and the old condition here treated
+                 * that alone as "ready to interpolate" against a
+                 * never-measured lower bound of `(0, 0)`. */
+                if n_bits > max_bits {
+                    gain_mult_q8 = (gain_mult_q8 * 3 / 2).min(1024);
+                } else {
+                    gain_mult_q8 = (gain_mult_q8 * 4 / 5).max(64);
+                }
+            } else if n_bits_upper != n_bits_lower {
+                /* Interpolate between the bracketing attempts, keeping the step
+                 * inside 25%-75% of the old range (note `gainMult_upper <
+                 * gainMult_lower`). Computed in i64: the product overflows
+                 * i32 in release at realistic budgets. */
+                let range = gain_mult_upper - gain_mult_lower;
+                gain_mult_q8 = gain_mult_lower
+                    + (i64::from(range) * i64::from(max_bits - n_bits_lower)
+                        / i64::from(n_bits_upper - n_bits_lower)) as i32;
+                if gain_mult_q8 > gain_mult_lower + (range >> 2) {
+                    gain_mult_q8 = gain_mult_lower + (range >> 2);
+                } else if gain_mult_q8 < gain_mult_upper - (range >> 2) {
+                    gain_mult_q8 = gain_mult_upper - (range >> 2);
+                }
+            }
+
+            iter += 1;
+        }
+
+        /* `self.synth`, `self.exc_q14`, `self.last_gain_index` and `ctrl` hold
+         * the accepted attempt (the last one run, or the restored snapshot). */
+        (cur_pulses, cur_xq)
     }
 
     /// The pitch-LPC residual over the whole buffered window (history +
@@ -1981,6 +2411,23 @@ impl ChannelState {
         }
         nrgs
     }
+}
+
+/// One accepted attempt of the SILK per-frame rate-control loop, with
+/// everything the loop has to roll back if a later attempt turns out worse.
+#[derive(Clone, Copy)]
+struct RateAttempt {
+    gains_indices: [i8; MAX_NB_SUBFR],
+    quant_offset_type: i8,
+    /// The dequantized gains the NSQ ran with (`Gains_Q16`).
+    gains_q16: [i32; MAX_NB_SUBFR],
+    pulses: [i16; MAX_FRAME_LENGTH],
+    xq: [i16; MAX_FRAME_LENGTH],
+    /// The decoder mirror the NSQ left behind, which the next frame
+    /// continues from.
+    synth: SynthesisState,
+    exc_q14: [i32; MAX_FRAME_LENGTH],
+    last_gain_index: i8,
 }
 
 /// The serializable result of one analyzed SILK frame — the side-info
