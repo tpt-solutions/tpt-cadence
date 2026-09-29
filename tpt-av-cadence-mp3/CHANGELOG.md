@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Short blocks for the MPEG-2/2.5 (LSF) families**: the window-sequence
+  state machine now runs on every version family. LSF short granules draw
+  their 9-bit `scalefac_compress` from the short row of the partition
+  table (36 coded scalefactors). New FFmpeg gate
+  `lsf_transient_short_blocks_agree_with_ffmpeg` (22.05/24/16/11.025 kHz,
+  mono and stereo, 110-123 dB inter-decoder SNR).
+
 - **Info/Xing metadata tags** (`new_cbr_with_info` / `new_vbr_with_xing`):
   a leading silent frame carries the LAME-style metadata — frames count,
   byte count, 100-entry seek TOC, and quality — written at open with

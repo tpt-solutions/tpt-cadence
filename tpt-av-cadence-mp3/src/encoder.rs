@@ -5,8 +5,7 @@
 //!
 //! - **All three version families** (32/44100/48000 Hz MPEG-1 at 32-320
 //!   kbps; the MPEG-2/2.5 LSF families at 16/22.05/24 kHz and
-//!   8/11.025/12 kHz, 8-160 kbps), **long blocks only** (no
-//!   block-switching / short blocks).
+//!   8/11.025/12 kHz, 8-160 kbps).
 //! - **CBR or VBR**: `new` fixes one bitrate per stream; `new_vbr`
 //!   (quality 0..=9) picks the smallest standard bitrate index per frame
 //!   whose planned content meets the quality tolerance — the decoder-
@@ -825,15 +824,15 @@ fn slens(compress: u8) -> (u32, u32) {
 /// 11..=20). LSF: the mixed-radix partition widths times their per-row
 /// band counts.
 fn scalefac_bits(compress: u16, lsf: bool, short: bool) -> u64 {
-    let (s1, s2) = slens(compress as u8);
-    if short {
-        // Partition counts [9, 9, 6, 12]: 18 bands at slen1, 18 at slen2.
-        return 18 * s1 as u64 + 18 * s2 as u64;
-    }
     if !lsf {
+        let (s1, s2) = slens(compress as u8);
+        if short {
+            // Partition counts [9, 9, 6, 12]: 18 bands at slen1, 18 at slen2.
+            return 18 * s1 as u64 + 18 * s2 as u64;
+        }
         return 11 * s1 as u64 + 10 * s2 as u64;
     }
-    let (sizes, counts) = lsf_sf_layout(compress);
+    let (sizes, counts) = lsf_sf_layout(compress, short);
     sizes
         .iter()
         .zip(counts.iter())
@@ -847,12 +846,9 @@ fn scalefac_bits(compress: u16, lsf: bool, short: bool) -> u64 {
 /// `SCF_MOD`: `sfc` names a digit group, and the counts come from the
 /// *following* `SCF_PARTITIONS` group (the count reader stops at the
 /// first zero count, so trailing zeros truncate the partitions).
-fn lsf_sf_layout(sfc: u16) -> ([u8; 4], [u8; 4]) {
+fn lsf_sf_layout(sfc: u16, short: bool) -> ([u8; 4], [u8; 4]) {
     const SCF_MOD: [u8; 24] = [
         5, 5, 4, 4, 5, 5, 4, 1, 4, 3, 1, 1, 5, 6, 6, 1, 4, 4, 4, 1, 4, 3, 1, 1,
-    ];
-    const SCF_PARTITIONS: [u8; 28] = [
-        6, 5, 5, 5, 6, 5, 5, 5, 6, 5, 7, 3, 11, 10, 0, 0, 7, 7, 7, 0, 6, 6, 6, 3, 8, 8, 5, 0,
     ];
     let mut sfc = sfc as i32;
     let mut k = 0usize;
@@ -866,8 +862,11 @@ fn lsf_sf_layout(sfc: u16) -> ([u8; 4], [u8; 4]) {
         sfc -= modprod as i32;
         k += 4;
     }
+    // Row 0 of the flat partition table serves long blocks, row 2 pure
+    // short blocks (row 1 is the mixed-block row, never emitted).
+    let row = if short { 2 * 28 } else { 0 };
     let mut counts = [0u8; 4];
-    counts.copy_from_slice(&SCF_PARTITIONS[k..k + 4]);
+    counts.copy_from_slice(&crate::tables::SCF_PARTITIONS[row + k..row + k + 4]);
     (sizes, counts)
 }
 
@@ -1475,9 +1474,10 @@ fn choose_compress(scalefacs: &[u8; MAX_SFB], lsf: bool, short: bool) -> (u16, b
         // whose widths can carry every transmitted value. All long-block
         // partition groups transmit 21 values (bands 0..=20), matching the
         // plan's scalefacs layout.
+        let n_sf = if short { 36 } else { 21 };
         let mut best: Option<(u16, u64)> = None;
         for sfc in 0..500u16 {
-            let (sizes, counts) = lsf_sf_layout(sfc);
+            let (sizes, counts) = lsf_sf_layout(sfc, short);
             let mut band = 0usize;
             let mut fits = true;
             let mut bits = 0u64;
@@ -1492,7 +1492,7 @@ fn choose_compress(scalefacs: &[u8; MAX_SFB], lsf: bool, short: bool) -> (u16, b
                 bits += w as u64 * c as u64;
                 band += c as usize;
             }
-            if fits && band == 21 && best.map_or(true, |(_, b)| bits < b) {
+            if fits && band == n_sf && best.map_or(true, |(_, b)| bits < b) {
                 best = Some((sfc, bits));
             }
         }
@@ -2217,8 +2217,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             history.copy_from_slice(&new_subband);
         }
 
-        // The window-sequence state machine (MPEG-1 only; LSF stays
-        // long-block). Attacks are detected on the raw PCM — the polyphase
+        // The window-sequence state machine (all version families). Attacks are detected on the raw PCM — the polyphase
         // analysis window smears attacks across granule boundaries, so the
         // subband domain localizes them poorly: each granule's front-half
         // PCM energy is compared against the previous granule's back-half
@@ -2231,7 +2230,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         // Per channel: the frame's 576 pairs split into two granules of
         // 288 pairs = 576 interleaved entries; each granule's front-half
         // energy vs the previous granule's back-half energy.
-        let quarter = self.samples_per_frame() * channels / 4; // 576 entries
+        let quarter = GRANULE_SAMPLES * channels / 2; // half a granule, interleaved
         let pcm_energy = |from: usize, len: usize| -> f64 {
             (from..from + len)
                 .map(|i| {
@@ -2248,9 +2247,8 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         for gr in 0..n_granules {
             let base = gr * 2 * quarter;
             let front = pcm_energy(base, quarter);
-            attacks[gr * channels + ch] = !self.lsf
-                && front > 1e-9
-                && front > 25.0 * self.channel_state[ch].prev_back_energy.max(1e-12);
+            attacks[gr * channels + ch] =
+                front > 1e-9 && front > 25.0 * self.channel_state[ch].prev_back_energy.max(1e-12);
         }
         let look = self.lookahead_rows(ch);
         let mut prev_short = self.channel_state[ch].last_short;
@@ -2274,15 +2272,14 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                         v * v
                     })
                     .sum::<f64>();
-                !self.lsf
-                    && e_front > 1e-9
+                e_front > 1e-9
                     && e_front > 25.0 * self.channel_state[ch].prev_back_energy.max(1e-12)
             };
-            let block = if !self.lsf && attack {
+            let block = if attack {
                 2u8 // content short
-            } else if !self.lsf && prev_short {
+            } else if prev_short {
                 4u8 // zero-line short: fade the run out, overlap -> 0
-            } else if !self.lsf && next_attack {
+            } else if next_attack {
                 3u8 // zero-line stop: overlap -> 0 before the short run
             } else {
                 0u8
@@ -2836,7 +2833,7 @@ fn emit_granule_data(
     // (11..=20). MPEG-1 short: partitions [9, 9, 6, 12] at [s1, s1, s2,
     // s2] over bands 0..=35. LSF: the compress value's partition widths
     // over its per-partition band counts.
-    if plan.block_type == 2 {
+    if plan.block_type == 2 && !lsf {
         let (s1, s2) = slens(plan.scalefac_compress as u8);
         let parts = [(9usize, s1), (9, s1), (6, s2), (12, s2)];
         let mut band = 0usize;
@@ -2847,7 +2844,7 @@ fn emit_granule_data(
             }
         }
     } else if lsf {
-        let (sizes, counts) = lsf_sf_layout(plan.scalefac_compress);
+        let (sizes, counts) = lsf_sf_layout(plan.scalefac_compress, plan.block_type == 2);
         let mut band = 0usize;
         for (&w, &c) in sizes.iter().zip(counts.iter()) {
             for _ in 0..c {

@@ -33,7 +33,7 @@ extension (encoder delay + padding), and the decoder applies the trim
 internally, so tagged round trips recover the exact source sample
 count. `new_cbr_with_info` / `new_vbr_with_xing`
 emit a leading Info/Xing metadata frame (counts + seek TOC, patched at
-finish) for exact durations and fast seeking. Short blocks (window switching) are enabled:
+finish) for exact durations and fast seeking. Short blocks (window switching) are enabled on all version families:
 PCM-domain transient detection drives a zero-line stop/bridge window
 sequence whose handover is convention-free across decoders (see
 CHANGELOG). The full cross-frame bit reservoir is

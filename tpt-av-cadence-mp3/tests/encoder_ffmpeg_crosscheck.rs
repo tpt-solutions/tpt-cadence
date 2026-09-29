@@ -914,6 +914,155 @@ fn transient_short_blocks_agree_with_ffmpeg() {
     );
 }
 
+/// LSF short-block gate: the MPEG-2/2.5 families switch windows too (one
+/// granule per frame, the 9-bit `scalefac_compress` drawn from the short
+/// partition row). A click after silence must engage short and stop
+/// granules and still agree with FFmpeg.
+#[test]
+fn lsf_transient_short_blocks_agree_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::{Mp3Decoder, Mp3Encoder};
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    struct Bits<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl Bits<'_> {
+        fn get(&mut self, n: u32) -> u32 {
+            let mut v = 0u32;
+            for _ in 0..n {
+                let byte = self.d[self.p / 8];
+                v = (v << 1) | u32::from((byte >> (7 - (self.p % 8))) & 1);
+                self.p += 1;
+            }
+            v
+        }
+    }
+
+    // (sample rate, channels, kbps, MPEG-2.5?)
+    for (sample_rate, channels, kbps) in [
+        (22_050u32, 1u16, 48u32),
+        (24_000, 2, 96),
+        (16_000, 2, 64),
+        (11_025, 1, 32),
+    ] {
+        let sr = sample_rate as usize;
+        let mut frames = Vec::new();
+        // Click 100 samples into a granule (the detector compares each
+        // granule's front half against the previous back half).
+        let click = sr / 2 / 1152 * 1152 + 100;
+        for i in 0..sr {
+            let s = if i < click {
+                0.0
+            } else if i < click + 48 {
+                ((i % 7) as f32 - 3.0) * 0.3
+            } else {
+                0.3 * (2.0 * PI * 1500.0 * i as f32 / sample_rate as f32).sin()
+            };
+            for _ in 0..channels {
+                frames.push(s);
+            }
+        }
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = Mp3Encoder::new(&mut buf, sample_rate, channels, kbps).unwrap();
+            enc.encode(&frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        let data = buf.into_inner();
+
+        let side_len = match channels {
+            1 => 9,
+            _ => 17,
+        };
+        let mut off = 0usize;
+        let (mut shorts, mut stops) = (0usize, 0usize);
+        while off + 4 <= data.len() {
+            let b2 = data[off + 2];
+            let span = (72 * kbps * 1000 / sample_rate) as usize + ((b2 >> 1) & 1) as usize;
+            let mut bits = Bits {
+                d: &data[off + 4..off + 4 + side_len],
+                p: 0,
+            };
+            bits.get(8);
+            bits.get(if channels == 1 { 1 } else { 2 });
+            for _ in 0..channels {
+                bits.get(12 + 9 + 8 + 9);
+                if bits.get(1) == 1 {
+                    let bt = bits.get(2);
+                    assert_eq!(bits.get(1), 0, "only pure short blocks are emitted");
+                    match bt {
+                        2 => shorts += 1,
+                        3 => stops += 1,
+                        _ => {}
+                    }
+                    bits.get(5 + 5 + 9);
+                } else {
+                    bits.get(15 + 4 + 3);
+                }
+                bits.get(1); // scalefac_scale
+                bits.get(1); // count1table_select
+            }
+            off += span;
+        }
+        assert_eq!(off, data.len(), "frame spans must tile the stream exactly");
+        assert!(
+            shorts > 0,
+            "{sample_rate} Hz: transient must engage short granules"
+        );
+        assert!(
+            stops > 0,
+            "{sample_rate} Hz: window sequence must include stop granules"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "cadence_mp3_lsf_short_{}_{}.mp3",
+            std::process::id(),
+            sample_rate
+        ));
+        std::fs::write(&path, &data).expect("write temp mp3");
+        let oracle =
+            decode_with_ffmpeg(&path, sample_rate, channels).expect("ffmpeg oracle decode");
+        let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+        let ch = dec.info().channels as usize;
+        let mut ours = Vec::new();
+        let mut out = vec![0.0f32; 4096 * ch];
+        loop {
+            match dec.decode(&mut out) {
+                Ok(0) => break,
+                Ok(g) => ours.extend_from_slice(&out[..g * ch]),
+                Err(e) => panic!("our decode errored: {e}"),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            ours.len(),
+            oracle.len(),
+            "{sample_rate} Hz: length mismatch vs ffmpeg"
+        );
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for (&a, &b) in ours.iter().zip(&oracle) {
+            let delta = f64::from(a) - f64::from(b);
+            error += delta * delta;
+            signal += f64::from(b).powi(2);
+        }
+        let snr = 10.0 * (signal / error).log10();
+        eprintln!("lsf short-block {sample_rate} Hz x{channels}: shorts={shorts} stops={stops} SNR={snr:.2} dB");
+        assert!(snr > 100.0, "{sample_rate} Hz: SNR={snr:.2} vs ffmpeg");
+    }
+}
+
 /// Metadata-tag gate: an Info/Xing-tagged stream must decode in FFmpeg in
 /// agreement with this crate's decoder — the tag frame counts as one
 /// silent frame in both, and the audio frames that follow (starting from
