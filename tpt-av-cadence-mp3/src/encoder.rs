@@ -1240,7 +1240,9 @@ fn evaluate_granule(
 ) -> GranuleCost {
     let gains = band_gains(global_gain, scalefacs, preflag, ms_stereo, layout.n_sf);
     let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
-    let mut window_ok = true;
+    // A line at the clamp ceiling was (almost surely) clamped: the quantizer
+    // is too fine for this granule and the decoded amplitude would be wrong.
+    let mut window_ok = !ix.iter().any(|&v| v >= 8206);
     for band in 0..layout.n_bands {
         // Uncoded trailing bands (long 21 / short 36..38) carry no
         // transmitted scalefac and no pretab (both read as zero in the
@@ -1253,7 +1255,7 @@ fn evaluate_granule(
             };
         let exp_q = global_gain as i32 + 190 - (sf_total << 1);
         for ix_i in &mut ix[layout.line_start[band]..layout.line_end[band]] {
-            if *ix_i >= 15 && ff_escape_shift(*ix_i, exp_q) < 0 {
+            if *ix_i >= 15 && !(0..=31).contains(&ff_escape_shift(*ix_i, exp_q)) {
                 *ix_i = 0;
                 window_ok = false;
             }
@@ -1374,7 +1376,7 @@ fn apply_ff_window(
             };
         let exp_q = global_gain as i32 + 190 - (sf_total << SHIFT);
         for ix_i in &mut ix[layout.line_start[band]..layout.line_end[band]] {
-            if *ix_i >= 15 && ff_escape_shift(*ix_i, exp_q) < 0 {
+            if *ix_i >= 15 && !(0..=31).contains(&ff_escape_shift(*ix_i, exp_q)) {
                 *ix_i = 0;
             }
         }
@@ -1658,9 +1660,19 @@ fn plan_granule(
     // ratio is at or under this value (1.0 = noise at threshold).
     tolerance: f64,
     block_type: u8,
+    // Intensity stereo (right channel only): bands from the given index
+    // through 20 carry pan positions as their scalefactors, frozen against
+    // amplification (their lines are all zero).
+    intensity: Option<(usize, &[u8; 22])>,
 ) -> GranuleCost {
     let mut scalefacs = [0u8; MAX_SFB];
     let mut amplified = [false; MAX_SFB];
+    if let Some((from, pos)) = intensity {
+        for band in from..21 {
+            scalefacs[band] = pos[band];
+            amplified[band] = true;
+        }
+    }
     let mut best: Option<GranuleCost> = None;
     let mut best_excess = f64::INFINITY;
     let mut fallback: Option<GranuleCost> = None;
@@ -1757,6 +1769,154 @@ fn plan_granule(
 }
 
 // ---------------------------------------------------------------------------
+// Intensity stereo (MPEG-1, long blocks). The decoder treats every band above
+// the right channel's highest non-zero band as intensity-coded: the left
+// channel's dequantized lines `A` are split as `L = A·kl`, `R = A·kr` with
+// `(kl, kr) = PAN[pos]` (`kl + kr = 1`, `kl/kr = tan(pos·π/12)`), `pos`
+// being the right channel's scalefactor for that band (0..=6 legal). Band 21
+// carries no scalefactor and inherits band 20's position (or 3 when band 20
+// is itself the top coded band). With mid/side also on, non-intensity bands
+// stay M/S and the decoder's extra √2 folds into the mid channel's shift.
+// ---------------------------------------------------------------------------
+
+/// Per-frame intensity plan: first intensity band and pan positions per
+/// granule.
+struct IsInfo {
+    from: [usize; 2],
+    pos: [[u8; 22]; 2],
+}
+
+/// Band energies `(EL, ER, Σ L·R)` over a long band.
+fn band_stats(l: &[f32], r: &[f32], layout: &BandLayout, band: usize) -> (f64, f64, f64) {
+    let (mut el, mut er, mut lr) = (0.0f64, 0.0f64, 0.0f64);
+    for i in layout.line_start[band]..layout.line_end[band] {
+        let (a, b) = (f64::from(l[i]), f64::from(r[i]));
+        el += a * a;
+        er += b * b;
+        lr += a * b;
+    }
+    (el, er, lr)
+}
+
+/// First band of the maximal top run (bands `from..=21`, `from >= 8`) whose
+/// left/right spectra are strongly in-phase (`ρ >= 0.9`), or 22 when band
+/// 21 itself is not. Bands where one channel is silent count as in phase:
+/// a hard pan is exactly representable.
+fn intensity_candidate(l: &[f32], r: &[f32], layout: &BandLayout) -> usize {
+    let mut from = 22usize;
+    // Bands more than 50 dB under the granule's total energy are leakage
+    // or numerical noise: their correlation is meaningless and any pan
+    // position is inaudible.
+    let total: f64 = (0..21)
+        .map(|band| {
+            let (el, er, _) = band_stats(l, r, layout, band);
+            el + er
+        })
+        .sum();
+    for band in (8..22).rev() {
+        let (el, er, lr) = band_stats(l, r, layout, band);
+        let ok = el + er <= 1e-5 * total
+            || el * er <= 1e-18
+            || lr / (el * er).sqrt() >= 0.9;
+        if !ok {
+            break;
+        }
+        from = band;
+    }
+    from
+}
+
+/// Pan position per band 0..=20 from the left/right energy ratio.
+fn intensity_positions(l: &[f32], r: &[f32], layout: &BandLayout) -> [u8; 22] {
+    let mut pos = [3u8; 22];
+    for (band, p) in pos.iter_mut().enumerate().take(21) {
+        let (el, er, _) = band_stats(l, r, layout, band);
+        if el <= 0.0 && er <= 0.0 {
+            continue;
+        }
+        let angle = if er <= 0.0 {
+            std::f64::consts::FRAC_PI_2
+        } else {
+            (el / er).sqrt().atan()
+        };
+        *p = ((angle * 12.0 / std::f64::consts::PI).round() as i32).clamp(0, 6) as u8;
+    }
+    pos
+}
+
+/// Rewrites bands `from..` of the (already M/S-transformed if `ms`)
+/// spectra `out0`/`out1` as an intensity source and silence: the source
+/// keeps the in-phase line shape `L+R`, scaled so the pan split preserves
+/// the band's total energy. The decoder's mid/side gain makes `A = 2·spec0`
+/// in M/S mode (`A = spec0` otherwise).
+fn apply_intensity(
+    l: &[f32],
+    r: &[f32],
+    out0: &mut [f32; GRANULE_SAMPLES],
+    out1: &mut [f32; GRANULE_SAMPLES],
+    layout: &BandLayout,
+    from: usize,
+    pos: &[u8; 22],
+    ms: bool,
+) {
+    for band in from..22 {
+        let p = if band == 21 {
+            if from <= 20 {
+                pos[20]
+            } else {
+                3
+            }
+        } else {
+            pos[band]
+        } as usize;
+        let (kl, kr) = (
+            f64::from(crate::tables::PAN[2 * p]),
+            f64::from(crate::tables::PAN[2 * p + 1]),
+        );
+        let (el, er, _) = band_stats(l, r, layout, band);
+        let sum_sq: f64 = (layout.line_start[band]..layout.line_end[band])
+            .map(|i| f64::from(l[i] + r[i]).powi(2))
+            .sum();
+        let g = if sum_sq > 0.0 {
+            ((el + er) / (kl * kl + kr * kr)).sqrt() / sum_sq.sqrt()
+        } else {
+            0.0
+        };
+        let scale = if ms { 0.5 } else { 1.0 } * g;
+        for i in layout.line_start[band]..layout.line_end[band] {
+            out0[i] = ((f64::from(l[i] + r[i])) * scale) as f32;
+            out1[i] = 0.0;
+        }
+    }
+}
+
+/// The decoder's view of a planned right channel: the highest band with a
+/// non-zero coded line (-1 when none). Everything above it is decoded as
+/// intensity.
+fn intensity_top_band(
+    plan: &GranulePlan,
+    spec: &[f32; GRANULE_SAMPLES],
+    layout: &BandLayout,
+    ms: bool,
+) -> i32 {
+    let gains = band_gains(plan.global_gain, &plan.scalefacs, plan.preflag, ms, 21);
+    let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
+    apply_ff_window(
+        &mut ix,
+        plan.global_gain,
+        &plan.scalefacs,
+        plan.preflag,
+        layout,
+    );
+    let coded = 2 * plan.big_values as usize + 4 * plan.count1_quads as usize;
+    (0..coded.min(GRANULE_SAMPLES))
+        .filter(|&i| ix[i] != 0)
+        .map(|i| i32::from(layout.band_of_line[i]))
+        .max()
+        .unwrap_or(-1)
+}
+
+// ---------------------------------------------------------------------------
 // Top-level encoder
 // ---------------------------------------------------------------------------
 
@@ -1846,6 +2006,10 @@ pub struct Mp3Encoder<W: Write + Seek> {
     /// This frame's per-slot block decisions (set during analysis):
     /// 0 long, 1 start, 2 short, 3 stop.
     slot_block: [u8; 4],
+    /// Opt-in intensity stereo (MPEG-1 stereo, long blocks).
+    intensity: bool,
+    /// Whether the frame being emitted carries intensity stereo.
+    frame_is: bool,
 
     /// Metadata tag state: `Some` once an Info/Xing frame has been written.
     meta: Option<TagMeta>,
@@ -1963,10 +2127,22 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             layout: BandLayout::new(sideinfo::sr_table_idx_for_sr(sample_rate)),
             short_layout: BandLayout::new_short(sideinfo::sr_table_idx_for_sr(sample_rate)),
             slot_block: [0; 4],
+            intensity: false,
+            frame_is: false,
             meta: None,
             bytes_written: 0,
             source_pairs: 0,
         })
+    }
+
+    /// Enables intensity stereo (off by default): on MPEG-1 stereo frames
+    /// whose granules are all long blocks, the highest bands whose left and
+    /// right spectra are strongly in-phase are coded as one mono source
+    /// plus a per-band pan position (the right channel's scalefactors
+    /// carry the positions). It trades stereo-image detail above the
+    /// switch band for bitrate, so it suits low bitrates.
+    pub fn set_intensity_stereo(&mut self, on: bool) {
+        self.intensity = on;
     }
 
     /// Opens a new variable-bitrate Layer III stream targeting a quality
@@ -2098,7 +2274,12 @@ impl<W: Write + Seek> Mp3Encoder<W> {
     /// the chosen index together with its plans so emit_frame never plans
     /// twice. Probing ignores the padding bit (at most one byte of slack,
     /// which simply stays in the reservoir).
-    fn plan_vbr_frame(&self, borrow: u64, ms: bool) -> (u8, [GranulePlan; 4], u64, f64) {
+    fn plan_vbr_frame(
+        &self,
+        borrow: u64,
+        ms: bool,
+        is: Option<&IsInfo>,
+    ) -> (u8, [GranulePlan; 4], u64, f64) {
         let tolerance = self.vbr_tolerance.unwrap_or(1.0);
         let mut best: Option<(u8, [GranulePlan; 4], u64, f64)> = None;
         for idx in 1..15u8 {
@@ -2107,7 +2288,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             if main_bits == 0 {
                 continue;
             }
-            let (plans, p23, worst) = self.plan_slots(main_bits + borrow * 8, ms);
+            let (plans, p23, worst) = self.plan_slots(main_bits + borrow * 8, ms, is);
             let candidate = (idx, plans, p23, worst);
             let done = worst <= tolerance;
             best = Some(candidate);
@@ -2145,8 +2326,8 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         // mode: mono=3, stereo=0, joint stereo=1 (with mode_ext bit 2 = ms)
         let (mode, mode_ext): (u8, u8) = if self.channels == 1 {
             (0b11, 0)
-        } else if ms {
-            (0b01, 0b10)
+        } else if ms || self.frame_is {
+            (0b01, (ms as u8) << 1 | self.frame_is as u8)
         } else {
             (0b00, 0)
         };
@@ -2474,7 +2655,12 @@ impl<W: Write + Seek> Mp3Encoder<W> {
     /// pathologically small budgets. Returns the plans and their exact total
     /// `part2_3_length` bit count.
     #[allow(clippy::needless_range_loop)] // slot indices address parallel arrays
-    fn plan_slots(&self, budget_total: u64, ms: bool) -> ([GranulePlan; 4], u64, f64) {
+    fn plan_slots(
+        &self,
+        budget_total: u64,
+        ms: bool,
+        is: Option<&IsInfo>,
+    ) -> ([GranulePlan; 4], u64, f64) {
         let channels = self.channels as usize;
         let slots = self.n_granules() * channels;
         let tolerance = self.vbr_tolerance.unwrap_or(1.0);
@@ -2524,6 +2710,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 self.lsf,
                 tolerance,
                 block,
+                is.filter(|_| ch == 1).map(|i| (i.from[gr], &i.pos[gr])),
             );
             remaining -= cost.bits.min(remaining);
             costs[slot] = cost.worst_ratio;
@@ -2580,8 +2767,37 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         }
 
         let ms = channels == 2 && self.prefer_ms();
+        let lr_spec = self.spec_scratch.clone();
         if ms {
             self.transform_to_ms();
+        }
+
+        // Intensity stereo candidates: MPEG-1 stereo frames whose granules
+        // are all long blocks and whose top bands are in phase in every
+        // granule. The start bands are refined against the planned right
+        // channel below (the decoder infers the boundary from the right
+        // channel's highest non-zero band).
+        let base_spec = self.spec_scratch.clone();
+        let mut is_info: Option<IsInfo> = None;
+        if self.intensity
+            && channels == 2
+            && !lsf
+            && self.slot_block[..n_granules * channels]
+                .iter()
+                .all(|&b| b == 0)
+        {
+            let mut info = IsInfo {
+                from: [22; 2],
+                pos: [[3; 22]; 2],
+            };
+            for gr in 0..n_granules {
+                info.from[gr] = intensity_candidate(&lr_spec[gr], &lr_spec[2 + gr], &self.layout);
+                info.pos[gr] = intensity_positions(&lr_spec[gr], &lr_spec[2 + gr], &self.layout);
+            }
+            eprintln!("DBG from {:?}", info.from);
+            if info.from[..n_granules].iter().all(|&f| f < 22) {
+                is_info = Some(info);
+            }
         }
 
         let bitrate_table: &[u32; 15] = if lsf {
@@ -2589,10 +2805,8 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         } else {
             &MPEG1_BITRATES_KBPS
         };
-        let ideal_bytes = |idx: u8| {
-            self.samples_per_frame() as f64 * bitrate_table[idx as usize] as f64 * 125.0
-                / self.sample_rate as f64
-        };
+        let (spf_f, sr_f) = (self.samples_per_frame() as f64, self.sample_rate as f64);
+        let ideal_bytes = |idx: u8| spf_f * bitrate_table[idx as usize] as f64 * 125.0 / sr_f;
 
         // Cross-frame borrowing: the last `borrow` bytes of the previous
         // frame's payload (held back unwritten, zero padding) become this
@@ -2610,18 +2824,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         // meets the quality tolerance. The padding bit is decided from the
         // chosen rate's ideal frame length (VBR probes assume no padding —
         // at most one byte of slack, which simply stays in the reservoir).
-        let (bitrate_idx, plans, total_p23, padding) = if self.vbr_tolerance.is_some() {
-            let (idx, plans, p23, _) = self.plan_vbr_frame(borrow, ms);
-            self.frac_accum += {
-                let ideal = ideal_bytes(idx);
-                ideal - ideal.floor()
-            };
-            let padding = self.frac_accum >= 1.0;
-            if padding {
-                self.frac_accum -= 1.0;
-            }
-            (idx, plans, p23, padding)
-        } else {
+        let cbr = if self.vbr_tolerance.is_none() {
             self.frac_accum += {
                 let ideal = ideal_bytes(self.bitrate_idx);
                 ideal - ideal.floor()
@@ -2634,10 +2837,73 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             let parsed = header::parse_header(&probe).map_err(|e| {
                 CadenceError::InvalidFormat(format!("internal header build error: {e}"))
             })?;
-            let probe_main = parsed.total_bytes() - 4 - self.side_info_bytes();
-            let (plans, p23, _) = self.plan_slots(probe_main as u64 * 8 + borrow * 8, ms);
-            (self.bitrate_idx, plans, p23, padding)
+            Some((padding, parsed.total_bytes() - 4 - self.side_info_bytes()))
+        } else {
+            None
         };
+        let (bitrate_idx, plans, total_p23, padding) = loop {
+            if let Some(info) = &is_info {
+                self.spec_scratch.clone_from(&base_spec);
+                for gr in 0..n_granules {
+                    let (a, b) = self.spec_scratch.split_at_mut(2);
+                    apply_intensity(
+                        &lr_spec[gr],
+                        &lr_spec[2 + gr],
+                        &mut a[gr],
+                        &mut b[gr],
+                        &self.layout,
+                        info.from[gr],
+                        &info.pos[gr],
+                        ms,
+                    );
+                }
+            }
+            let (idx, plans, p23, padding) = if let Some((padding, probe_main)) = cbr {
+                let (plans, p23, _) =
+                    self.plan_slots(probe_main as u64 * 8 + borrow * 8, ms, is_info.as_ref());
+                (self.bitrate_idx, plans, p23, padding)
+            } else {
+                let (idx, plans, p23, _) = self.plan_vbr_frame(borrow, ms, is_info.as_ref());
+                (idx, plans, p23, false)
+            };
+            // The decoder places the intensity boundary just above the
+            // right channel's highest coded band: when planning left that
+            // band below the candidate start, pull the start down so the
+            // uncoded gap is intensity-coded as intended, and re-plan.
+            let mut moved = false;
+            if let Some(info) = &mut is_info {
+                for gr in 0..n_granules {
+                    let top = intensity_top_band(
+                        &plans[gr * 2 + 1],
+                        &self.spec_scratch[2 + gr],
+                        &self.layout,
+                        ms,
+                    );
+                    let wanted = (top + 1) as usize;
+                    if wanted < info.from[gr] {
+                        info.from[gr] = wanted;
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                break (idx, plans, p23, padding);
+            }
+        };
+        let (padding, bitrate_idx) = if self.vbr_tolerance.is_some() {
+            self.frac_accum += {
+                let ideal = ideal_bytes(bitrate_idx);
+                ideal - ideal.floor()
+            };
+            let padding = self.frac_accum >= 1.0;
+            if padding {
+                self.frac_accum -= 1.0;
+            }
+            (padding, bitrate_idx)
+        } else {
+            (padding, bitrate_idx)
+        };
+        self.frame_is = is_info.is_some();
 
         let hdr = self.header_bytes(padding, ms, bitrate_idx);
         let parsed = header::parse_header(&hdr).map_err(|e| {
@@ -2766,6 +3032,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         self.write_sink(&hw.bytes)?;
         self.write_sink(&stream[lead..])?;
         self.held = main_bytes - granule_bytes.saturating_sub(borrow as usize);
+        self.frame_is = false;
         Ok(())
     }
 }
@@ -3867,7 +4134,17 @@ mod tests {
         }
         let thresholds = psy_thresholds(&spec, &layout, 44_100);
         let budget = 990u64;
-        let cost = plan_granule(&spec, &layout, &thresholds, false, budget, false, 1.0, 2);
+        let cost = plan_granule(
+            &spec,
+            &layout,
+            &thresholds,
+            false,
+            budget,
+            false,
+            1.0,
+            2,
+            None,
+        );
         let mut plan = cost.plan;
         assert!(plan.block_type == 2, "planner must keep the short layout");
         while plan.big_values > 0 || plan.count1_quads > 0 {
@@ -3988,7 +4265,17 @@ mod tests {
         // planner returns its best-effort structure and emit_frame's trim
         // backstop cuts the tail; replicate that here.
         let budget = 990u64;
-        let cost = plan_granule(&spec, &layout, &thresholds, false, budget, false, 1.0, 0);
+        let cost = plan_granule(
+            &spec,
+            &layout,
+            &thresholds,
+            false,
+            budget,
+            false,
+            1.0,
+            0,
+            None,
+        );
         let mut plan = cost.plan;
         while plan.big_values > 0 || plan.count1_quads > 0 {
             if measure_plan(&plan, &spec, &layout, false, false) <= budget {

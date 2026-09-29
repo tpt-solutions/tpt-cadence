@@ -1063,6 +1063,136 @@ fn lsf_transient_short_blocks_agree_with_ffmpeg() {
     }
 }
 
+/// Intensity-stereo gate: a source panned exactly at position 4
+/// (`L/R = tan(60°)`) above 2 kHz is representable by intensity coding.
+/// The stream must engage intensity stereo, decode identically in FFmpeg
+/// and this crate (>100 dB), and reproduce the same per-channel levels as
+/// the ordinary encode of the same source — both with mid/side on
+/// (correlated content) and off (independent low band forcing L/R).
+#[test]
+fn intensity_stereo_agrees_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::{Mp3Decoder, Mp3Encoder};
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    let sample_rate = 44_100u32;
+    let n = sample_rate as usize * 2;
+    let pan = 1.0 / 3.0f32.sqrt();
+    for independent_low in [false, true] {
+        let mut frames = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f32 / sample_rate as f32;
+            let hi: f32 = [2600.0f32, 3700.0, 5100.0, 6900.0, 9300.0, 12100.0]
+                .iter()
+                .enumerate()
+                .map(|(k, f)| 0.06 * (2.0 * PI * f * t + k as f32).sin())
+                .sum();
+            let lo = 0.2 * (2.0 * PI * 500.0 * t).sin();
+            let (l, r) = if independent_low {
+                (hi + lo, pan * hi + 0.2 * (2.0 * PI * 330.0 * t).sin())
+            } else {
+                (hi + lo, pan * (hi + lo))
+            };
+            frames.push(l);
+            frames.push(r);
+        }
+
+        // (stream, our decode, FFmpeg decode, intensity frames, frames)
+        let encode = |intensity: bool| {
+            let mut buf = Cursor::new(Vec::new());
+            {
+                let mut enc = Mp3Encoder::new(&mut buf, sample_rate, 2, 128).unwrap();
+                enc.set_intensity_stereo(intensity);
+                enc.encode(&frames).unwrap();
+                Encoder::finish(&mut enc).unwrap();
+            }
+            let data = buf.into_inner();
+            let (mut off, mut is_frames, mut total) = (0usize, 0usize, 0usize);
+            while off + 4 <= data.len() {
+                off +=
+                    (1152 * 128 * 125 / sample_rate) as usize + ((data[off + 2] >> 1) & 1) as usize;
+                if (data[off - (1152 * 128 * 125 / sample_rate) as usize + 3] >> 4) & 1 == 1 {
+                    is_frames += 1;
+                }
+                total += 1;
+            }
+            let path = std::env::temp_dir().join(format!(
+                "cadence_mp3_is_{}_{}_{}.mp3",
+                std::process::id(),
+                independent_low,
+                intensity
+            ));
+            std::fs::write(&path, &data).expect("write temp mp3");
+            let oracle = decode_with_ffmpeg(&path, sample_rate, 2).expect("ffmpeg oracle decode");
+            let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+            let mut ours = Vec::new();
+            let mut out = vec![0.0f32; 4096 * 2];
+            loop {
+                match dec.decode(&mut out) {
+                    Ok(0) => break,
+                    Ok(g) => ours.extend_from_slice(&out[..g * 2]),
+                    Err(e) => panic!("our decode errored: {e}"),
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+            (ours, oracle, is_frames, total)
+        };
+        let (base, _, base_is, _) = encode(false);
+        assert_eq!(base_is, 0, "intensity is opt-in");
+        let (ours, oracle, is_frames, total) = encode(true);
+        assert!(
+            is_frames * 2 > total,
+            "intensity must engage (independent_low={independent_low}): {is_frames}/{total}"
+        );
+
+        assert_eq!(ours.len(), oracle.len(), "length mismatch vs ffmpeg");
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for (&a, &b) in ours.iter().zip(&oracle) {
+            sig += f64::from(b).powi(2);
+            err += (f64::from(a) - f64::from(b)).powi(2);
+        }
+        let inter = 10.0 * (sig / err).log10();
+
+        let rms = |x: &[f32], c: usize| {
+            let v: Vec<f64> = x
+                .iter()
+                .skip(20_000 * 2 + c)
+                .step_by(2)
+                .take(40_000)
+                .map(|&s| f64::from(s).powi(2))
+                .collect();
+            (v.iter().sum::<f64>() / v.len() as f64).sqrt()
+        };
+        eprintln!(
+            "intensity (independent_low={independent_low}): {is_frames}/{total} frames, inter-decoder {inter:.2} dB, rms L {:.4}/{:.4} R {:.4}/{:.4} (IS/plain)",
+            rms(&ours, 0),
+            rms(&base, 0),
+            rms(&ours, 1),
+            rms(&base, 1)
+        );
+        assert!(
+            inter > 100.0,
+            "inter-decoder SNR {inter:.2} dB (low={independent_low})"
+        );
+        for c in 0..2 {
+            let (a, b) = (rms(&ours, c), rms(&base, c));
+            assert!(
+                (a / b - 1.0).abs() < 0.1,
+                "channel {c} level {a:.4} vs plain {b:.4} (low={independent_low})"
+            );
+        }
+    }
+}
+
 /// Metadata-tag gate: an Info/Xing-tagged stream must decode in FFmpeg in
 /// agreement with this crate's decoder — the tag frame counts as one
 /// silent frame in both, and the audio frames that follow (starting from
