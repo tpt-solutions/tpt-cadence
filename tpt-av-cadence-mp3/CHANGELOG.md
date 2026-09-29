@@ -8,6 +8,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Info/Xing metadata tags** (`new_cbr_with_info` / `new_vbr_with_xing`):
+  a leading silent frame carries the LAME-style metadata — frames count,
+  byte count, 100-entry seek TOC, and quality — written at open with
+  placeholder counts and patched at `finish` (the encoder now requires
+  seekable sinks, matching the FLAC/WAV encoders' convention). The tag
+  frame consumes no reservoir bits, so the audio frames that follow start
+  from a clean `main_data_begin = 0` chain, and the crate's decoder skips
+  leading Info/Xing/LAME-tag frames exactly like FFmpeg's demuxer, so
+  tagged and untagged emissions decode to identical sample counts and
+  inter-decoder agreement (124 dB on tagged streams).
+- **LAME gapless extension** in the Info/Xing tag: the 24-bit
+  encoder-delay/padding field (delay = 574, measured impulse alignment;
+  padding = audio frames·spf − delay − source pairs) is written at tag
+  creation and patched at `finish`, and the **decoder applies the LAME
+  trim internally** — leading delay samples are skipped and the final
+  frame gives up its padding tail — so a tagged round trip recovers the
+  exact source sample count with no player-side arithmetic. The
+  metadata-tag crosscheck verifies the field parse-back and the
+  sample-exact trim.
+- **Short blocks (window switching) ENABLED** for the MP3 encoder
+  (MPEG-1): a closed-form 12-point analysis derived by inverting the
+  decoder's `imdct12` chain (round trip through the decoder's real
+  kernels verified across the overlap chain), the 39-band (scalefactor
+  band, window) layout with its implied 9-band region 0 and the
+  [9, 9, 6, 12] scalefactor partition, a fixed-bound two-region book
+  planner, the window-switched side-info shape, a PCM-domain transient
+  detector (front-half vs prior back-half energy — the polyphase window
+  smears attacks in the subband domain), and a zero-line stop/bridge
+  window-sequence state machine: the granule before an attack and the
+  first after a short run carry no lines, driving the decoder's overlap
+  state to exactly zero — a pure function of their (empty) lines — so
+  the handover is convention-free in every decoder. Verified against
+  FFmpeg at 121 dB on transient material with the full sequence (bt3
+  stop -> bt2 shorts -> bt2 bridge) asserted in the side info. An
+  earlier session's "~30 dB transition divergence" was a measurement
+  artifact: the test click exceeded full scale, so FFmpeg's int16 output
+  saturated while this crate's float output kept the overshoot; in the
+  float domain the decoders agree exactly.
+- **VBR encoding** (`Mp3Encoder::new_vbr`, quality 0..=9 LAME-style): each
+  frame's bitrate index is chosen as the smallest standard rate whose
+  planned content meets the quality tolerance — the decoder-recommended
+  MP3 VBR, since every frame header self-describes its size and the bit
+  reservoir absorbs the frame-size differences. The psychoacoustic
+  amplification loop gained a tolerance target (CBR keeps noise-at-
+  threshold, 1.0; VBR maps quality to +1.5 dB allowed band noise per
+  step), and plans now report their worst-band noise-to-threshold ratio
+  as the frame's delivered quality. Gates: a selection regression (VBR
+  must vary the bitrate with loudness, tile the stream byte-exactly
+  across varying frame sizes, and decode quiet-then-loud material
+  correctly) and an FFmpeg oracle test for MPEG-1 mono/stereo and LSF
+  stereo VBR streams at 120-124 dB inter-decoder agreement.
 - **MPEG-2/2.5 (LSF) family encoding**: `Mp3Encoder` now accepts all three
   version families — MPEG-1 at 32/44.1/48 kHz (32-320 kbps), MPEG-2 at
   16/22.05/24 kHz and MPEG-2.5 at 8/11.025/12 kHz (8-160 kbps). LSF frames

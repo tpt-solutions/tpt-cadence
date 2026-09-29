@@ -67,6 +67,10 @@ pub struct Mp3Decoder {
     staged_frames: usize,
     staged_pos: usize,
     frames_out: u64,
+    /// Remaining leading samples to skip (the delay part of `gapless`).
+    gapless_delay_front: usize,
+    /// LAME gapless trim (delay, padding) from a leading Info/Xing tag.
+    gapless: Option<(usize, usize)>,
 
     /// Scratch for decode-and-discard seeking.
     seek_scratch: Box<[f32]>,
@@ -114,12 +118,60 @@ impl Mp3Decoder {
                 }
             }
         }
-        let (off, hdr) = found.ok_or_else(|| {
+        let (mut off, mut hdr) = found.ok_or_else(|| {
             CadenceError::InvalidFormat("no MPEG Layer III frame found in stream".into())
         })?;
+
+        // Metadata-tag skip: a leading Info/Xing frame (LAME-style) is
+        // ancillary, not audio: decode nothing for it and resume at the
+        // first real audio frame, matching FFmpeg's demuxer.
+        let mut gapless: Option<(usize, usize)> = None;
+        loop {
+            let nch: usize = if hdr.mono { 1 } else { 2 };
+            let si_len = SIDE_INFO[hdr.mpeg1 as usize][nch - 1];
+            let fourcc_off = off + 4 + si_len;
+            let is_tag = fourcc_off + 4 <= valid
+                && matches!(
+                    &probe[fourcc_off..fourcc_off + 4],
+                    b"Xing" | b"Info" | b"LAME",
+                );
+            if !is_tag {
+                break;
+            }
+            // LAME gapless extension: 24-bit delay/padding field at the
+            // documented offset (FOURCC + flags + frames + bytes + TOC
+            // + quality + 21 bytes of version/revision prefix).
+            let lame_at = fourcc_off + 4 + 4 + 4 + 4 + 100 + 4 + 21;
+            if lame_at + 3 <= valid {
+                let v = (u32::from(probe[lame_at]) << 16)
+                    | (u32::from(probe[lame_at + 1]) << 8)
+                    | u32::from(probe[lame_at + 2]);
+                let delay = (v >> 12) as usize;
+                let padding = (v & 0xFFF) as usize;
+                if delay > 0 || padding > 0 {
+                    gapless = Some((delay, padding));
+                }
+            }
+
+            let total = hdr.total_bytes();
+            audio_start += total as u64;
+            probe.copy_within(off + total..valid, 0);
+            valid -= total;
+            match find_first_frame(&probe[..valid], probe_eof) {
+                Some(hit) => {
+                    (off, hdr) = hit;
+                }
+                None => {
+                    return Err(CadenceError::InvalidFormat(
+                        "stream carries only a metadata tag frame".into(),
+                    ));
+                }
+            }
+        }
         // Account for bytes before the first frame within this probe window
         // so seek() resets to the real first frame.
         audio_start += off as u64;
+        let (gapless_delay, gapless_pad) = gapless.unwrap_or((0, 0));
 
         let channels: usize = if hdr.mono { 1 } else { 2 };
         let info = StreamInfo::new(Format::Mp3, hdr.sample_rate_hz, channels as u16, 16);
@@ -152,6 +204,12 @@ impl Mp3Decoder {
             staged_frames: 0,
             staged_pos: 0,
             frames_out: 0,
+            gapless: if gapless_delay > 0 || gapless_pad > 0 {
+                Some((gapless_delay, gapless_pad))
+            } else {
+                None
+            },
+            gapless_delay_front: gapless_delay,
             seek_scratch: vec![0.0f32; channels * 576].into_boxed_slice(),
         })
     }
@@ -269,6 +327,14 @@ impl Mp3Decoder {
                     }
                     self.staged_frames = frames;
                     self.staged_pos = 0;
+                    // LAME end padding: the stream's final frame gives up
+                    // its last `padding` samples (the synth pipeline tail
+                    // the source never filled).
+                    if let Some((_, pad)) = self.gapless {
+                        if self.source_eof && self.window_pos >= self.window_valid {
+                            self.staged_frames -= pad.min(frames);
+                        }
+                    }
                     return Ok(true);
                 }
                 Err(_) => {
@@ -556,6 +622,17 @@ impl Decoder for Mp3Decoder {
         while written < want {
             if self.staged_pos >= self.staged_frames && !self.decode_next_frame()? {
                 break;
+            }
+            // LAME front skip: leading encoder-delay samples.
+            if self.gapless_delay_front > 0 {
+                let skip = self
+                    .gapless_delay_front
+                    .min(self.staged_frames - self.staged_pos);
+                self.staged_pos += skip;
+                self.gapless_delay_front -= skip;
+                if self.staged_pos >= self.staged_frames {
+                    continue;
+                }
             }
             let available = self.staged_frames - self.staged_pos;
             let n = (want - written).min(available);

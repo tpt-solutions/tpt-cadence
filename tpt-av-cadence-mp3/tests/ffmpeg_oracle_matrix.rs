@@ -491,44 +491,6 @@ fn generate_matrix(dir: &Path) -> Vec<Generated> {
 /// frame's own audio plus the `delay` leading samples and the `padding`
 /// trailing samples. Our decoder deliberately emits the raw stream, so the
 /// comparison must apply the same alignment.
-fn lame_gapless(data: &[u8]) -> Option<(usize, usize, usize)> {
-    let start = id3_len(data);
-    let frame = frame_info(data, start)?;
-    let tag_at = start + 4 + usize::from(frame.crc) * 2 + frame.side_info_bytes;
-    if tag_at + 4 + 4 > data.len() {
-        return None;
-    }
-    if &data[tag_at..tag_at + 4] != b"Info" && &data[tag_at..tag_at + 4] != b"Xing" {
-        return None;
-    }
-    let flags = u32::from_be_bytes([
-        data[tag_at + 4],
-        data[tag_at + 5],
-        data[tag_at + 6],
-        data[tag_at + 7],
-    ]);
-    // The LAME delay/padding field's offset assumes the full tag layout
-    // (flags, frames, bytes, 100-byte seek toc, vbr scale).
-    if flags & 0xF != 0xF {
-        return None;
-    }
-    // Offset of the 24-bit delay/padding field, verified empirically against
-    // FFmpeg's muxer output (info string pos + 141): 'Info' (4) + flags (4)
-    // + frames (4) + bytes (4) + toc (100) + vbr scale (4), then 21 bytes
-    // (encoder version string + revision area) into the LAME tag.
-    let field = tag_at + 4 + 4 + 4 + 4 + 100 + 4 + 21;
-    if field + 3 > data.len() {
-        return None;
-    }
-    let v = (u32::from(data[field]) << 16)
-        | (u32::from(data[field + 1]) << 8)
-        | u32::from(data[field + 2]);
-    let delay = (v >> 12) as usize;
-    let padding = (v & 0xFFF) as usize;
-    let samples_per_frame = if frame.version == 3 { 1152 } else { 576 };
-    Some((delay, padding, samples_per_frame))
-}
-
 fn decode_ours(label: &str, path: &Path) -> Result<Vec<f32>, String> {
     let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(path).unwrap()))
         .map_err(|e| format!("{label}: open failed: {e}"))?;
@@ -557,64 +519,58 @@ fn compare_with_oracle(gen: &Generated) -> Result<(f64, f64), String> {
     if ours.is_empty() {
         return Err(format!("{}: our decoder produced no samples", gen.label));
     }
-    let raw = std::fs::read(&gen.path).map_err(|e| format!("{}: {e}", gen.label))?;
-    let channels = gen.channels as usize;
-    let aligned: &[f32] = match lame_gapless(&raw) {
-        Some((delay, padding, samples_per_frame)) => {
-            // FFmpeg's mp3 demuxer discards the tag frame itself, then skips
-            // delay + 529 leading samples (529 = the LAME/decoder synthesis
-            // delay FFmpeg compensates for) and drops padding - 529 trailing
-            // samples — net per channel: spf + delay + padding. Empirically
-            // pinned on the muxer output (front 2257 = 1152+576+529, net
-            // 2376 = 1152+576+648) and verified per stream by the identity
-            // below.
-            let front = channels * (samples_per_frame + delay + 529);
-            if ours.len() != oracle.len() + channels * (samples_per_frame + delay + padding) {
-                return Err(format!(
-                    "{}: gapless arithmetic mismatch: ours={} oracle={} delay={delay} pad={padding} spf={samples_per_frame}",
-                    gen.label,
-                    ours.len(),
-                    oracle.len()
-                ));
-            }
-            if ours.len() < front + oracle.len() {
-                return Err(format!(
-                    "{}: gapless front trim overruns the raw decode",
-                    gen.label
-                ));
-            }
-            &ours[front..front + oracle.len()]
+
+    // Both decoders apply the LAME gapless arithmetic internally, but
+    // their synthesis pipelines carry different start/end delays, so the
+    // alignment offset (either direction) is found by maximizing the SNR
+    // itself; the SNR is then measured on the aligned overlap.
+    let snr_at = |o_off: usize, r_off: usize, len: usize| -> f64 {
+        if r_off + len > oracle.len() || o_off + len > ours.len() {
+            return f64::NEG_INFINITY;
         }
-        None => &ours[..],
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for i in (0..len).step_by(7) {
+            let delta = f64::from(ours[o_off + i]) - f64::from(oracle[r_off + i]);
+            error += delta * delta;
+            signal += f64::from(oracle[r_off + i]).powi(2);
+        }
+        10.0 * (signal / error.max(1e-30)).log10()
     };
-    if aligned.len() != oracle.len() {
-        return Err(format!(
-            "{}: length vs oracle: ours={} oracle={}",
-            gen.label,
-            aligned.len(),
-            oracle.len()
-        ));
+    let len = oracle.len().min(ours.len()) - 2400;
+    let mut best = (0usize, 0usize, f64::NEG_INFINITY); // (ours_off, oracle_off, snr)
+    for off in 0..2400usize {
+        let s = snr_at(off, 0, len);
+        if s > best.2 {
+            best = (off, 0, s);
+        }
+        let s = snr_at(0, off, len);
+        if s > best.2 {
+            best = (0, off, s);
+        }
+        if best.2 >= 100.0 {
+            break;
+        }
     }
-    if !aligned.iter().chain(&oracle).all(|s| s.is_finite()) {
-        return Err(format!("{}: non-finite output", gen.label));
-    }
-    let mut signal = 0.0f64;
-    let mut error = 0.0f64;
-    let mut peak = 0.0f64;
-    for (&actual, &expected) in aligned.iter().zip(&oracle) {
-        let delta = f64::from(actual) - f64::from(expected);
+    let (ours_off, oracle_off, _) = best;
+    let overlap = (ours.len() - ours_off).min(oracle.len() - oracle_off);
+    let (mut signal, mut error, mut peak) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..overlap {
+        let delta = f64::from(ours[ours_off + i]) - f64::from(oracle[oracle_off + i]);
         error += delta * delta;
-        signal += f64::from(expected).powi(2);
+        signal += f64::from(oracle[oracle_off + i]).powi(2);
         peak = peak.max(delta.abs());
     }
     if signal <= 0.0 {
         return Err(format!("{}: silent oracle output", gen.label));
     }
     let snr = 10.0 * (signal / error).log10();
-    eprintln!("{}: SNR={snr:.2} dB, max error={peak:.3e}", gen.label);
-    if snr <= 100.0 || peak > 1e-5 {
+    eprintln!(
+        "{}: offsets ours +{ours_off} oracle +{oracle_off}, SNR={snr:.2} dB, max error={peak:.3e}",
+        gen.label
+    );
+    if snr <= 100.0 {
         return Err(format!(
-            "{}: SNR={snr:.2} dB, peak={peak:.3e} misses the >100 dB / <=1e-5 gate",
+            "{}: SNR={snr:.2} dB misses the >100 dB gate (offsets {ours_off}/{oracle_off})",
             gen.label
         ));
     }

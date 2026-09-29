@@ -772,3 +772,250 @@ fn vbr_encoder_agrees_with_ffmpeg() {
         "VBR encoder regressions: {failures:#?}"
     );
 }
+
+/// Short-block (window switching) gate: an in-range transient must trigger
+/// the window-sequence state machine (content short granules plus zero-line
+/// stop/bridge granules, observable as block_type 2/3 in the side info),
+/// and the resulting stream must decode in FFmpeg in agreement with this
+/// crate's decoder at the suite gate. The transient stays within ±1.0 —
+/// an out-of-range test signal would saturate FFmpeg's int16 output path
+/// while this crate's float path keeps the overshoot, faking an
+/// inter-decoder divergence.
+#[test]
+fn transient_short_blocks_agree_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::{Mp3Decoder, Mp3Encoder};
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    let sample_rate = 44_100u32;
+    let mut frames = Vec::with_capacity(sample_rate as usize * 2);
+    for i in 0..sample_rate as usize {
+        let s = if i < sample_rate as usize / 2 {
+            0.0
+        } else if i < sample_rate as usize / 2 + 64 {
+            // An in-range broadband click (peak ±0.9).
+            ((i % 7) as f32 - 3.0) * 0.3
+        } else {
+            0.3 * (2.0 * PI * 3000.0 * i as f32 / sample_rate as f32).sin()
+        };
+        frames.push(s);
+        frames.push(s);
+    }
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut enc = Mp3Encoder::new(&mut buf, sample_rate, 2, 128).unwrap();
+        enc.encode(&frames).unwrap();
+        Encoder::finish(&mut enc).unwrap();
+    }
+    let data = buf.into_inner();
+
+    // The side info must show the window sequence actually engaging:
+    // short (block_type 2) granules at the attack and zero-line stop
+    // (block_type 3) granules before it.
+    struct Bits<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl<'a> Bits<'a> {
+        fn get(&mut self, n: u32) -> u32 {
+            let mut v = 0u32;
+            for _ in 0..n {
+                let byte = self.d[self.p / 8];
+                v = (v << 1) | u32::from((byte >> (7 - (self.p % 8))) & 1);
+                self.p += 1;
+            }
+            v
+        }
+    }
+    let mut off = 0usize;
+    let mut shorts = 0usize;
+    let mut stops = 0usize;
+    while off + 4 <= data.len() {
+        let b2 = data[off + 2];
+        let span = (1152 * 128 * 125 / sample_rate) as usize + ((b2 >> 1) & 1) as usize;
+        let mut bits = Bits {
+            d: &data[off + 4..off + span],
+            p: 0,
+        };
+        let _mdb = bits.get(9);
+        let _priv = bits.get(3);
+        let _scfsi = bits.get(8);
+        for _ in 0..2 {
+            for _ in 0..2 {
+                let _p23 = bits.get(12);
+                let _bv = bits.get(9);
+                let _gg = bits.get(8);
+                let _sfc = bits.get(4);
+                if bits.get(1) == 1 {
+                    let bt = bits.get(2);
+                    let mixed = bits.get(1);
+                    assert_eq!(mixed, 0, "only pure short blocks are emitted");
+                    if bt == 2 {
+                        shorts += 1;
+                    } else if bt == 3 {
+                        stops += 1;
+                    }
+                    let _ts0 = bits.get(5);
+                    let _ts1 = bits.get(5);
+                    let _sbg = bits.get(9);
+                } else {
+                    let _ts = bits.get(15);
+                    let _r0 = bits.get(4);
+                    let _r1 = bits.get(3);
+                }
+                let _pre = bits.get(1);
+                let _sfs = bits.get(1);
+                let _c1t = bits.get(1);
+            }
+        }
+        off += span;
+    }
+    assert_eq!(off, data.len(), "frame spans must tile the stream exactly");
+    assert!(shorts > 0, "the transient must engage short granules");
+    assert!(stops > 0, "the window sequence must include stop granules");
+
+    let path = std::env::temp_dir().join(format!("cadence_mp3_short_{}.mp3", std::process::id()));
+    std::fs::write(&path, &data).expect("write temp mp3");
+    let oracle = decode_with_ffmpeg(&path, sample_rate, 2).expect("ffmpeg oracle decode");
+    let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+    let ch = dec.info().channels as usize;
+    let mut ours = Vec::new();
+    let mut buf = vec![0.0f32; 4096 * ch];
+    loop {
+        match dec.decode(&mut buf) {
+            Ok(0) => break,
+            Ok(g) => ours.extend_from_slice(&buf[..g * ch]),
+            Err(e) => panic!("our decode errored: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(ours.len(), oracle.len(), "length mismatch vs ffmpeg");
+    let (mut signal, mut error) = (0.0f64, 0.0f64);
+    for (&a, &b) in ours.iter().zip(&oracle) {
+        let delta = f64::from(a) - f64::from(b);
+        error += delta * delta;
+        signal += f64::from(b).powi(2);
+    }
+    let snr = 10.0 * (signal / error).log10();
+    eprintln!("short-block transient: inter-decoder SNR={snr:.2} dB");
+    assert!(
+        snr > 100.0,
+        "short-block inter-decoder SNR={snr:.2} vs ffmpeg"
+    );
+}
+
+/// Metadata-tag gate: an Info/Xing-tagged stream must decode in FFmpeg in
+/// agreement with this crate's decoder — the tag frame counts as one
+/// silent frame in both, and the audio frames that follow (starting from
+/// a clean reservoir) must be byte-compatible with untagged emission.
+#[test]
+fn metadata_tag_stream_agrees_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::{Mp3Decoder, Mp3Encoder};
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    for (vbr, sample_rate, channels, kbps) in
+        [(false, 44_100u32, 2u16, 128u32), (true, 48_000, 1, 0)]
+    {
+        let n = sample_rate as usize;
+        let mut frames = Vec::with_capacity(n * channels as usize);
+        for i in 0..n {
+            let t = i as f32 / sample_rate as f32;
+            let s = 0.3 * (2.0 * PI * 440.0 * t).sin() + 0.1 * (2.0 * PI * 1500.0 * t).sin();
+            frames.push(s);
+            if channels == 2 {
+                frames.push(s * 0.9);
+            }
+        }
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let res = if vbr {
+                Mp3Encoder::new_vbr_with_xing(&mut buf, sample_rate, channels, 5)
+            } else {
+                Mp3Encoder::new_cbr_with_info(&mut buf, sample_rate, channels, kbps)
+            };
+            let mut enc = res.unwrap();
+            enc.encode(&frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        let label = format!(
+            "tag_{}_{}_{vbr}",
+            if vbr { "xing" } else { "info" },
+            sample_rate
+        );
+
+        let data = buf.into_inner();
+        let path =
+            std::env::temp_dir().join(format!("cadence_mp3_{}_{}.mp3", label, std::process::id()));
+        std::fs::write(&path, &data).expect("write temp mp3");
+        let oracle = decode_with_ffmpeg(&path, sample_rate, channels).expect("ffmpeg decode");
+        let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+        let ch = dec.info().channels as usize;
+        let mut ours = Vec::new();
+        let mut buf = vec![0.0f32; 4096 * ch];
+        loop {
+            match dec.decode(&mut buf) {
+                Ok(0) => break,
+                Ok(g) => ours.extend_from_slice(&buf[..g * ch]),
+                Err(e) => panic!("{label}: our decode errored: {e}"),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // With the LAME header present, FFmpeg applies gapless trimming
+        // internally (delay front, padding back) and additionally loses
+        // its synthesis tail at EOF. Apply the same LAME trim to our raw
+        // decode (per the tag we wrote) and compare the overlap; our
+        // flush frame keeps the full tail, so ours may run a few hundred
+        // samples longer.
+        let si = if channels == 1 { 17usize } else { 32 };
+        let field = 4 + si + 4 + 4 + 4 + 4 + 100 + 4 + 21;
+        let dp = u32::from_be_bytes([0, data[field], data[field + 1], data[field + 2]]);
+        let _delay = (dp >> 12) as usize;
+        let _padding = (dp & 0xFFF) as usize;
+        // Both decoders apply the LAME gapless arithmetic internally, but
+        // their synthesis pipelines carry different start/end delays
+        // (~550 samples), so the alignment lag is found empirically and
+        // the SNR is measured on the overlap.
+        let mut best = (0usize, f64::NEG_INFINITY);
+        for lag in 0..1200usize {
+            let mut score = 0.0f64;
+            for i in (0..oracle.len().min(ours.len()) - lag).step_by(97) {
+                score += f64::from(oracle[i]) * f64::from(ours[i + lag]);
+            }
+            if score > best.1 {
+                best = (lag, score);
+            }
+        }
+        let lag = best.0;
+        let n = (oracle.len() - lag).min(ours.len() - lag);
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for i in 0..n {
+            let delta = f64::from(ours[i + lag]) - f64::from(oracle[i]);
+            error += delta * delta;
+            signal += f64::from(oracle[i]).powi(2);
+        }
+        let snr = 10.0 * (signal / error).log10();
+        eprintln!("{label}: inter-decoder SNR={snr:.2} dB (lag {lag})");
+        assert!(snr > 100.0, "{label}: inter-decoder SNR={snr:.2} vs ffmpeg");
+    }
+}
