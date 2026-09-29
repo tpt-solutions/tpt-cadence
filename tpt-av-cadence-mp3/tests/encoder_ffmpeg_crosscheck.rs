@@ -1118,11 +1118,11 @@ fn intensity_stereo_agrees_with_ffmpeg() {
             let data = buf.into_inner();
             let (mut off, mut is_frames, mut total) = (0usize, 0usize, 0usize);
             while off + 4 <= data.len() {
-                off +=
-                    (1152 * 128 * 125 / sample_rate) as usize + ((data[off + 2] >> 1) & 1) as usize;
-                if (data[off - (1152 * 128 * 125 / sample_rate) as usize + 3] >> 4) & 1 == 1 {
+                if (data[off + 3] >> 4) & 1 == 1 {
                     is_frames += 1;
                 }
+                off +=
+                    (1152 * 128 * 125 / sample_rate) as usize + ((data[off + 2] >> 1) & 1) as usize;
                 total += 1;
             }
             let path = std::env::temp_dir().join(format!(

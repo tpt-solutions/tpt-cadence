@@ -1815,9 +1815,7 @@ fn intensity_candidate(l: &[f32], r: &[f32], layout: &BandLayout) -> usize {
         .sum();
     for band in (8..22).rev() {
         let (el, er, lr) = band_stats(l, r, layout, band);
-        let ok = el + er <= 1e-5 * total
-            || el * er <= 1e-18
-            || lr / (el * er).sqrt() >= 0.9;
+        let ok = el + er <= 1e-5 * total || el * er <= 1e-18 || lr / (el * er).sqrt() >= 0.9;
         if !ok {
             break;
         }
@@ -1844,6 +1842,7 @@ fn intensity_positions(l: &[f32], r: &[f32], layout: &BandLayout) -> [u8; 22] {
     pos
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Rewrites bands `from..` of the (already M/S-transformed if `ms`)
 /// spectra `out0`/`out1` as an intensity source and silence: the source
 /// keeps the in-phase line shape `L+R`, scaled so the pan split preserves
@@ -2779,6 +2778,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         // channel's highest non-zero band).
         let base_spec = self.spec_scratch.clone();
         let mut is_info: Option<IsInfo> = None;
+
         if self.intensity
             && channels == 2
             && !lsf
@@ -2794,7 +2794,6 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 info.from[gr] = intensity_candidate(&lr_spec[gr], &lr_spec[2 + gr], &self.layout);
                 info.pos[gr] = intensity_positions(&lr_spec[gr], &lr_spec[2 + gr], &self.layout);
             }
-            eprintln!("DBG from {:?}", info.from);
             if info.from[..n_granules].iter().all(|&f| f < 22) {
                 is_info = Some(info);
             }
