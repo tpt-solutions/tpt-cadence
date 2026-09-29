@@ -17,6 +17,7 @@
 
 mod bitreader;
 mod codebook;
+mod encoder;
 mod fft;
 mod floor;
 mod header;
@@ -31,6 +32,7 @@ use tpt_av_cadence_core::{
 use tpt_av_cadence_ogg::PageReader;
 
 use crate::bitreader::BitReader;
+pub use crate::encoder::VorbisEncoder;
 use crate::header::{IdHeader, Setup};
 use crate::mdct::{vector_fmul_window, Mdct};
 use crate::residue::ResidueWorkspace;

@@ -264,7 +264,6 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
                     }
                 }
                 let values = x.len();
-                eprintln!("DBG floor1 values={values} at bit {}", br.bit_pos);
                 // Precompute neighbors and sort order (spec 7.2.2/FFmpeg
                 // ff_vorbis_ready_floor1_list).
                 let mut low = vec![0usize; values];
@@ -311,7 +310,6 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
 
     // Residues.
     let residue_count = br.read_bits(6)? as usize + 1;
-    eprintln!("DBG residues={residue_count} at bit {}", br.bit_pos);
     let mut residues = Vec::with_capacity(residue_count);
     for _ in 0..residue_count {
         let residue_type = br.read_bits(16)? as u8;
@@ -433,22 +431,6 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
         });
     }
 
-    eprintln!(
-        "DBG mapping dump: {} mappings; {:?}",
-        mappings.len(),
-        mappings
-            .iter()
-            .map(|m| (
-                m.submaps,
-                m.coupling_steps,
-                m.magnitude.to_vec(),
-                m.angle.to_vec(),
-                m.mux.to_vec(),
-                m.submap_floor.to_vec(),
-                m.submap_residue.to_vec()
-            ))
-            .collect::<Vec<_>>()
-    );
     // Modes.
     let mode_count = br.read_bits(6)? as usize + 1;
     let mut modes = Vec::with_capacity(mode_count);

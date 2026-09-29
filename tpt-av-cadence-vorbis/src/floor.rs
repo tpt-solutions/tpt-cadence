@@ -563,7 +563,7 @@ impl Floor1 {
 
 /// Bresenham line in the dB-index domain, substituting
 /// `floor1_inverse_dB_table` values (spec 9.2.7 + 7.2.4 step 15).
-fn render_line(x0: usize, y0: usize, x1: usize, y1: usize, buf: &mut [f32]) {
+pub(crate) fn render_line(x0: usize, y0: usize, x1: usize, y1: usize, buf: &mut [f32]) {
     let dy = y1 as i64 - y0 as i64;
     // Callers only ever advance `lx`/pass `n` forward along the ascending
     // `self.sort` order (or `n` itself, the tail segment), so `x1 >= x0`

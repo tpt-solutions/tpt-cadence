@@ -17,6 +17,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tpt-av-cadence-test-utils = { workspace = true }
 
 [[bench]]
 name = "decode"
