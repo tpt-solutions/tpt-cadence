@@ -115,3 +115,43 @@ fn ffmpeg_decodes_our_stream_like_we_do() {
         assert!(snr > 90.0, "inter-decoder SNR {snr}");
     }
 }
+
+#[test]
+#[ignore]
+fn bitrate_sweep() {
+    let input: Vec<f32> = match std::env::var("VORBIS_SWEEP_RAW") {
+        Ok(p) => std::fs::read(p)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        Err(_) => signal(44100 * 4, 2, 44100.0),
+    };
+    let secs = input.len() as f64 / 2.0 / 44100.0;
+    for q in [0.0f32, 2.0, 4.0, 6.0, 8.0, 10.0] {
+        let data = encode(&input, 2, 44100, q);
+        let out = decode(data.clone(), 2);
+        eprintln!(
+            "q{q}: {:.0} kbps, snr {:.1} dB",
+            data.len() as f64 * 8.0 / secs / 1000.0,
+            snr_db(&input, &out)
+        );
+    }
+}
+
+#[test]
+fn short_and_odd_lengths_keep_exact_length() {
+    for channels in [1usize, 2] {
+        for n in [1usize, 100, 1023, 1024, 1025, 5000] {
+            let input = signal(n, channels, 44100.0);
+            let out = decode(encode(&input, channels as u16, 44100, 5.0), channels);
+            assert_eq!(out.len(), input.len(), "{channels}ch n={n}");
+        }
+    }
+}
+
+#[test]
+fn rejects_bad_configuration() {
+    assert!(VorbisEncoder::new(Vec::new(), 44100, 3, 5.0).is_err());
+    assert!(VorbisEncoder::new(Vec::new(), 0, 2, 5.0).is_err());
+}

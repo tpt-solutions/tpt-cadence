@@ -40,6 +40,10 @@ const N: usize = 1 << BS_EXP;
 const M: usize = N / 2;
 const FLOOR_RANGE: i32 = 128;
 const FLOOR_RANGE_BITS: u32 = 7;
+/// Exponent blending the floor between tracking the local envelope (1.0,
+/// constant band SNR) and a flat absolute noise level (0.0, minimum MSE):
+/// noise follows the spectrum partially, as masking does.
+const FLOOR_ALPHA: f32 = 0.7;
 const SERIAL: u32 = 0x5450_5456;
 /// Forward MDCT scale: makes the decoder's unnormalized IMDCT + window
 /// overlap-add reconstruct unity gain.
@@ -321,6 +325,9 @@ pub struct VorbisEncoder<W: Write + Send> {
     window: Vec<f32>,
     /// Floor offset below the envelope, as an amplitude ratio.
     floor_gain: f32,
+    alpha: f32,
+    /// Absolute noise level the floor is pulled toward (amplitude).
+    floor_d: f32,
     /// First bin forced to zero (lowpass).
     cutoff_bin: usize,
     inbuf: Vec<Vec<f32>>,
@@ -478,7 +485,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
             })
             .collect();
 
-        let snr_db = 2.0 + 0.9 * f64::from(quality);
+        let snr_db = -8.0 + 1.6 * f64::from(quality);
         let cutoff_hz = 12_000.0 + 1_000.0 * f64::from(quality);
         let cutoff_bin = ((cutoff_hz / (f64::from(sample_rate) / 2.0)) * M as f64) as usize;
 
@@ -497,6 +504,8 @@ impl<W: Write + Send> VorbisEncoder<W> {
             post,
             window,
             floor_gain: 10f64.powf(-snr_db / 20.0) as f32,
+            alpha: FLOOR_ALPHA,
+            floor_d: 10f32.powf(-(50.0 + 1.5 * quality) / 20.0),
             cutoff_bin: cutoff_bin.min(M),
             inbuf: vec![vec![0.0; M]; ch],
             total_in: 0,
@@ -531,7 +540,9 @@ impl<W: Write + Send> VorbisEncoder<W> {
                 let hi = (pos + hw).min(M - 1);
                 let e: f32 =
                     spec[lo..=hi].iter().map(|v| v * v).sum::<f32>() / (hi - lo + 1) as f32;
-                let target = (e.sqrt() * self.floor_gain).max(1e-5);
+                let target = ((e.sqrt().max(1e-9) * self.floor_gain).powf(self.alpha)
+                    * self.floor_d.powf(1.0 - self.alpha))
+                .max(1e-5);
                 let idx = FLOOR1_INVERSE_DB.partition_point(|&t| t < target);
                 let idx = if idx > 0
                     && idx < 256
