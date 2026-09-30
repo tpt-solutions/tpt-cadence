@@ -31,32 +31,85 @@ pub fn restore_fixed(block: &mut [i32], order: usize) {
     }
 }
 
-/// Computes a bounded first-order LPC predictor from integer samples.
-///
-/// FLAC's general LPC syntax is fully supported by the decoder; this encoder
-/// intentionally starts with a stable first-order coefficient derived from
-/// normalized autocorrelation. The returned coefficient is already quantized
-/// for the requested shift and is suitable for direct bitstream emission.
-pub fn analyze_lpc(samples: &[i32], order: usize, shift: u32) -> Vec<i64> {
-    if order == 0 || samples.len() <= order {
-        return vec![0; order];
+/// Highest LPC order the encoder searches (RFC 9639 allows up to 32; 12 is
+/// the reference encoder's `-8` setting and the usual sweet spot).
+pub const MAX_ENCODE_ORDER: usize = 12;
+
+/// Autocorrelation of `x` for lags `0..out.len()`.
+pub fn autocorrelation(x: &[f64], out: &mut [f64]) {
+    for (lag, slot) in out.iter_mut().enumerate() {
+        *slot = if lag < x.len() {
+            x[lag..].iter().zip(x).map(|(a, b)| a * b).sum()
+        } else {
+            0.0
+        };
     }
-    debug_assert_eq!(
-        order, 1,
-        "the FLAC encoder currently searches first-order LPC only"
-    );
-    let mut energy = 0i128;
-    let mut correlation = 0i128;
-    for i in 1..samples.len() {
-        energy += samples[i] as i128 * samples[i] as i128;
-        correlation += samples[i] as i128 * samples[i - 1] as i128;
+}
+
+/// Levinson-Durbin recursion. Given autocorrelation `autoc[0..=max_order]`,
+/// returns the predictor coefficients for every order `1..=max_order`
+/// (`result[o - 1]` holds the `o` coefficients of the order-`o` predictor,
+/// nearest sample first, in the `x[i] ~ sum(c[j] * x[i-1-j])` convention).
+/// Recursion stops early if the prediction error collapses, so the result
+/// may hold fewer than `max_order` entries.
+pub fn levinson_durbin(autoc: &[f64], max_order: usize) -> Vec<Vec<f64>> {
+    let mut out: Vec<Vec<f64>> = Vec::with_capacity(max_order);
+    if autoc.is_empty() || autoc[0] <= 0.0 {
+        return out;
     }
-    if energy == 0 {
-        return vec![0];
+    let mut err = autoc[0];
+    let mut a: Vec<f64> = Vec::with_capacity(max_order);
+    for m in 0..max_order.min(autoc.len() - 1) {
+        let mut acc = autoc[m + 1];
+        for (j, &aj) in a.iter().enumerate() {
+            acc -= aj * autoc[m - j];
+        }
+        let k = acc / err;
+        let prev = a.clone();
+        for (j, aj) in a.iter_mut().enumerate() {
+            *aj -= k * prev[m - 1 - j];
+        }
+        a.push(k);
+        err *= 1.0 - k * k;
+        out.push(a.clone());
+        if err <= autoc[0] * 1e-12 {
+            break;
+        }
     }
-    let scale = 1i128 << shift;
-    let coefficient = ((correlation * scale) / energy).clamp(-(1i128 << 14), (1i128 << 14) - 1);
-    vec![coefficient as i64]
+    out
+}
+
+/// Quantizes real-valued predictor `coefs` to `precision`-bit signed
+/// integers with a right-shift in `0..=15` (the range FLAC allows), using
+/// running error feedback so rounding errors don't accumulate. Returns
+/// `None` when the coefficients can't be represented (all zero, non-finite,
+/// or a required shift below zero).
+pub fn quantize_coefficients(coefs: &[f64], precision: u32) -> Option<(Vec<i64>, u32)> {
+    let cmax = coefs.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+    if !cmax.is_finite() || cmax <= 0.0 {
+        return None;
+    }
+    // frexp exponent: cmax = m * 2^e with m in [0.5, 1).
+    let e = cmax.log2().floor() as i32 + 1;
+    let shift = precision as i32 - e - 1;
+    if shift < 0 {
+        return None;
+    }
+    let shift = shift.min(15) as u32;
+    let qmax = (1i64 << (precision - 1)) - 1;
+    let qmin = -(1i64 << (precision - 1));
+    let scale = (1u64 << shift) as f64;
+    let mut error = 0.0f64;
+    let q = coefs
+        .iter()
+        .map(|&c| {
+            let v = c * scale + error;
+            let r = (v.round() as i64).clamp(qmin, qmax);
+            error = v - r as f64;
+            r
+        })
+        .collect();
+    Some((q, shift))
 }
 
 /// Applies the general LPC predictor with the given quantized coefficients
@@ -111,12 +164,36 @@ mod tests {
     }
 
     #[test]
-    fn analyze_first_order_lpc_tracks_correlation() {
-        let samples = vec![10, 20, 40, 80, 160, 320];
-        let coefficients = analyze_lpc(&samples, 1, 12);
-        assert_eq!(coefficients.len(), 1);
-        assert!(coefficients[0] > 0);
-        assert!(coefficients[0] < (1i64 << 14));
+    fn levinson_recovers_ar2_process() {
+        // x[n] = 1.5 x[n-1] - 0.7 x[n-2] + tiny drive: order-2 coefficients
+        // must come back close to (1.5, -0.7) and the residual must shrink.
+        let mut x = vec![1.0f64, 0.5];
+        let mut seed = 12345u32;
+        for i in 2..4000 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((seed >> 16) as f64 / 65536.0 - 0.5) * 1.0;
+            let v = 1.5 * x[i - 1] - 0.7 * x[i - 2] + noise;
+            x.push(v);
+        }
+        let mut ac = [0.0; 5];
+        autocorrelation(&x, &mut ac);
+        let orders = levinson_durbin(&ac, 4);
+        assert_eq!(orders.len(), 4);
+        assert!((orders[1][0] - 1.5).abs() < 0.05, "{:?}", orders[1]);
+        assert!((orders[1][1] + 0.7).abs() < 0.05, "{:?}", orders[1]);
+    }
+
+    #[test]
+    fn quantize_keeps_precision_and_shift_in_range() {
+        let (q, shift) = quantize_coefficients(&[1.5, -0.7, 0.2], 12).unwrap();
+        assert!(shift <= 15);
+        let recon: Vec<f64> = q
+            .iter()
+            .map(|&v| v as f64 / (1u64 << shift) as f64)
+            .collect();
+        assert!((recon[0] - 1.5).abs() < 1e-2 && (recon[1] + 0.7).abs() < 1e-2);
+        assert!(q.iter().all(|&v| v.abs() < (1 << 11)));
+        assert!(quantize_coefficients(&[0.0, 0.0], 12).is_none());
     }
 
     #[test]

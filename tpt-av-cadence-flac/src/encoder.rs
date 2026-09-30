@@ -1,37 +1,39 @@
 //! FLAC stream encoder (RFC 9639).
 //!
-//! Scope of this first cut (see `todo.md` for the full rationale):
+//! Scope (see `todo.md` for the history):
 //!
 //! - Fixed blocksize only (a single common block size for every full frame;
 //!   the final frame of a stream may be shorter). No block-switching.
-//! - Subframe types: CONSTANT, VERBATIM, FIXED (predictor orders 0-4), and
-//!   bounded first-order LPC selected by an autocorrelation estimate.
+//! - Subframe types: CONSTANT, VERBATIM, FIXED (predictor orders 0-4) and
+//!   general LPC. LPC analysis windows the block (Tukey 0.5), runs
+//!   Levinson-Durbin once and prices orders {1-6, 8, 10-12} by their real
+//!   coded size (quantized coefficients with error feedback, block-length
+//!   dependent precision); the cheapest of all candidates wins.
+//! - Wasted bits (trailing zero bits common to a block) are detected and
+//!   shifted out.
 //! - Partitioned Rice residual coding, always using the Rice2 (5-bit
 //!   parameter) coding method for simplicity, with a partition-order search
 //!   (capped) and a per-partition optimal-parameter search, including the
 //!   escaped/raw-partition fallback for low-entropy partitions (e.g. an
 //!   all-zero partition costs 0 bits per sample via `raw_bits = 0`).
-//! - Channel assignment is always INDEPENDENT (no left/side, right/side, or
-//!   mid/side stereo decorrelation). This is spec-valid but leaves stereo
-//!   compression on the table; a future session could add mid/side search.
+//! - Stereo frames try all four channel assignments (independent,
+//!   left/side, side/right, mid/side) and keep the smallest.
 //! - Sample rate and bit depth are always signalled via the STREAMINFO
 //!   block (frame header codes 0), matching every frame to the stream's
 //!   fixed format.
-//! - The STREAMINFO MD5 field is left all-zero (the documented "not
-//!   computed" convention many encoders use) rather than duplicating an MD5
-//!   implementation into this crate; nothing in this crate's own decoder
-//!   validates it, and it does not affect bitstream correctness.
+//! - STREAMINFO carries the real MD5 of the unencoded samples and the
+//!   min/max frame sizes, patched in when the stream is finished.
 //!
-//! Despite the reduced feature set, the output is fully spec-compliant FLAC:
-//! every frame carries correct header/footer CRCs, and this crate's own
-//! `FlacDecoder` (or any conformant decoder) reconstructs the input
-//! bit-exactly.
+//! The output is fully spec-compliant FLAC: every frame carries correct
+//! header/footer CRCs, and this crate's own `FlacDecoder` (or any conformant
+//! decoder) reconstructs the input bit-exactly.
 
 use std::io::{Seek, SeekFrom, Write};
 
 use tpt_av_cadence_core::{f32_to_int, CadenceError, Encoder, Result};
 
 use crate::lpc;
+use crate::md5::Md5;
 use crate::stream::{crc16, crc8};
 
 /// Fixed block size used for every full frame (the last frame of a stream
@@ -79,6 +81,18 @@ impl BitWriter {
         }
         let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         self.push((value as u64) & mask, n);
+    }
+
+    /// Appends every bit written to `other`.
+    fn append(&mut self, other: &BitWriter) {
+        let full = (other.bit_pos / 8) as usize;
+        for &b in &other.bytes[..full] {
+            self.push(b as u64, 8);
+        }
+        let rem = other.bit_pos % 8;
+        if rem > 0 {
+            self.push((other.bytes[full] >> (8 - rem)) as u64, rem);
+        }
     }
 
     /// Pads with zero bits up to the next byte boundary.
@@ -146,7 +160,13 @@ fn zigzag(v: i32) -> u32 {
 fn best_rice_param(vals: &[u32]) -> (u32, u64) {
     let mut best_k = 0u32;
     let mut best_cost = u64::MAX;
-    for k in 0..=30u32 {
+    // The optimal parameter sits within one or two steps of log2(mean).
+    let sum: u64 = vals.iter().map(|&v| v as u64).sum();
+    let mean = sum / vals.len().max(1) as u64;
+    let k_guess = (64 - mean.leading_zeros()).saturating_sub(1).min(30);
+    let k_lo = k_guess.saturating_sub(2);
+    let k_hi = (k_guess + 1).min(30);
+    for k in k_lo..=k_hi {
         let mut cost = vals.len() as u64 * (k as u64 + 1);
         if cost >= best_cost {
             continue;
@@ -336,89 +356,211 @@ fn compute_fixed_residual(samples: &[i32], order: usize, out: &mut Vec<i32>) {
     }
 }
 
-/// Computes the residual for a quantized first-order LPC predictor.
-fn compute_lpc_residual(samples: &[i32], coefficient: i64, shift: u32, out: &mut Vec<i32>) {
+/// Computes the residual for quantized LPC `coefs` (order = `coefs.len()`).
+/// `out[..order]` holds the untouched warm-up samples. Returns `false` if
+/// any residual would not fit in 32 bits (the candidate is then unusable).
+fn compute_lpc_residual(samples: &[i32], coefs: &[i64], shift: u32, out: &mut Vec<i32>) -> bool {
     out.clear();
     out.extend_from_slice(samples);
-    for i in 1..samples.len() {
-        let prediction = (coefficient.wrapping_mul(samples[i - 1] as i64) >> shift) as i32;
-        out[i] = samples[i].wrapping_sub(prediction);
+    let order = coefs.len();
+    for i in order..samples.len() {
+        let mut acc: i64 = 0;
+        for (j, &c) in coefs.iter().enumerate() {
+            acc += c * samples[i - 1 - j] as i64;
+        }
+        let r = samples[i] as i64 - (acc >> shift);
+        if r < i32::MIN as i64 || r > i32::MAX as i64 {
+            return false;
+        }
+        out[i] = r as i32;
+    }
+    true
+}
+
+/// Tukey(0.5) window, the reference encoder's default analysis window.
+fn tukey_window(n: usize) -> Vec<f64> {
+    let np = ((n / 4).max(1)) as f64;
+    (0..n)
+        .map(|i| {
+            let i = i as f64;
+            let edge = if i < np {
+                i
+            } else if i >= n as f64 - np {
+                n as f64 - 1.0 - i
+            } else {
+                return 1.0;
+            };
+            0.5 - 0.5 * (std::f64::consts::PI * edge / np).cos()
+        })
+        .collect()
+}
+
+/// LPC orders tried per subframe (derived from one Levinson-Durbin pass).
+const LPC_ORDERS: [usize; 10] = [1, 2, 3, 4, 5, 6, 8, 10, 11, 12];
+
+/// LPC coefficient precision in bits, scaled with the block length the way
+/// the reference encoder does.
+fn lpc_precision(block_len: usize) -> u32 {
+    match block_len {
+        0..=192 => 9,
+        193..=384 => 10,
+        385..=576 => 11,
+        577..=1152 => 12,
+        1153..=2304 => 13,
+        _ => 14,
     }
 }
 
-/// Encodes one subframe (one channel's worth of one block).
-fn encode_subframe(bw: &mut BitWriter, samples: &[i32], bps: u16, scratch: &mut Vec<i32>) {
+/// The cheapest coding found for one subframe's (wasted-bit-shifted) samples.
+struct Candidate {
+    cost: u64,
+    order: usize,
+    /// `Some((coefs, shift, precision))` for LPC, `None` for FIXED.
+    lpc: Option<(Vec<i64>, u32, u32)>,
+    residual: Vec<i32>,
+    po: u32,
+    plans: Vec<PartitionPlan>,
+}
+
+/// Writes the wasted-bits flag (and unary count, RFC 9639 §9.2.2).
+fn write_wasted(bw: &mut BitWriter, wasted: u32) {
+    if wasted == 0 {
+        bw.push(0, 1);
+    } else {
+        bw.push(1, 1);
+        bw.push(1, wasted); // wasted-1 zeros, then a one
+    }
+}
+
+/// Encodes one subframe (one channel's worth of one block, at bit depth
+/// `bps`, which is one more than the stream depth for a side channel) into
+/// its own bit buffer so callers can compare candidate sizes.
+fn encode_subframe(samples: &[i32], bps: u32) -> BitWriter {
+    let mut bw = BitWriter::new();
     bw.push(0, 1); // padding
+
+    let ored = samples.iter().fold(0u32, |a, &s| a | s as u32);
+    let wasted = if ored == 0 {
+        0
+    } else {
+        ored.trailing_zeros().min(bps - 1)
+    };
+    let shifted: Vec<i32>;
+    let samples = if wasted > 0 {
+        shifted = samples.iter().map(|&s| s >> wasted).collect();
+        &shifted[..]
+    } else {
+        samples
+    };
+    let bps = bps - wasted;
 
     if samples.iter().all(|&v| v == samples[0]) {
         bw.push(0b000000, 6); // CONSTANT
-        bw.push(0, 1); // no wasted bits
-        bw.push_signed(samples[0] as i64, bps as u32);
-        return;
+        write_wasted(&mut bw, wasted);
+        bw.push_signed(samples[0] as i64, bps);
+        return bw;
     }
 
-    let max_order = 4usize.min(samples.len());
-    let mut best_order = 0usize;
-    let mut best_sum = u64::MAX;
-    let mut best_residual: Vec<i32> = Vec::new();
-    for order in 0..=max_order {
-        compute_fixed_residual(samples, order, scratch);
-        let sum_abs: u64 = scratch[order..]
+    let n = samples.len();
+    let verbatim_cost = n as u64 * bps as u64;
+    let mut best: Option<Candidate> = None;
+    let mut scratch: Vec<i32> = Vec::with_capacity(n);
+
+    // FIXED predictors, orders 0..=4.
+    for order in 0..=4usize.min(n) {
+        compute_fixed_residual(samples, order, &mut scratch);
+        let (po, plans, rc) = plan_residual(&scratch[order..], n, order);
+        let cost = order as u64 * bps as u64 + 2 + rc;
+        if best.as_ref().map_or(true, |b| cost < b.cost) {
+            best = Some(Candidate {
+                cost,
+                order,
+                lpc: None,
+                residual: scratch.clone(),
+                po,
+                plans,
+            });
+        }
+    }
+
+    // General LPC: one windowed Levinson-Durbin pass, then each candidate
+    // order is quantized and priced by its real residual coding cost.
+    let max_order = lpc::MAX_ENCODE_ORDER.min(n / 2);
+    if max_order >= 1 && n >= 16 {
+        let window = tukey_window(n);
+        let windowed: Vec<f64> = samples
             .iter()
-            .map(|&r| r.unsigned_abs() as u64)
-            .sum();
-        if sum_abs < best_sum {
-            best_sum = sum_abs;
-            best_order = order;
-            best_residual.clear();
-            best_residual.extend_from_slice(scratch);
+            .zip(&window)
+            .map(|(&s, &w)| s as f64 * w)
+            .collect();
+        let mut autoc = vec![0.0f64; max_order + 1];
+        lpc::autocorrelation(&windowed, &mut autoc);
+        let per_order = lpc::levinson_durbin(&autoc, max_order);
+        let precision = lpc_precision(n).min(bps + 5);
+        for &order in LPC_ORDERS.iter().filter(|&&o| o <= per_order.len()) {
+            let Some((coefs, shift)) = lpc::quantize_coefficients(&per_order[order - 1], precision)
+            else {
+                continue;
+            };
+            if !compute_lpc_residual(samples, &coefs, shift, &mut scratch) {
+                continue;
+            }
+            let (po, plans, rc) = plan_residual(&scratch[order..], n, order);
+            let cost = order as u64 * (bps as u64 + precision as u64) + 4 + 5 + 2 + rc;
+            if best.as_ref().map_or(true, |b| cost < b.cost) {
+                best = Some(Candidate {
+                    cost,
+                    order,
+                    lpc: Some((coefs, shift, precision)),
+                    residual: scratch.clone(),
+                    po,
+                    plans,
+                });
+            }
         }
     }
 
-    let (po, plans, residual_cost) =
-        plan_residual(&best_residual[best_order..], samples.len(), best_order);
-    let fixed_cost = best_order as u64 * bps as u64 + 2 /* method */ + residual_cost;
-    let verbatim_cost = samples.len() as u64 * bps as u64;
-
-    const LPC_SHIFT: u32 = 12;
-    const LPC_PRECISION: u32 = 15;
-    let lpc_coefficients = lpc::analyze_lpc(samples, 1, LPC_SHIFT);
-    let lpc_coefficient = lpc_coefficients[0];
-    compute_lpc_residual(samples, lpc_coefficient, LPC_SHIFT, scratch);
-    let lpc_residual: Vec<i32> = scratch[1..].to_vec();
-    debug_assert_eq!(lpc_residual.len() + 1, samples.len());
-    let (lpc_po, lpc_plans, lpc_residual_cost) = plan_residual(&lpc_residual, samples.len(), 1);
-    let lpc_cost = bps as u64 + 4 + 5 + LPC_PRECISION as u64 + 2 + lpc_residual_cost;
-
-    if lpc_cost < fixed_cost && lpc_cost < verbatim_cost {
-        bw.push(0b100000, 6); // LPC, order 1
-        bw.push(0, 1); // no wasted bits
-        bw.push_signed(samples[0] as i64, bps as u32);
-        bw.push((LPC_PRECISION - 1) as u64, 4);
-        bw.push_signed(LPC_SHIFT as i64, 5);
-        bw.push_signed(lpc_coefficient, LPC_PRECISION);
-        write_residual(bw, &lpc_residual, samples.len(), 1, lpc_po, &lpc_plans);
-    } else if fixed_cost <= verbatim_cost {
-        bw.push(0b001000 | best_order as u64, 6); // FIXED, order in low 3 bits
-        bw.push(0, 1); // no wasted bits
-        for &w in &samples[..best_order] {
-            bw.push_signed(w as i64, bps as u32);
-        }
-        write_residual(
-            bw,
-            &best_residual[best_order..],
-            samples.len(),
-            best_order,
-            po,
-            &plans,
-        );
-    } else {
+    let best = best.expect("fixed order 0 is always a candidate");
+    if best.cost >= verbatim_cost {
         bw.push(0b000001, 6); // VERBATIM
-        bw.push(0, 1);
+        write_wasted(&mut bw, wasted);
         for &s in samples {
-            bw.push_signed(s as i64, bps as u32);
+            bw.push_signed(s as i64, bps);
+        }
+        return bw;
+    }
+
+    let order = best.order;
+    match &best.lpc {
+        Some((coefs, shift, precision)) => {
+            bw.push(0b100000 | (order as u64 - 1), 6); // LPC, order-1 in low 5 bits
+            write_wasted(&mut bw, wasted);
+            for &w in &samples[..order] {
+                bw.push_signed(w as i64, bps);
+            }
+            bw.push((*precision - 1) as u64, 4);
+            bw.push_signed(*shift as i64, 5);
+            for &c in coefs {
+                bw.push_signed(c, *precision);
+            }
+        }
+        None => {
+            bw.push(0b001000 | order as u64, 6); // FIXED, order in low 3 bits
+            write_wasted(&mut bw, wasted);
+            for &w in &samples[..order] {
+                bw.push_signed(w as i64, bps);
+            }
         }
     }
+    write_residual(
+        &mut bw,
+        &best.residual[order..],
+        n,
+        order,
+        best.po,
+        &best.plans,
+    );
+    bw
 }
 
 // ---------------------------------------------------------------------------
@@ -450,9 +592,9 @@ pub struct FlacEncoder<W: Write + Seek> {
     max_block_used: usize,
     finished: bool,
 
-    // Scratch reused across subframes to avoid per-block allocation for the
-    // (order search x residual) intermediate.
-    residual_scratch: Vec<i32>,
+    md5: Md5,
+    min_frame_bytes: usize,
+    max_frame_bytes: usize,
 }
 
 impl<W: Write + Seek> FlacEncoder<W> {
@@ -493,12 +635,49 @@ impl<W: Write + Seek> FlacEncoder<W> {
             min_block_used: usize::MAX,
             max_block_used: 0,
             finished: false,
-            residual_scratch: Vec::with_capacity(BLOCK_SIZE),
+            md5: Md5::new(),
+            min_frame_bytes: usize::MAX,
+            max_frame_bytes: 0,
         })
     }
 
     fn emit_frame(&mut self, count: usize) -> Result<()> {
         let mut bw = BitWriter::new();
+
+        // --- Subframes (encoded first so stereo decorrelation can pick the
+        // cheapest channel assignment before the header is written) ---
+        let bps = self.bits_per_sample as u32;
+        let mut body = BitWriter::new();
+        let assignment_code: u64;
+        if self.channels == 2 && bps < 32 {
+            let (l, r) = (&self.channel_buf[0][..count], &self.channel_buf[1][..count]);
+            let mid: Vec<i32> = l
+                .iter()
+                .zip(r)
+                .map(|(&a, &b)| ((a as i64 + b as i64) >> 1) as i32)
+                .collect();
+            let side: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| a.wrapping_sub(b)).collect();
+            let el = encode_subframe(l, bps);
+            let er = encode_subframe(r, bps);
+            let em = encode_subframe(&mid, bps);
+            let es = encode_subframe(&side, bps + 1);
+            let options = [
+                (el.bit_pos + er.bit_pos, 1u64, [&el, &er]), // independent
+                (el.bit_pos + es.bit_pos, 8, [&el, &es]),    // left/side
+                (es.bit_pos + er.bit_pos, 9, [&es, &er]),    // side/right
+                (em.bit_pos + es.bit_pos, 10, [&em, &es]),   // mid/side
+            ];
+            let (_, code, parts) = options.iter().min_by_key(|o| o.0).unwrap();
+            assignment_code = *code;
+            for p in parts {
+                body.append(p);
+            }
+        } else {
+            assignment_code = (self.channels - 1) as u64;
+            for c in 0..self.channels as usize {
+                body.append(&encode_subframe(&self.channel_buf[c][..count], bps));
+            }
+        }
 
         // --- Frame header ---
         bw.push(0b11111111111110, 14); // sync
@@ -506,7 +685,7 @@ impl<W: Write + Seek> FlacEncoder<W> {
         bw.push(0, 1); // fixed blocksize (frame number coding)
         bw.push(7, 4); // block-size code: explicit 16-bit (count - 1)
         bw.push(0, 4); // sample-rate code: use STREAMINFO
-        bw.push((self.channels - 1) as u64, 4); // independent channels
+        bw.push(assignment_code, 4);
         bw.push(0, 3); // sample-size code: use STREAMINFO
         bw.push(0, 1); // reserved
         bw.push_utf8(self.frame_number);
@@ -518,15 +697,7 @@ impl<W: Write + Seek> FlacEncoder<W> {
         bw.bit_pos = bw.bytes.len() as u32 * 8;
 
         // --- Subframes ---
-        for c in 0..self.channels as usize {
-            let samples = &self.channel_buf[c][..count];
-            encode_subframe(
-                &mut bw,
-                samples,
-                self.bits_per_sample,
-                &mut self.residual_scratch,
-            );
-        }
+        bw.append(&body);
         bw.align();
 
         // --- Frame footer ---
@@ -534,6 +705,19 @@ impl<W: Write + Seek> FlacEncoder<W> {
         bw.bytes.extend_from_slice(&crc.to_be_bytes());
 
         self.sink.write_all(&bw.bytes)?;
+
+        // Feed the STREAMINFO signature: unencoded samples, interleaved,
+        // little-endian, ceil(bps/8) bytes each.
+        let width = (self.bits_per_sample as usize).div_ceil(8);
+        let mut raw = Vec::with_capacity(count * self.channels as usize * width);
+        for i in 0..count {
+            for c in 0..self.channels as usize {
+                raw.extend_from_slice(&self.channel_buf[c][i].to_le_bytes()[..width]);
+            }
+        }
+        self.md5.update(&raw);
+        self.min_frame_bytes = self.min_frame_bytes.min(bw.bytes.len());
+        self.max_frame_bytes = self.max_frame_bytes.max(bw.bytes.len());
 
         self.frame_number += 1;
         self.total_samples += count as u64;
@@ -572,6 +756,12 @@ impl<W: Write + Seek> FlacEncoder<W> {
         self.sink.seek(SeekFrom::Start(8))?;
         self.sink.write_all(&min_block.to_be_bytes())?;
         self.sink.write_all(&max_block.to_be_bytes())?;
+        if self.frame_number > 0 {
+            let min_f = (self.min_frame_bytes as u32).min(0xFF_FFFF).to_be_bytes();
+            let max_f = (self.max_frame_bytes as u32).min(0xFF_FFFF).to_be_bytes();
+            self.sink.write_all(&min_f[1..])?;
+            self.sink.write_all(&max_f[1..])?;
+        }
 
         self.sink.seek(SeekFrom::Start(18))?;
         let packed = pack_streaminfo_tail(
@@ -581,6 +771,8 @@ impl<W: Write + Seek> FlacEncoder<W> {
             self.total_samples,
         );
         self.sink.write_all(&packed.to_be_bytes())?;
+        let digest = std::mem::take(&mut self.md5).finalize();
+        self.sink.write_all(&digest)?;
 
         self.sink.seek(SeekFrom::End(0))?;
         self.sink.flush()?;
@@ -935,5 +1127,119 @@ mod tests {
         let expect = quantize_plain(44_100, &frames, 16);
         let (got, _) = round_trip(44_100, 1, 16, &frames);
         assert_eq!(got, expect);
+    }
+
+    fn encode_to_bytes(channels: u16, bps: u16, frames: &[f32]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = FlacEncoder::new(&mut buf, 44_100, channels, bps).unwrap();
+            enc.encode(frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// Correlated stereo music-like signal: shared harmonic content plus a
+    /// small independent component per channel.
+    fn correlated_stereo(n: usize) -> Vec<f32> {
+        let mut seed = 99u32;
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f32 / 44_100.0;
+            let base = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.3
+                + (2.0 * std::f32::consts::PI * 660.0 * t).sin() * 0.1;
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n1 = ((seed >> 16) as f32 / 65536.0 - 0.5) * 0.002;
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n2 = ((seed >> 16) as f32 / 65536.0 - 0.5) * 0.002;
+            out.push(base + n1);
+            out.push(base * 0.9 + n2);
+        }
+        out
+    }
+
+    #[test]
+    fn streaminfo_md5_matches_decoded_samples() {
+        let frames = correlated_stereo(10_000);
+        let bytes = encode_to_bytes(2, 16, &frames);
+        let quantized = quantize_plain(44_100, &frames, 16);
+        let mut raw = Vec::new();
+        for &s in &quantized {
+            raw.extend_from_slice(&((s * 32768.0) as i16).to_le_bytes());
+        }
+        assert_eq!(&bytes[26..42], &Md5::digest(&raw)[..]);
+    }
+
+    #[test]
+    fn correlated_stereo_round_trips_and_uses_decorrelation() {
+        let frames = correlated_stereo(20_000);
+        let expect = quantize_plain(44_100, &frames, 16);
+        let (got, _) = round_trip(44_100, 2, 16, &frames);
+        assert_eq!(got, expect);
+        // First frame header: byte 3 of the frame's channel field is the
+        // high nibble of the byte after the sample-rate code; just require
+        // some non-independent assignment appears in the stream.
+        let bytes = encode_to_bytes(2, 16, &frames);
+        let frame_start = 8 + 34;
+        let assignment = (bytes[frame_start + 3] >> 4) & 0xF;
+        assert!((8..=10).contains(&assignment), "assignment {assignment}");
+    }
+
+    #[test]
+    fn opposite_full_scale_side_channel_round_trips() {
+        // L = +max, R = -max makes side = 2*max: needs the 17-bit side path.
+        let mut frames = Vec::new();
+        for i in 0..5000 {
+            let v = if i % 7 < 3 { 1.0 } else { -1.0 };
+            frames.push(v);
+            frames.push(-v);
+        }
+        let expect = quantize_plain(44_100, &frames, 16);
+        let (got, _) = round_trip(44_100, 2, 16, &frames);
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn wasted_bits_round_trip_and_shrink_output() {
+        // Every sample a multiple of 256 (8 wasted bits at 16-bit depth).
+        let mut frames = Vec::new();
+        for i in 0..8192 {
+            let v = (((i * 37) % 200) - 100) * 256;
+            frames.push(v as f32 / 32768.0);
+        }
+        let expect = quantize_plain(44_100, &frames, 16);
+        let (got, _) = round_trip(44_100, 1, 16, &frames);
+        assert_eq!(got, expect);
+        let bytes = encode_to_bytes(1, 16, &frames);
+        assert!(bytes.len() < 8192, "len {}", bytes.len());
+    }
+
+    #[test]
+    fn lpc_beats_fixed_predictors_on_resonant_signal() {
+        // A narrowband resonance is what LPC captures and the fixed
+        // order-4 predictors cannot: expect near the noise entropy.
+        let n = 16_384;
+        let mut x = vec![0.0f64; n];
+        let mut seed = 7u32;
+        for i in 2..n {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let e = ((seed >> 16) as f64 / 65536.0 - 0.5) * 300.0;
+            x[i] = 1.9 * x[i - 1] - 0.95 * x[i - 2] + e;
+        }
+        let peak = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let frames: Vec<f32> = x.iter().map(|v| (v / peak * 0.5) as f32).collect();
+        let expect = quantize_plain(44_100, &frames, 16);
+        let (got, _) = round_trip(44_100, 1, 16, &frames);
+        assert_eq!(got, expect);
+        let bytes = encode_to_bytes(1, 16, &frames);
+        // The driving noise is uniform in +-amp (after scaling); an ideal
+        // predictor reaches its entropy log2(2*amp) bits/sample.
+        let amp = 150.0 * 16384.0 / peak;
+        let bits_per_sample = bytes.len() as f64 * 8.0 / n as f64;
+        assert!(
+            bits_per_sample < (2.0 * amp).log2() + 0.7,
+            "got {bits_per_sample:.2} bits/sample, ideal {:.2}",
+            (2.0 * amp).log2()
+        );
     }
 }

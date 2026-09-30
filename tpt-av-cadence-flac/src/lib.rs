@@ -35,6 +35,7 @@
 pub mod decoder;
 pub mod encoder;
 pub mod lpc;
+mod md5;
 pub mod rice;
 pub mod stream;
 pub mod subframe;
