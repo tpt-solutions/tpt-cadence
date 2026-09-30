@@ -2,7 +2,6 @@
 //! requantized (but still scalefactor-band ordered) granule data.
 
 use crate::header::FrameHeader;
-use crate::scalefac::ldexp_q2;
 use crate::sideinfo::GranuleInfo;
 use crate::tables::PAN;
 
@@ -55,7 +54,7 @@ fn stereo_process(
     max_band: &[i32; 3],
     mpeg2_sh: u32,
 ) {
-    let max_pos = if hdr.mpeg1 { 7 } else { 64 };
+    let max_pos = if hdr.mpeg1 { 7 } else { 16 };
     let mut off = 0usize;
     for (i, &w) in sfb.iter().enumerate() {
         if w == 0 {
@@ -72,12 +71,18 @@ fn stereo_process(
             let (kl, kr) = if hdr.mpeg1 {
                 (PAN[2 * ipos as usize], PAN[2 * ipos as usize + 1])
             } else {
-                let mut kl = 1.0f32;
-                let mut kr = ldexp_q2(1.0, (((ipos + 1) >> 1) << mpeg2_sh) as i32);
+                // ISO/IEC 13818-3 LSF intensity ladder (FFmpeg's
+                // `is_table_lsf`): the position's parity picks which
+                // channel keeps unity gain, the other takes
+                // `2^(-(sh+1)·j/4)` with `j = (pos+1)>>1` — quarter-step
+                // ratio units, `sh` the transmitted scalefac_compress LSB.
+                let f =
+                    2.0f32.powf(-((mpeg2_sh as i32 + 1) * (((ipos + 1) >> 1) as i32)) as f32 / 4.0);
                 if ipos & 1 != 0 {
-                    std::mem::swap(&mut kl, &mut kr);
+                    (f, 1.0)
+                } else {
+                    (1.0, f)
                 }
-                (kl, kr)
             };
             intensity_band(&mut left[off..], w as usize, kl * s, kr * s);
         } else if hdr.ms_stereo {

@@ -1,6 +1,6 @@
 [package]
 name = "tpt-av-cadence-pcm"
-description = "Raw headerless PCM reader for the tpt-cadence audio codec suite."
+description = "Raw headerless PCM reader and writer for the tpt-cadence audio codec suite."
 readme = "README.md"
 keywords = ["audio", "pcm", "codec", "decoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]

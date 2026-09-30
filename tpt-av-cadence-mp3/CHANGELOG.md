@@ -15,6 +15,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `lsf_transient_short_blocks_agree_with_ffmpeg` (22.05/24/16/11.025 kHz,
   mono and stereo, 110-123 dB inter-decoder SNR).
 
+### Fixed
+
+- **Repeated-transient LSF (MPEG-2/2.5) short-block divergence.** On
+  material made of *repeated* click transients (~1 click per 1.5 granules) the
+  plain encode diverged from FFmpeg on our own bytes at 22-45 dB on alternating
+  click cycles, identically with and without intensity stereo. The fault was
+  in the window-sequence state machine's cross-frame lookahead, not in the
+  short-block analysis or quantization: `next_attack` compared the lookahead
+  PCM against the *previous* frame's stored back-half energy while the next
+  frame's own granule-0 detector compares against the *current* frame's back
+  half, and it measured a single channel strided by `channels` where that
+  detector measures a contiguous window spanning both. Either disagreement
+  silently dropped the zero-line stop granule that must precede a short run,
+  so the encoder emitted a bare `long -> short` transition whose overlap
+  handover decoders are free to interpret differently. Both measurements now
+  match the detector they predict, and all channels of a granule share one
+  verdict. New gate `lsf_repeated_transients_agree_with_ffmpeg` (22.05 kHz
+  stereo 64 kbps click train) asserts both the ISO window-sequence shape and a
+  worst-per-granule inter-decoder floor; it now holds at 104-122 dB on every
+  granule, against 22-45 dB before.
+
 - **Info/Xing metadata tags** (`new_cbr_with_info` / `new_vbr_with_xing`):
   a leading silent frame carries the LAME-style metadata — frames count,
   byte count, 100-entry seek TOC, and quality — written at open with

@@ -1063,6 +1063,204 @@ fn lsf_transient_short_blocks_agree_with_ffmpeg() {
     }
 }
 
+/// Regression gate for the repeated-transient LSF short-block defect
+/// (`todo.md`, 2026-09-30 second session): a *click train* — not a single
+/// click — made the plain LSF encode diverge from FFmpeg at 22-45 dB on every
+/// other click cycle from frame ~59 on, identically with and without
+/// intensity stereo.
+///
+/// Root cause was entirely in the window-sequence state machine's
+/// cross-frame lookahead, not in the short-block analysis or quantization:
+///
+/// 1. `next_attack` compared the lookahead PCM against the *previous* frame's
+///    stored back-half energy, but the next frame's own granule-0 detector
+///    compares against the *current* frame's back half. The lookahead could
+///    therefore disagree with the detector it was predicting.
+/// 2. It measured one channel strided by `channels`, while that detector
+///    measures a contiguous window spanning both channels — a second way for
+///    the two to disagree.
+///
+/// Either disagreement silently dropped the zero-line stop granule that must
+/// precede a short run, so the encoder emitted a bare `long -> short`
+/// transition, where the two decoders are free to interpret the overlap
+/// handover differently. The clicks are spaced 1.5 granules apart, so each
+/// cycle re-arms the lookahead and the defect repeated indefinitely.
+///
+/// The gate asserts both the per-granule floor (the defect was localized to
+/// single granules, so a whole-stream average would hide it) and the
+/// side-info shape: every content short granule must be preceded by a stop.
+#[test]
+fn lsf_repeated_transients_agree_with_ffmpeg() {
+    use tpt_av_cadence_core::Encoder;
+    use tpt_av_cadence_mp3::Mp3Encoder;
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    const SAMPLE_RATE: u32 = 22_050;
+    const CHANNELS: u16 = 2;
+    const KBPS: u32 = 64;
+    const CLICK_PERIOD: usize = 864;
+
+    struct Bits<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl Bits<'_> {
+        fn get(&mut self, n: u32) -> u32 {
+            let mut v = 0u32;
+            for _ in 0..n {
+                let byte = self.d[self.p / 8];
+                v = (v << 1) | u32::from((byte >> (7 - (self.p % 8))) & 1);
+                self.p += 1;
+            }
+            v
+        }
+    }
+
+    let sr = SAMPLE_RATE as usize;
+    let mut frames = vec![0.0f32; sr * CHANNELS as usize];
+    for i in 0..sr {
+        let s = if i % CLICK_PERIOD < 48 {
+            ((i % 7) as f32 - 3.0) * 0.3
+        } else {
+            0.0
+        };
+        for c in 0..CHANNELS as usize {
+            frames[i * CHANNELS as usize + c] = s;
+        }
+    }
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut enc = Mp3Encoder::new(&mut buf, SAMPLE_RATE, CHANNELS, KBPS).unwrap();
+        enc.encode(&frames).unwrap();
+        Encoder::finish(&mut enc).unwrap();
+    }
+    let data = buf.into_inner();
+
+    // Walk the side info: collect every granule's block type and assert the
+    // ISO window-sequence shape. A content short must be entered from a stop
+    // or another short, never straight from a long block.
+    let side_len = 17usize; // stereo
+    let mut off = 0usize;
+    let mut bts: Vec<u8> = Vec::new();
+    while off + 4 <= data.len() {
+        let b2 = data[off + 2];
+        let span = (72 * KBPS * 1000 / SAMPLE_RATE) as usize + ((b2 >> 1) & 1) as usize;
+        assert!(
+            off + 4 + side_len <= data.len(),
+            "frame at {off} runs past the stream"
+        );
+        let mut bits = Bits {
+            d: &data[off + 4..off + 4 + side_len],
+            p: 0,
+        };
+        bits.get(8); // main_data_begin
+        bits.get(2); // private bits
+        for _ in 0..CHANNELS {
+            bits.get(12 + 9 + 8 + 9); // part2_3, big_values, gain, scalefac_compress
+            if bits.get(1) == 1 {
+                let block = bits.get(2) as u8;
+                bits.get(1); // mixed_block_flag
+                bits.get(10); // table_select
+                bits.get(9); // subblock_gain
+                bits.get(2); // scalefac_scale, count1table_select
+                bts.push(block);
+            } else {
+                bits.get(15 + 4 + 3);
+                bits.get(2);
+                bts.push(0);
+            }
+        }
+        off += span;
+    }
+    assert_eq!(off, data.len(), "frame spans must tile the stream exactly");
+
+    let mut shorts = 0usize;
+    for (i, &bt) in bts.iter().enumerate() {
+        if bt == 2 {
+            shorts += 1;
+            let prev = if i == 0 { 3 } else { bts[i - 1] };
+            assert!(
+                prev == 2 || prev == 3,
+                "granule {i}: bare long -> short transition (prev block_type {prev})"
+            );
+        }
+    }
+    assert!(
+        shorts > 8,
+        "expected many short granules from a click train, got {shorts}"
+    );
+
+    run_repeated_transient_oracle(&data, shorts);
+}
+
+/// Decodes `data` with this crate and with FFmpeg and gates the *worst
+/// per-granule* inter-decoder SNR (the repeated-transient defect hit
+/// individual granules, so a whole-stream average would dilute it away).
+fn run_repeated_transient_oracle(data: &[u8], shorts: usize) {
+    use tpt_av_cadence_core::Decoder;
+    use tpt_av_cadence_mp3::Mp3Decoder;
+
+    const SAMPLE_RATE: u32 = 22_050;
+    const CHANNELS: u16 = 2;
+
+    let path = std::env::temp_dir().join(format!(
+        "cadence_mp3_lsf_repeated_transients_{}.mp3",
+        std::process::id()
+    ));
+    std::fs::write(&path, data).expect("write temp mp3");
+    let oracle = decode_with_ffmpeg(&path, SAMPLE_RATE, CHANNELS).expect("ffmpeg oracle decode");
+    let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+    let ch = dec.info().channels as usize;
+    let mut ours = Vec::new();
+    let mut out = vec![0.0f32; 4096 * ch];
+    loop {
+        match dec.decode(&mut out) {
+            Ok(0) => break,
+            Ok(g) => ours.extend_from_slice(&out[..g * ch]),
+            Err(e) => panic!("our decode errored: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(ours.len(), oracle.len(), "length mismatch vs ffmpeg");
+
+    let per_granule = 576 * ch;
+    let mut worst = f64::INFINITY;
+    let mut worst_g = 0usize;
+    for (g, chunk) in ours.chunks(per_granule).enumerate() {
+        let o = &oracle[g * per_granule..g * per_granule + chunk.len()];
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for (&a, &b) in chunk.iter().zip(o) {
+            let delta = f64::from(a) - f64::from(b);
+            error += delta * delta;
+            signal += f64::from(b) * f64::from(b);
+        }
+        if error <= 0.0 {
+            continue; // both decoders agree exactly (silence)
+        }
+        let snr = 10.0 * (signal / error).log10();
+        if snr < worst {
+            worst = snr;
+            worst_g = g;
+        }
+    }
+    eprintln!(
+        "lsf repeated transients: {shorts} short granules, worst per-granule \
+         SNR={worst:.2} dB at granule {worst_g}"
+    );
+    assert!(
+        worst > 100.0,
+        "worst per-granule SNR={worst:.2} dB at granule {worst_g} vs ffmpeg"
+    );
+}
+
 /// Intensity-stereo gate: a source panned exactly at position 4
 /// (`L/R = tan(60°)`) above 2 kHz is representable by intensity coding.
 /// The stream must engage intensity stereo, decode identically in FFmpeg
@@ -1190,6 +1388,374 @@ fn intensity_stereo_agrees_with_ffmpeg() {
                 "channel {c} level {a:.4} vs plain {b:.4} (low={independent_low})"
             );
         }
+    }
+}
+
+/// Intensity-stereo short-block gate: a dual-mono signal — a steady tone
+/// handing over to a click train every 1.5 granules — codes as long-block
+/// granules, short-block granules, zero-line short bridges, and frames
+/// mixing the families, with every granule's channels exactly in phase, so
+/// intensity must engage in every frame (per window on the interleaved
+/// (band, window) bands for the short granules). The stream must decode
+/// identically in FFmpeg and this crate (>100 dB) and reproduce the same
+/// per-channel levels as the ordinary encode of the same source.
+#[test]
+fn intensity_short_blocks_agree_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::{Mp3Decoder, Mp3Encoder};
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    struct Bits<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl Bits<'_> {
+        fn get(&mut self, n: u32) -> u32 {
+            let mut v = 0u32;
+            for _ in 0..n {
+                let byte = self.d[self.p / 8];
+                v = (v << 1) | u32::from((byte >> (7 - (self.p % 8))) & 1);
+                self.p += 1;
+            }
+            v
+        }
+    }
+
+    let sample_rate = 44_100u32;
+    let n = sample_rate as usize * 2;
+    let click_start = sample_rate as usize / 2;
+    let click_period = 1728usize; // 1.5 granules: attacks alternate granules
+    let mut frames = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f32 / sample_rate as f32;
+        let mut ch = 0.3 * (2.0 * PI * 1500.0 * t).sin() + 0.1 * (2.0 * PI * 440.0 * t).sin();
+        if i >= click_start {
+            let k = (i - click_start) % click_period;
+            if k < 64 {
+                let noise = ((i * 37 % 23) as f32 - 11.0) / 11.0;
+                ch = 0.5 * noise * (-(k as f32) / 16.0).exp();
+            } else {
+                ch = 0.0;
+            }
+        }
+        // Dual mono: both channels identical, so every granule's top bands
+        // are exactly in phase (rho = 1) and window switching runs in both
+        // channels at once (matched block families per granule).
+        frames.push(ch);
+        frames.push(ch);
+    }
+
+    let encode = |intensity: bool| {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = Mp3Encoder::new(&mut buf, sample_rate, 2, 128).unwrap();
+            enc.set_intensity_stereo(intensity);
+            enc.encode(&frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        buf.into_inner()
+    };
+    let base = encode(false);
+    let data = encode(true);
+
+    // Walk the frames: count intensity-signaled frames (mode_ext bit 1)
+    // and window-switched granules from the side info (MPEG-1 stereo:
+    // 32-byte side info, two granules x two channels).
+    let (mut off, mut is_frames, mut total, mut shorts, mut longs) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    while off + 4 + 32 <= data.len() {
+        is_frames += ((data[off + 3] >> 4) & 1) as usize;
+        let span = (1152 * 128 * 125 / sample_rate as usize) + ((data[off + 2] >> 1) & 1) as usize;
+        let mut bits = Bits {
+            d: &data[off + 4..off + 4 + 32],
+            p: 0,
+        };
+        bits.get(9); // main_data_begin
+        bits.get(3); // private bits
+        bits.get(8); // scfsi
+        for _ in 0..2 {
+            for _ in 0..2 {
+                bits.get(12 + 9 + 8 + 4); // part2_3, big_values, global_gain, scf_compress
+                if bits.get(1) == 1 {
+                    let bt = bits.get(2);
+                    assert_eq!(bits.get(1), 0, "only pure short blocks are emitted");
+                    if bt == 2 {
+                        shorts += 1;
+                    }
+                    bits.get(5 + 5 + 9);
+                } else {
+                    longs += 1;
+                    bits.get(15 + 4 + 3);
+                }
+                bits.get(3); // preflag, scalefac_scale, count1_table
+            }
+        }
+        off += span;
+        total += 1;
+    }
+    assert!(
+        longs > 0 && shorts > 0,
+        "material must mix long and short granules: {longs} long / {shorts} short"
+    );
+    eprintln!("intensity short-block: {is_frames}/{total} frames intensity-signaled, {shorts} short + {longs} long granules");
+
+    let path =
+        std::env::temp_dir().join(format!("cadence_mp3_is_short_{}.mp3", std::process::id()));
+    std::fs::write(&path, &data).expect("write temp mp3");
+    let oracle = decode_with_ffmpeg(&path, sample_rate, 2).expect("ffmpeg oracle decode");
+    let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+    let mut ours = Vec::new();
+    let mut out = vec![0.0f32; 4096 * 2];
+    loop {
+        match dec.decode(&mut out) {
+            Ok(0) => break,
+            Ok(g) => ours.extend_from_slice(&out[..g * 2]),
+            Err(e) => panic!("our decode errored: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+
+    // The plain encode of the dual-mono source decodes as mid/side; both
+    // streams need the same walk to strip decoder lead-in delay.
+    let base_path = std::env::temp_dir().join(format!(
+        "cadence_mp3_is_short_base_{}.mp3",
+        std::process::id()
+    ));
+    std::fs::write(&base_path, &base).expect("write temp mp3");
+    let mut base_dec =
+        Mp3Decoder::open(Box::new(std::fs::File::open(&base_path).unwrap())).unwrap();
+    let mut base = Vec::new();
+    loop {
+        match base_dec.decode(&mut out) {
+            Ok(0) => break,
+            Ok(g) => base.extend_from_slice(&out[..g * 2]),
+            Err(e) => panic!("base decode errored: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&base_path);
+
+    assert_eq!(ours.len(), oracle.len(), "length mismatch vs ffmpeg");
+    let (mut sig, mut err) = (0.0f64, 0.0f64);
+    for (&a, &b) in ours.iter().zip(&oracle) {
+        sig += f64::from(b).powi(2);
+        err += (f64::from(a) - f64::from(b)).powi(2);
+    }
+    let inter = 10.0 * (sig / err).log10();
+    let rms = |x: &[f32], c: usize| {
+        let v: Vec<f64> = x
+            .iter()
+            .skip(20_000 * 2 + c)
+            .step_by(2)
+            .take(40_000)
+            .map(|&s| f64::from(s).powi(2))
+            .collect();
+        (v.iter().sum::<f64>() / v.len() as f64).sqrt()
+    };
+    eprintln!(
+        "intensity short-block: inter-decoder {inter:.2} dB, rms L {:.4}/{:.4} R {:.4}/{:.4} (IS/plain)",
+        rms(&ours, 0),
+        rms(&base, 0),
+        rms(&ours, 1),
+        rms(&base, 1)
+    );
+    assert!(inter > 100.0, "inter-decoder SNR {inter:.2} dB vs ffmpeg");
+    for c in 0..2 {
+        let (a, b) = (rms(&ours, c), rms(&base, c));
+        assert!(
+            (a / b - 1.0).abs() < 0.1,
+            "channel {c} level {a:.4} vs plain {b:.4}"
+        );
+    }
+}
+
+/// LSF-family intensity-stereo gate: a source panned exactly 2:1 (L/R
+/// amplitude ratio 2, the ladder's position 4 at shift 1) with two
+/// isolated click transients codes as long-block granules, short-block
+/// granules, zero-line short bridges, and mixed-family frames whose top
+/// bands are exactly in phase, so intensity must engage in every frame —
+/// on the LSF families through the preselected power-of-two position
+/// partition (transmitted via the right channel's split
+/// `scalefac_compress`). The stream must decode identically in FFmpeg and
+/// this crate (>100 dB) and reproduce the same per-channel levels as the
+/// ordinary encode of the same source. (The clicks are isolated: repeated
+/// click trains trip an unrelated, pre-existing short-block encode defect
+/// tracked in `todo.md` that equally affects the plain encode.)
+#[test]
+fn lsf_intensity_stereo_agrees_with_ffmpeg() {
+    use std::f32::consts::PI;
+
+    use tpt_av_cadence_core::{Decoder, Encoder};
+    use tpt_av_cadence_mp3::{Mp3Decoder, Mp3Encoder};
+
+    if !ffmpeg_available() {
+        if std::env::var_os("CADENCE_REQUIRE_FFMPEG").is_some() {
+            panic!("FFmpeg is required but unavailable on PATH");
+        }
+        eprintln!("skipping: FFmpeg not on PATH");
+        return;
+    }
+
+    struct Bits<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl Bits<'_> {
+        fn get(&mut self, n: u32) -> u32 {
+            let mut v = 0u32;
+            for _ in 0..n {
+                let byte = self.d[self.p / 8];
+                v = (v << 1) | u32::from((byte >> (7 - (self.p % 8))) & 1);
+                self.p += 1;
+            }
+            v
+        }
+    }
+
+    let sample_rate = 22_050u32;
+    let kbps = 64u32;
+    let n = sample_rate as usize * 2;
+    let clicks = [sample_rate as usize / 2, sample_rate as usize * 7 / 10];
+    let mut frames = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f32 / sample_rate as f32;
+        let mut r = 0.25 * (2.0 * PI * 1500.0 * t).sin() + 0.1 * (2.0 * PI * 440.0 * t).sin();
+        for &c in &clicks {
+            if i >= c && i < c + 64 {
+                let k = i - c;
+                let noise = ((i * 37 % 23) as f32 - 11.0) / 11.0;
+                r = 0.45 * noise * (-(k as f32) / 16.0).exp();
+            }
+        }
+        // Exactly 2:1 panning: every band's L/R amplitude ratio is the
+        // ladder's exponent +1, so the top bands are exactly in phase and
+        // every position lands without error.
+        frames.push(2.0 * r);
+        frames.push(r);
+    }
+
+    let encode = |intensity: bool| {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut enc = Mp3Encoder::new(&mut buf, sample_rate, 2, kbps).unwrap();
+            enc.set_intensity_stereo(intensity);
+            enc.encode(&frames).unwrap();
+            Encoder::finish(&mut enc).unwrap();
+        }
+        buf.into_inner()
+    };
+    let base = encode(false);
+    let data = encode(true);
+
+    // Walk the frames: count intensity-signaled frames (mode_ext bit 0 on
+    // MPEG-2 joint stereo) and window-switched granules from the LSF side
+    // info (17 bytes for stereo, one granule, 9-bit scalefac_compress).
+    let (mut off, mut is_frames, mut total, mut shorts) = (0usize, 0usize, 0usize, 0usize);
+    while off + 4 + 17 <= data.len() {
+        is_frames += ((data[off + 3] >> 4) & 1) as usize;
+        let span = (576 * kbps * 125 / sample_rate) as usize + ((data[off + 2] >> 1) & 1) as usize;
+        let mut bits = Bits {
+            d: &data[off + 4..off + 4 + 17],
+            p: 0,
+        };
+        bits.get(8); // main_data_begin
+        bits.get(2); // private bits
+        for _ in 0..2 {
+            bits.get(12 + 9 + 8 + 9); // part2_3, big_values, global_gain, scf_compress
+            if bits.get(1) == 1 {
+                if bits.get(2) == 2 {
+                    shorts += 1;
+                }
+                assert_eq!(bits.get(1), 0, "only pure short blocks are emitted");
+                bits.get(5 + 5 + 9);
+            } else {
+                bits.get(15 + 4 + 3);
+            }
+            bits.get(2); // scalefac_scale, count1_table
+        }
+        off += span;
+        total += 1;
+    }
+    assert!(shorts > 0, "material must produce short granules");
+    assert_eq!(
+        is_frames, total,
+        "intensity must engage in every frame (panned dual content)"
+    );
+    eprintln!(
+        "lsf intensity: {is_frames}/{total} frames intensity-signaled, {shorts} short granules"
+    );
+
+    let path = std::env::temp_dir().join(format!("cadence_mp3_lsf_is_{}.mp3", std::process::id()));
+    std::fs::write(&path, &data).expect("write temp mp3");
+    let oracle = decode_with_ffmpeg(&path, sample_rate, 2).expect("ffmpeg oracle decode");
+    let mut dec = Mp3Decoder::open(Box::new(std::fs::File::open(&path).unwrap())).unwrap();
+    let mut ours = Vec::new();
+    let mut out = vec![0.0f32; 4096 * 2];
+    loop {
+        match dec.decode(&mut out) {
+            Ok(0) => break,
+            Ok(g) => ours.extend_from_slice(&out[..g * 2]),
+            Err(e) => panic!("our decode errored: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+
+    let base_path = std::env::temp_dir().join(format!(
+        "cadence_mp3_lsf_is_base_{}.mp3",
+        std::process::id()
+    ));
+    std::fs::write(&base_path, &base).expect("write temp mp3");
+    let mut base_dec =
+        Mp3Decoder::open(Box::new(std::fs::File::open(&base_path).unwrap())).unwrap();
+    let mut base = Vec::new();
+    loop {
+        match base_dec.decode(&mut out) {
+            Ok(0) => break,
+            Ok(g) => base.extend_from_slice(&out[..g * 2]),
+            Err(e) => panic!("base decode errored: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(&base_path);
+
+    assert_eq!(ours.len(), oracle.len(), "length mismatch vs ffmpeg");
+    let (mut sig, mut err) = (0.0f64, 0.0f64);
+    for (&a, &b) in ours.iter().zip(&oracle) {
+        sig += f64::from(b).powi(2);
+        err += (f64::from(a) - f64::from(b)).powi(2);
+    }
+    let inter = 10.0 * (sig / err).log10();
+    let rms = |x: &[f32], c: usize| {
+        let v: Vec<f64> = x
+            .iter()
+            .skip(20_000 * 2 + c)
+            .step_by(2)
+            .take(40_000)
+            .map(|&s| f64::from(s).powi(2))
+            .collect();
+        (v.iter().sum::<f64>() / v.len() as f64).sqrt()
+    };
+    eprintln!(
+        "lsf intensity: inter-decoder {inter:.2} dB, rms L {:.4}/{:.4} R {:.4}/{:.4} (IS/plain)",
+        rms(&ours, 0),
+        rms(&base, 0),
+        rms(&ours, 1),
+        rms(&base, 1)
+    );
+    assert!(inter > 100.0, "inter-decoder SNR {inter:.2} dB vs ffmpeg");
+    for c in 0..2 {
+        let (a, b) = (rms(&ours, c), rms(&base, c));
+        assert!(
+            (a / b - 1.0).abs() < 0.1,
+            "channel {c} level {a:.4} vs plain {b:.4}"
+        );
     }
 }
 

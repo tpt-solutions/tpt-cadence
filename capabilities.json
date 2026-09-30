@@ -1,7 +1,7 @@
 {
   "$schema": "n/a — hand-maintained, mirrors README.md's crate/format tables and todo.md status; update both together",
   "generated": "manually maintained, not auto-generated",
-  "last_updated": "2026-09-24",
+  "last_updated": "2026-09-30",
   "crates": [
     {
       "crate": "tpt-av-cadence-core",
@@ -72,13 +72,13 @@
     {
       "crate": "tpt-av-cadence-opus",
       "formats": ["opus", "ogg-opus"],
-      "role": "Opus (RFC 6716) decoder + Ogg Opus container (RFC 7845)",
+      "role": "Opus (RFC 6716) decoder and encoder (CELT, SILK, hybrid) + Ogg Opus container (RFC 7845)",
       "decode": "conformance-tested",
-      "encode": "foundation-only",
+      "encode": "recorded scope complete (quality tuning remains, see todo.md)",
       "conformance": "100% final_range match on all 12 official RFC 6716 test vectors; SILK-only vectors PCM bit-exact; residual PCM SNR gap on CELT/hybrid vectors is float-ULP-class, not an entropy desync",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "CELT encoder: mono-or-stereo, fullband, CBR, all 4 frame sizes, transient/TF handling, joint M/S + intensity stereo coupling, constrained VBR, energy-adaptive dynalloc boosts; a top-level OggOpusEncoder implements the Encoder trait and writes real .opus/Ogg files (RFC 7845 pre_skip/delayed-tail/EOS semantics complete; RangeEncoder::try_done_sized mirrors libopus fixed-size storage so every CELT payload stays exactly bytes_per_frame). SILK encoder foundation (2026-09-26): SilkEncoder encodes mono 10/20 ms frames at 8/12/16 kHz internal rate into VBR SILK payloads — exact ports of silk_encode_indices, silk_encode_pulses (min-bits rate-level search), silk_gains_quant, silk_NLSF_encode + the NLSF_del_dec_quant trellis, silk_VQ_WMat_EC/quant_LTP_gains, the control_SNR tables, and an exact silk_A2NLSF; the excitation is coded by a closed-loop forward NSQ that runs the decoder’s own decode_core arithmetic, so encoder simulation and SilkDecoder output are bit-identical (pinned by tests). Foundation analysis simplifications (documented): noise-shaping analysis ported (per-subframe warped-correlation gains wired in, +0.8-1.2 dB; the shaping filter/tilt/harmonic/Lambda are computed but not yet closed into the NSQ error-feedback loop, which needs the per-frame rate-control ramp first), autocorr+schur LPC in place of Burg, full-resolution correlation pitch search without lookahead, no LBRR/DTX/FEC/stereo. Remaining encoder scope: SILK payload packetization into Opus/Ogg containers and hybrid SILK+CELT, SILK per-frame rate-control ramp, then the shaping feedback loop and RD rate term, delayed-decision NSQ and lookahead; SILK CBR sizing is landed."
+      "notes": "Encoder scope complete, all decoder-bit-exact: CELT (mono/stereo, fullband, CBR/VBR, all 4 frame sizes, transient/TF handling, M/S + intensity stereo, dynalloc steering); SILK (reference NSQ + delayed-decision NSQ behind set_complexity, per-frame rate control onto the caller budget, mono + stereo adaptive mid/side, 4-band VAD, Burg LPC, NLSF interpolation search, LBRR/FEC via set_packet_loss_perc, DTX, CBR payload sizing); hybrid SILK+CELT (TOC configs 12-15, mono or stereo, shared range coder); Ogg Opus writing with RFC 7845 pre-skip/granules recovering the exact input sample count"
     },
     {
       "crate": "tpt-av-cadence-aac",
@@ -94,24 +94,24 @@
     {
       "crate": "tpt-av-cadence-mp3",
       "formats": ["mp3"],
-      "role": "MPEG-1/2 Layer III",
+      "role": "MP3 decoder and encoder",
       "decode": "conformance-tested",
-      "encode": "bitstream-valid-only",
+      "encode": "gated (FFmpeg-accepted, 102-124 dB inter-decoder fidelity)",
       "conformance": ">100 dB SNR vs FFmpeg on ten bundled decode fixtures; official ISO/IEC 11172-4 vectors not obtainable, so decode correctness rests on the FFmpeg oracle alone",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "Mp3Encoder emits valid, independently FFmpeg-decodable CBR Layer III bitstreams. The analysis polyphase path matches shine's reverse circular-buffer fill; forward MDCT/antialias/change-sign precompensation, escape-Huffman pair ordering, count1 zero-width handling, MPEG-1 stereo side-info field order, and mono/stereo synthesis state are regression-tested. Active mono and independent-stereo end-to-end fidelity gates pass within the reduced flat-gain/no-reservoir encoder scope; psychoacoustic tuning, bit-reservoir borrowing, and full feature-set expansion remain out of scope."
+      "notes": "Mp3Encoder: full CBR and loudness/quality-targeting VBR across MPEG-1/2/2.5 with bit-reservoir borrowing, short-block switching, mid/side + opt-in intensity stereo (MPEG-1 PAN table and the ISO 13818-3 LSF ladder), Info/Xing + LAME gapless tags. The repeated-transient LSF short-block divergence is fixed (the window-sequence cross-frame lookahead now measures exactly what the granule-0 detector it predicts measures, so the mandatory zero-line stop is never dropped); psycho-loop quality tuning remains open"
     },
     {
       "crate": "tpt-av-cadence-vorbis",
       "formats": ["ogg-vorbis"],
-      "role": "Ogg Vorbis I",
+      "role": "Vorbis decoder and encoder",
       "decode": "conformance-tested",
-      "encode": "not-implemented",
+      "encode": "first encoder landed (FFmpeg-gated, 136 dB inter-decoder)",
       "conformance": "136-138 dB SNR vs FFmpeg on six bundled fixtures",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "Encoder deferred — needs a psychoacoustic model"
+      "notes": "VorbisEncoder: floor 1 + coupled residue type 1, quality 0-10, square-polar stereo, exact input length via granule trimming. Remaining: block switching, per-file adaptive Huffman books, psychoacoustic masking, >2 channels, quality-to-bitrate calibration"
     },
     {
       "crate": "tpt-av-cadence-test-utils",
@@ -138,13 +138,13 @@
     {
       "crate": "tpt-av-cadence-wasm-demo",
       "formats": ["wav"],
-      "role": "wasm32-unknown-unknown feasibility spike — wasm-bindgen wrapper decoding WAV to f32",
+      "role": "wasm32-unknown-unknown smoke demo \u2014 wasm-bindgen wrapper decoding every supported format to f32",
       "decode": "stable",
       "encode": "n/a",
       "conformance": "n/a (verified via a Node.js runtime smoke test, not a conformance suite)",
       "realtime_safe": false,
       "fuzzed": false,
-      "notes": "publish = false, not part of the crate suite proper. Proves every decoder crate builds and runs correctly under wasm32-unknown-unknown with zero code changes; only WAV is wired up here, wiring the rest is mechanical repetition"
+      "notes": "Exports decode_<format>_to_f32 / <format>_sample_rate for every supported format; CI's wasm job builds for wasm32-unknown-unknown and runs test.js, verifying each format end to end (lossless exact; lossy via rate/duration/level). Fixtures under fixtures/ are generated by this workspace's own encoders (tests/gen_fixtures.rs)."
     }
   ]
 }

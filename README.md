@@ -5,21 +5,25 @@
 
 **A pure-Rust, zero-dependency audio codec suite. Memory-safe, real-time capable, and permissively licensed (MIT OR Apache-2.0).**
 
-**Status:** Early-stage / Pre-1.0 — WAV, AIFF, FLAC, and raw PCM are implemented and
-bit-exact conformance-tested (decode and encode); AAC-LC and HE-AAC/SBR and
-MP3 pass FFmpeg-reference conformance (>100 dB SNR) for decode. AAC remains
-decode-only pending a licensing decision; the MP3 encoder produces valid,
-FFmpeg-decodable bitstreams with passing reduced-scope mono/stereo fidelity
-gates. Opus decode and Ogg Opus support are conformance-tested, with a CELT-only/Ogg Opus encoder foundation in progress;
-its CBR packets stay exactly on budget and RFC 7845 pre-skip/granules recover
-the exact input sample count. Hybrid SILK/CELT encoding and psychoacoustic
-tuning remain open. Vorbis
-decode is conformance-tested with no encoder yet.
+**Status:** Early-stage / Pre-1.0 — WAV, AIFF, FLAC, and raw PCM are
+implemented and bit-exact conformance-tested (decode and encode). The
+AAC-LC/HE-AAC-SBR, MP3, Opus, and Ogg Vorbis decoders all pass
+FFmpeg-reference conformance (>100 dB SNR); AAC remains decode-only
+pending a licensing decision. Encoders: the MP3 encoder (CBR and VBR,
+bit-reservoir borrowing, short-block switching, mid/side plus opt-in
+intensity stereo, Info/Xing + LAME gapless tags, all of MPEG-1/2/2.5),
+the Vorbis encoder (floor 1 + coupled residue, quality 0-10), and the
+Opus encoder (CELT, SILK, and hybrid SILK/CELT, mono/stereo, CBR/VBR,
+LBRR/FEC, DTX, RFC 7845 pre-skip/granules recovering the exact input
+sample count) produce FFmpeg-decodable streams with passing fidelity
+gates. Remaining encoder work is quality tuning and feature extras —
+see `todo.md`.
 **Ecosystem:** [TPT Solutions Open Source](https://opensource.tptsolutions.co.nz/)
 
 `tpt-cadence` is the **audio codec layer** of the TPT AV Stack. It provides pure-Rust,
-spec-compliant decoders for every major audio format, written from the specification up
-with zero external audio dependencies — no FFmpeg, no `symphonia`, no `hound`, no C bindings.
+spec-compliant decoders (and, for most formats, encoders) written from the specification
+up with zero external audio dependencies — no FFmpeg, no `symphonia`, no `hound`, no C
+bindings.
 
 See [DESIGN.md](DESIGN.md) for the full design rationale.
 
@@ -51,11 +55,11 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable — decode + encode, bit-exact |
 | [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable — decode + encode, bit-exact |
 | [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable — decode + encode (fixed predictors only), bit-exact |
-| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact. 🚧 Encoders: CELT-only `Encoder` + Ogg Opus writer (mono/stereo, fullband, CBR/VBR, all 4 frame sizes, M/S + intensity stereo), a complete SILK encoder (`SilkEncoder`: reference noise-shaping NSQ + per-frame rate control, decoder-bit-exact, VBR with payloads on budget, mono + stereo adaptive mid/side with mid-only side skipping), SILK-mode `.opus` writing (`OggOpusEncoder::new_silk`/`new_silk_cbr`: TOC configs 0–11, 10/20/40/60 ms packets with reference intra-packet conditional coding, 8/12/16 kHz internal rate, measured per-rate pre-skip, optional constant-size CBR payloads, optional DTX silence skipping, optional LBRR/FEC redundancy), and hybrid SILK+CELT writing (`OggOpusEncoder::new_hybrid`: TOC configs 12–15, SWB/FB, mono or stereo, shared range coder, start-band-17 CELT); LBRR/FEC/DTX remains open |
+| [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact. ✅ Encoder scope complete: CELT encoder (mono/stereo, fullband, CBR/VBR, all 4 frame sizes, transient/TF handling, M/S + intensity stereo, dynalloc steering), a complete SILK encoder (`SilkEncoder`: reference noise-shaping NSQ + delayed-decision NSQ behind `set_complexity`, per-frame rate control onto the caller's budget, mono + stereo adaptive mid/side, VAD, Burg LPC, NLSF interpolation, LBRR/FEC via `set_packet_loss_perc`, DTX, CBR payload sizing), SILK-mode `.opus` writing (`new_silk`/`new_silk_cbr`), and hybrid SILK+CELT writing (`new_hybrid`, TOC configs 12–15, mono or stereo on a shared range coder) — all decoder-bit-exact, with RFC 7845 pre-skip/granules recovering the exact input sample count |
 | [`tpt-av-cadence-ogg`](tpt-av-cadence-ogg) | Ogg page/packet container (RFC 3533) shared by Vorbis and Opus | ✅ In use |
 | [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg), decode-only |
-| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg) on ten bundled streams plus a generated 23-stream LAME oracle matrix (MPEG-1/2/2.5, 8–320 kbps ladder, all channel modes, feature-coverage-asserted) standing in for the unobtainable ISO/IEC 11172-4 vectors. ✅ Encoder bitstream validity, full MPEG-1 bitrate-ladder FFmpeg acceptance + PCM agreement, and reduced-scope mono/stereo end-to-end fidelity gates pass; psychoacoustics, reservoir borrowing, and full feature-set expansion remain out of scope — see `todo.md` |
-| [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures) |
+| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg) on ten bundled streams plus a generated 23-stream LAME oracle matrix (MPEG-1/2/2.5, 8–320 kbps ladder, all channel modes, feature-coverage-asserted) standing in for the unobtainable ISO/IEC 11172-4 vectors. ✅ Encoder: full CBR and loudness/quality-targeting VBR across MPEG-1/2/2.5 with bit-reservoir borrowing, short-block switching, mid/side + opt-in intensity stereo, and Info/Xing + LAME gapless tags — FFmpeg-accepted with passing inter-decoder fidelity gates (102–124 dB); only psycho-loop quality tuning remains open — see `todo.md` |
+| [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Decode conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures). ✅ First encoder landed (`VorbisEncoder`, floor 1 + coupled residue type 1, quality 0–10): FFmpeg-verified round trips at 136 dB; block switching, adaptive Huffman books, and psychoacoustic masking remain future work — see `todo.md` |
 | [`tpt-av-cadence-test-utils`](tpt-av-cadence-test-utils) | Conformance harness — FFmpeg comparison, fuzz helpers, MD5 | ✅ Internal (dev-only) |
 
 See [`capabilities.json`](capabilities.json) for a machine-readable version of this table

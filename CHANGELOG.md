@@ -8,6 +8,64 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
 ## [Unreleased]
 
 ### Added
+- Ogg Vorbis encoder (`tpt-av-cadence-vorbis`): `VorbisEncoder::new(sink,
+  rate, 1|2 channels, quality 0..=10)` — single 2048-sample block
+  size/mode, floor 1 (34 posts fitted and then decoded back through the
+  real `Floor1::decode` so the residue is computed against the exact
+  curve), residue type 1 over static Huffman-shaped lattice VQ books with
+  square-polar stereo coupling, and exact input length via granule
+  trimming, with headers round-tripped through `parse_setup` at
+  construction. Gates: round-trip SNR, exact odd/short input lengths, and
+  FFmpeg agreement (136 dB inter-decoder, 1ch/2ch, 44.1/48 kHz). The floor
+  rule blends envelope-tracking with flat noise (alpha 0.7); on the sample
+  music fixture ~150 kbps reaches ~23 dB SNR vs libvorbis' 16.7 dB at
+  134 kbps. Block switching, per-file adaptive Huffman books, and a real
+  psychoacoustic model remain future work (see `todo.md`).
+- MP3 intensity stereo, opt-in (`tpt-av-cadence-mp3`):
+  `Mp3Encoder::set_intensity_stereo` codes the top in-phase scalefactor
+  bands as one mono source plus per-band pan positions carried in the
+  right channel's scalefactors. Engages per frame when every granule's top
+  bands are strongly in-phase (rho >= 0.9), per window on short-block
+  granules, and on every version family — MPEG-1 pans quantize to the
+  12-step `PAN` table, the LSF families to the ISO/IEC 13818-3
+  quarter-step ladder through a jointly-fitted position/width partition
+  search (the right channel's `scalefac_compress` LSB carries the
+  intensity scale). FFmpeg cross-check gates: 119-120 dB inter-decoder on
+  long-block material, 102.8 dB across mixed long/short granules, 121.4 dB
+  on LSF, with per-channel levels within 2% of the plain encode.
+- MP3 short-block switching enabled, plus Info/Xing + LAME gapless tags
+  (`tpt-av-cadence-mp3`): the previously gated short-block machinery now
+  runs on MPEG-1 (attack-driven block-type state machine with zero-line
+  stop/bridge granules for decoder-agreement-safe window handover) and on
+  MPEG-2/2.5 (one granule per frame, short-row scalefactor partition
+  table), gated by FFmpeg cross-checks at 110-123 dB inter-decoder.
+  `new_cbr_with_info`/`new_vbr_with_xing` write Info/Xing headers with the
+  LAME gapless fields (measured encoder delay, flush padding, seek TOC),
+  patched in place after encoding; FFmpeg applies the same trimming our
+  decoder does on the tagged streams.
+- `silk_NSQ_del_dec` delayed-decision noise-shaping quantization
+  (`tpt-av-cadence-opus`): an exact port of `silk/NSQ_del_dec.c`
+  (1-4 pruning paths, 40-sample decision delay, per-path warping
+  feedback, the voiced subframe-2 tree reset), wired behind
+  `SilkEncoder::set_complexity(0..=10)` via the reference's own dispatch.
+  Validated by a 64-configuration differential against `decode_core` and
+  bit-exact complexity-10 round trips including CBR; on the suite's
+  speech fixture complexity 10 improves A-weighted SNR by 9-13 dB while
+  shrinking the payload.
+- MP3 encoder completions (`tpt-av-cadence-mp3`): full bit-reservoir
+  borrowing (`main_data_begin` reach-back, up to 511 banked bytes, byte-
+  exact frame tiling for mixed-rate streams); the output-scale defect
+  fixed (the analyzer ran at 32768x input on top of an analyzer/synth
+  kernel pair carrying 2^16, so every stream decoded 65536x too loud and
+  survived every correlation-based gate; the analyzer now measures unity
+  gain and the decade gate asserts decoded ~= source peak); MPEG-2/2.5
+  (LSF) encoding at 8-160 kbps (one 576-sample granule, 9/17-byte side
+  info, 9-bit mixed-radix `scalefac_compress` search); and loudness- and
+  quality-targeting per-frame VBR (`Mp3Encoder::new_vbr`, quality 0..=9,
+  per-frame bitrate-ladder selection absorbed by the reservoir).
+  FFmpeg-oracle gates pass across all three families (110-124 dB
+  inter-decoder with unity gain); this supersedes the "long blocks only,
+  bit-reservoir-free" scope note on the early MP3 entry below.
 - SILK noise-shaping analysis (`tpt-av-cadence-opus`): a new
   `silk::noise_shape` module ports
   `silk_noise_shape_analysis_FLP`, `silk_warped_autocorrelation_FLP` and
@@ -56,7 +114,9 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   immediately surfaced two real encoder defects (a ~1e5× output-scale
   error in all materials, and cross-decoder divergence on tonal granules),
   tracked with measurements in `todo.md` behind an `#[ignore]`d regression
-  test. Remaining documented oracle gaps: Layer III intensity stereo,
+  test. Remaining documented oracle gaps: Layer III intensity stereo
+  (since covered by the encoder-side FFmpeg cross-check gates — see the
+  intensity entry above),
   CRC-protected whole streams (separately covered by `crc_streams.rs`),
   and free-format bitrates.
 - Perceptual quality metrics (`tpt-av-cadence-test-utils`): a shared
@@ -391,6 +451,30 @@ version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en
   scope.
 
 ### Fixed
+- `tpt-av-cadence-mp3`'s decoder applied minimp3's non-standard LSF
+  intensity-stereo position ladder (integer power-of-two ratios with a 64
+  position ceiling) instead of the ISO/IEC 13818-3 semantics FFmpeg
+  implements (parity picks the unity side, the other side takes
+  `2^(-(sh+1)*j/4)` — quarter-step ratio units — and positions >= 16 mean
+  "not intensity"). The path had no fixture coverage before the encoder's
+  LSF intensity gate exercised it; decoder and encoder now agree with
+  FFmpeg at 121.4 dB inter-decoder.
+- MP3: on MPEG-2/2.5 (LSF) material made of *repeated* click transients the
+  encoder emitted bare `long -> short` window transitions, whose overlap
+  handover our decoder and FFmpeg resolved differently — 22-45 dB
+  inter-decoder on alternating click cycles, with and without intensity
+  stereo. Cause was the window-sequence state machine's cross-frame
+  lookahead disagreeing with the granule-0 detector it was predicting (it
+  used the previous frame's baseline energy, and measured one channel where
+  the detector measures both), which silently dropped the zero-line stop
+  granule a short run must be entered through. Every granule of the repro
+  now agrees at 104-122 dB, gated by the new
+  `lsf_repeated_transients_agree_with_ffmpeg`.
+- The SILK encoder's rate-control loop mis-bracketed its gain-multiplier
+  bisection (a broken interpolation formula left over from an earlier
+  abandoned integration), silently overshooting bitrate budgets by
+  1.2-1.55x. Fixed and verified by direct trace; the SNR quality-gate
+  floors were re-measured honestly at the now-honored budgets.
 - `tpt-av-cadence-opus`'s SILK `smlawt` truncated its third operand to the
   low 16 bits like `smlawb`; the reference's `silk_SMLAWT` uses the *top*
   16 bits. The pair together decodes the reference's packed LF-shaping

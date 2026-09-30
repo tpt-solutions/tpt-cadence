@@ -791,7 +791,13 @@ dependencies = [
 name = "tpt-av-cadence-wasm-demo"
 version = "0.1.0"
 dependencies = [
+ "tpt-av-cadence-aac",
+ "tpt-av-cadence-aiff",
  "tpt-av-cadence-core",
+ "tpt-av-cadence-flac",
+ "tpt-av-cadence-mp3",
+ "tpt-av-cadence-opus",
+ "tpt-av-cadence-vorbis",
  "tpt-av-cadence-wav",
  "wasm-bindgen",
 ]

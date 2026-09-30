@@ -870,6 +870,160 @@ fn lsf_sf_layout(sfc: u16, short: bool) -> ([u8; 4], [u8; 4]) {
     (sizes, counts)
 }
 
+/// Preselected LSF intensity transmission config for the right channel:
+/// the partition (a `SCF_MOD` digit row's widths plus the matching
+/// `SCF_PARTITIONS` counts), the exponent shift (transmitted as the compress
+/// LSB, doubling the pan-ratio step when set), and the assembled 9-bit
+/// `scalefac_compress` value `(sfc << 1) | sh`, kept below the
+/// preflag-implying 500 (a preflag would add the pretab to the position
+/// values on the decode side and corrupt them).
+#[derive(Clone, Copy, Debug)]
+struct LsfIsConfig {
+    sh: u8,
+    compress: u16,
+    sizes: [u8; 4],
+    counts: [u8; 4],
+}
+
+impl LsfIsConfig {
+    /// Transmitted scalefactor bits (the decoder's count reader stops at
+    /// the first zero count, so trailing groups carry nothing).
+    fn sfb_bits(&self) -> u64 {
+        self.sizes
+            .iter()
+            .zip(self.counts.iter())
+            .take_while(|&(_, &c)| c != 0)
+            .map(|(&w, &c)| u64::from(w) * u64::from(c))
+            .sum()
+    }
+}
+
+/// Amplitude-ratio exponent (log2 L/R) of an LSF intensity position: the
+/// decoder derives `(kl, kr) = (1, 2^(-(sh+1)·j/4))` for even `p = 2j` and
+/// `(2^(-(sh+1)·j/4), 1)` for odd `p = 2j-1` (`p = 0` is the mono `(1, 1)`),
+/// so position `p` codes an L/R amplitude ratio of `2^(±(sh+1)·j/4)` —
+/// quarter-step units, positive = left louder.
+fn lsf_position_exponent(p: u8, sh: u8) -> f64 {
+    if p == 0 {
+        return 0.0;
+    }
+    let exp = f64::from((sh as i32 + 1) * (((p + 1) >> 1) as i32)) / 4.0;
+    if p & 1 != 0 {
+        -exp
+    } else {
+        exp
+    }
+}
+
+/// Searches the LSF intensity partition space (the three `SCF_MOD` rows the
+/// right channel's `sfc = compress >> 1` walk can land on — flat-table
+/// groups 16/20/24, the ISO 13818-3 intensity count rows — their digit
+/// combinations, and both exponent shifts) for the transmission config
+/// whose representable positions fit the desired per-band amplitude-ratio
+/// exponents best — least total exponent error over the intensity bands
+/// (those at or above their window's start), then fewest scalefactor bits.
+/// Positions are clamped into each band group's width, never taking the
+/// width's `max_scf` sentinel (which decoders read as "not intensity") nor
+/// the ladder's 16 ceiling; a zero-width group can only carry the mono
+/// position 0. Infallible: a config always exists (the mono-everywhere
+/// position 0 fits every layout).
+fn lsf_intensity_search(
+    wanted: &[f64; 36],
+    from: &[usize; 3],
+    short: bool,
+) -> (LsfIsConfig, [u8; 36]) {
+    // (mod-row offset in `SCF_MOD`, sfc base, count-group offset in
+    // `SCF_PARTITIONS`) — the intensity rows sit four groups later in the
+    // partition table than in the mod table.
+    const ROW_DIGITS: [(usize, usize, i32); 3] = [(12, 16, 0), (16, 20, 180), (20, 24, 244)];
+    let mods = &crate::tables::SCF_MOD;
+    let part_off = if short { 2 * 28 } else { 0 };
+    let n_bands = if short { 36 } else { 21 };
+    let is_band = |band: usize| -> bool {
+        if short {
+            band >= from[band % 3]
+        } else {
+            band >= from[0]
+        }
+    };
+    let mut best: Option<(f64, u64, LsfIsConfig, [u8; 36])> = None;
+    for sh in 0..2u8 {
+        for &(k, kp, sfc_base) in &ROW_DIGITS {
+            let counts = [
+                crate::tables::SCF_PARTITIONS[part_off + kp],
+                crate::tables::SCF_PARTITIONS[part_off + kp + 1],
+                crate::tables::SCF_PARTITIONS[part_off + kp + 2],
+                crate::tables::SCF_PARTITIONS[part_off + kp + 3],
+            ];
+            // Digit space of this row (mixed radix over its mods); only
+            // tuples whose group widths can carry a non-mono position
+            // somewhere are worth scoring, but the mono fallback keeps
+            // every tuple valid.
+            let row_mods = [mods[k], mods[k + 1], mods[k + 2], mods[k + 3]];
+            let space: i32 = row_mods.iter().map(|&m| m as i32).product();
+            for d in 0..space {
+                // Decompose d exactly like the decoder reads `sfc` back:
+                // sizes[0] is the MOST significant digit.
+                let mut rem = d;
+                let mut sizes = [0u8; 4];
+                for i in (0..4).rev() {
+                    sizes[i] = (rem % row_mods[i] as i32) as u8;
+                    rem /= row_mods[i] as i32;
+                }
+                let compress = (((sfc_base + d) << 1) | sh as i32) as u16;
+                if compress >= 500 {
+                    continue; // preflag would corrupt the position values
+                }
+                let cfg = LsfIsConfig {
+                    sh,
+                    compress,
+                    sizes,
+                    counts,
+                };
+                let mut pos = [0u8; 36];
+                let mut error = 0.0f64;
+                let mut band = 0usize;
+                for (g, &cnt) in counts.iter().enumerate() {
+                    for _ in 0..cnt {
+                        if band >= n_bands {
+                            break;
+                        }
+                        if is_band(band) {
+                            let w = sizes[g];
+                            // Exclusive bound: never the width's max_scf
+                            // sentinel, never the ladder's 16 ceiling.
+                            let cap = if w == 0 { 1 } else { ((1 << w) - 1).min(16) };
+                            let mut best_p = 0u8;
+                            let mut best_e = f64::INFINITY;
+                            for p in 0..cap {
+                                let e = lsf_position_exponent(p, sh);
+                                let d = e - wanted[band];
+                                let d = d * d;
+                                if d < best_e {
+                                    best_e = d;
+                                    best_p = p;
+                                }
+                            }
+                            pos[band] = best_p;
+                            error += best_e;
+                        }
+                        band += 1;
+                    }
+                }
+                let bits = cfg.sfb_bits();
+                if best.map_or(true, |(be, bb, _, _)| {
+                    error < be || (error == be && bits < bb)
+                }) {
+                    best = Some((error, bits, cfg, pos));
+                }
+            }
+        }
+    }
+    let (error, bits, cfg, pos) = best.expect("mono config always fits");
+    let _ = (error, bits);
+    (cfg, pos)
+}
+
 /// Per-band requantization multipliers for a planned granule — an exact
 /// mirror of `crate::scalefac::decode_scalefactors`' final loop for long
 /// blocks at `scalefac_scale = 0`, including the preflag/pretab add-back and
@@ -1235,8 +1389,8 @@ fn evaluate_granule(
     compress: u16,
     preflag: bool,
     ms_stereo: bool,
-    lsf: bool,
     block_type: u8,
+    sfb_bits: u64,
 ) -> GranuleCost {
     let gains = band_gains(global_gain, scalefacs, preflag, ms_stereo, layout.n_sf);
     let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
@@ -1325,7 +1479,6 @@ fn evaluate_granule(
         *noise = acc;
     }
 
-    let sfb_bits = scalefac_bits(compress, lsf, layout.short);
     let total_bits = best_bits + sfb_bits;
     GranuleCost {
         plan: GranulePlan {
@@ -1396,12 +1549,12 @@ fn inner_loop(
     preflag: bool,
     ms_stereo: bool,
     budget_bits: u64,
-    lsf: bool,
     block_type: u8,
+    sfb_bits: u64,
 ) -> GranuleCost {
     let cost_at = |gg: u8| {
         evaluate_granule(
-            spec, layout, gg, scalefacs, compress, preflag, ms_stereo, lsf, block_type,
+            spec, layout, gg, scalefacs, compress, preflag, ms_stereo, block_type, sfb_bits,
         )
     };
 
@@ -1660,25 +1813,45 @@ fn plan_granule(
     // ratio is at or under this value (1.0 = noise at threshold).
     tolerance: f64,
     block_type: u8,
-    // Intensity stereo (right channel only): bands from the given index
-    // through 20 carry pan positions as their scalefactors, frozen against
-    // amplification (their lines are all zero).
-    intensity: Option<(usize, &[u8; 22])>,
+    // Intensity stereo (right channel only): long granules freeze bands
+    // `from[0]..=20` (21 inherited), short granules freeze each window's
+    // bands from `from[w]` up — their scalefactors carry pan positions,
+    // frozen against amplification (their lines are all zero). On the LSF
+    // families the positions transmit through the preselected intensity
+    // partition instead of `choose_compress`'s widths.
+    intensity: Option<IsGranulePlan<'_>>,
 ) -> GranuleCost {
     let mut scalefacs = [0u8; MAX_SFB];
     let mut amplified = [false; MAX_SFB];
-    if let Some((from, pos)) = intensity {
-        for band in from..21 {
-            scalefacs[band] = pos[band];
-            amplified[band] = true;
+    if let Some(is) = intensity {
+        let (from, pos) = (is.from, is.pos);
+        for band in 0..if layout.short { 36 } else { 21 } {
+            let w = if layout.short { band % 3 } else { 0 };
+            if band >= from[w] {
+                scalefacs[band] = pos[band];
+                amplified[band] = true;
+            }
         }
     }
+    let is_lsf_cfg = intensity.and_then(|is| is.lsf);
     let mut best: Option<GranuleCost> = None;
     let mut best_excess = f64::INFINITY;
     let mut fallback: Option<GranuleCost> = None;
     // The band amplified in the previous round (for window-failure marking).
     for _round in 0..=PSY_AMPLIFICATION_ROUNDS {
-        let (compress, preflag) = choose_compress(&scalefacs, lsf, layout.short);
+        // The LSF intensity channel's widths are preselected with its
+        // positions (they must carry values up to ~30, which the regular
+        // search's band-count-based fit cannot express); its real
+        // (non-frozen) scalefactors stay at 0 unless the amplification
+        // loop bumps one band, which any width >= 1 carries.
+        let (compress, preflag, sfb_bits) = match is_lsf_cfg {
+            Some(cfg) => (cfg.compress, false, cfg.sfb_bits()),
+            None => {
+                let (compress, preflag) = choose_compress(&scalefacs, lsf, layout.short);
+                let sfb_bits = scalefac_bits(compress, lsf, layout.short);
+                (compress, preflag, sfb_bits)
+            }
+        };
         let cost = inner_loop(
             spec,
             layout,
@@ -1687,8 +1860,8 @@ fn plan_granule(
             preflag,
             ms_stereo,
             budget_bits,
-            lsf,
             block_type,
+            sfb_bits,
         );
         if cost.over_budget {
             fallback = Some(cost);
@@ -1759,8 +1932,11 @@ fn plan_granule(
             false,
             ms_stereo,
             u64::MAX,
-            lsf,
             block_type,
+            match is_lsf_cfg {
+                Some(cfg) => cfg.sfb_bits(),
+                None => scalefac_bits(0, lsf, layout.short),
+            },
         );
         flat.over_budget = true;
         flat.worst_ratio = f64::INFINITY;
@@ -1769,21 +1945,51 @@ fn plan_granule(
 }
 
 // ---------------------------------------------------------------------------
-// Intensity stereo (MPEG-1, long blocks). The decoder treats every band above
-// the right channel's highest non-zero band as intensity-coded: the left
-// channel's dequantized lines `A` are split as `L = A·kl`, `R = A·kr` with
-// `(kl, kr) = PAN[pos]` (`kl + kr = 1`, `kl/kr = tan(pos·π/12)`), `pos`
-// being the right channel's scalefactor for that band (0..=6 legal). Band 21
-// carries no scalefactor and inherits band 20's position (or 3 when band 20
-// is itself the top coded band). With mid/side also on, non-intensity bands
-// stay M/S and the decoder's extra √2 folds into the mid channel's shift.
+// Intensity stereo (all three version families, long and short block
+// granules). The decoder treats every band above the right channel's
+// highest non-zero band as intensity-coded: the left channel's dequantized
+// lines `A` are split as `L = A·kl`, `R = A·kr`, `pos` being the right
+// channel's scalefactor for that band. On MPEG-1, `(kl, kr) = PAN[pos]`
+// (`kl + kr = 1`, `kl/kr = tan(pos·π/12)`, 0..=6 legal) and the family
+// default is the center (3); on the LSF families positions ride the ISO
+// 13818-3 quarter-step ladder — `(kl, kr) = (1, 2^(-(sh+1)·j/4))` for even
+// `p = 2j`, `(2^(-(sh+1)·j/4), 1)` for odd `p = 2j-1`, mono `(1, 1)` at
+// `p = 0` — with the shift `sh` transmitted as the right channel's
+// `scalefac_compress` LSB, 0 as the family default, positions capped at 15
+// (16 is the ladder's "not intensity" ceiling) and a width's `max_scf`
+// value meaning the same (both never emitted). Long blocks share one
+// boundary across bands
+// 0..=21, and band 21 (scalefactor-less) inherits band 20's position (or
+// the family default when band 20 is itself the top coded band). Short
+// blocks run the same rule per window over the interleaved (scalefactor
+// band, window) bands — the boundary of window `w` only covers bands
+// `≡ w (mod 3)` — and each window's top band (`33 + w`) inherits band
+// `30 + w`'s position (or the family default when `30 + w` itself lies
+// above the right channel's top coded band). With mid/side also on,
+// non-intensity bands stay M/S and the decoder's extra √2 folds into the
+// mid channel's shift.
 // ---------------------------------------------------------------------------
 
-/// Per-frame intensity plan: first intensity band and pan positions per
-/// granule.
+/// Per-frame intensity plan: first intensity band per granule and pan
+/// positions per coded band. Long granules use window slot 0 only (bands
+/// `from[0]..=20` coded, 21 inherited); short granules carry a first band
+/// per window (`from[w] ≡ w (mod 3)`, bands `from[w]..=35`).
 struct IsInfo {
-    from: [usize; 2],
-    pos: [[u8; 22]; 2],
+    from: [[usize; 3]; 2],
+    pos: [[u8; 36]; 2],
+    /// LSF only: the preselected right-channel position transmission
+    /// config (LSF frames carry a single granule).
+    lsf: Option<LsfIsConfig>,
+}
+
+/// Per-granule intensity plan handed to [`plan_granule`]: the per-window
+/// first bands, the pan positions, and the LSF position-transmission
+/// config when the frame is LSF.
+#[derive(Clone, Copy)]
+struct IsGranulePlan<'a> {
+    from: [usize; 3],
+    pos: &'a [u8; 36],
+    lsf: Option<LsfIsConfig>,
 }
 
 /// Band energies `(EL, ER, Σ L·R)` over a long band.
@@ -1798,36 +2004,52 @@ fn band_stats(l: &[f32], r: &[f32], layout: &BandLayout, band: usize) -> (f64, f
     (el, er, lr)
 }
 
-/// First band of the maximal top run (bands `from..=21`, `from >= 8`) whose
-/// left/right spectra are strongly in-phase (`ρ >= 0.9`), or 22 when band
-/// 21 itself is not. Bands where one channel is silent count as in phase:
-/// a hard pan is exactly representable.
-fn intensity_candidate(l: &[f32], r: &[f32], layout: &BandLayout) -> usize {
-    let mut from = 22usize;
+/// First band of the maximal top run whose left/right spectra are strongly
+/// in-phase (`ρ >= 0.9`) — long: the single run `from..=21`, `from >= 8`
+/// (22 when band 21 itself is not); short: one run per window over bands
+/// `≡ w (mod 3)`, `from[w] >= 24` (36 when even the window's top band is
+/// not). Bands where one channel is silent count as in phase: a hard pan
+/// is exactly representable.
+fn intensity_candidate(l: &[f32], r: &[f32], layout: &BandLayout) -> [usize; 3] {
+    let (n_bands, floor, windows) = if layout.short {
+        (36, 24, 3)
+    } else {
+        (22, 8, 1)
+    };
+    let mut from = [n_bands; 3];
     // Bands more than 50 dB under the granule's total energy are leakage
     // or numerical noise: their correlation is meaningless and any pan
     // position is inaudible.
-    let total: f64 = (0..21)
+    let total: f64 = (0..if layout.short { 36 } else { 21 })
         .map(|band| {
             let (el, er, _) = band_stats(l, r, layout, band);
             el + er
         })
         .sum();
-    for band in (8..22).rev() {
-        let (el, er, lr) = band_stats(l, r, layout, band);
-        let ok = el + er <= 1e-5 * total || el * er <= 1e-18 || lr / (el * er).sqrt() >= 0.9;
-        if !ok {
-            break;
+    for (w, slot) in from.iter_mut().enumerate().take(windows) {
+        let mut band = n_bands - 1 - w;
+        while band >= floor {
+            let (el, er, lr) = band_stats(l, r, layout, band);
+            let ok = el + er <= 1e-5 * total || el * er <= 1e-18 || lr / (el * er).sqrt() >= 0.9;
+            if !ok {
+                break;
+            }
+            *slot = band;
+            band -= if layout.short { 3 } else { 1 };
         }
-        from = band;
     }
     from
 }
 
-/// Pan position per band 0..=20 from the left/right energy ratio.
-fn intensity_positions(l: &[f32], r: &[f32], layout: &BandLayout) -> [u8; 22] {
-    let mut pos = [3u8; 22];
-    for (band, p) in pos.iter_mut().enumerate().take(21) {
+/// Pan position per coded band from the left/right energy ratio (long:
+/// bands 0..=20; short: all 36 (band, window) bands).
+fn intensity_positions(l: &[f32], r: &[f32], layout: &BandLayout) -> [u8; 36] {
+    let mut pos = [3u8; 36];
+    for (band, p) in pos
+        .iter_mut()
+        .enumerate()
+        .take(if layout.short { 36 } else { 21 })
+    {
         let (el, er, _) = band_stats(l, r, layout, band);
         if el <= 0.0 && er <= 0.0 {
             continue;
@@ -1842,36 +2064,93 @@ fn intensity_positions(l: &[f32], r: &[f32], layout: &BandLayout) -> [u8; 22] {
     pos
 }
 
+/// Desired per-band L/R amplitude-ratio exponents (log2) for the LSF
+/// intensity ladder: silent bands read as mono, one-sided bands clamp to
+/// the ladder's ±30 ceiling inside the config search.
+fn intensity_exponents_lsf(l: &[f32], r: &[f32], layout: &BandLayout) -> [f64; 36] {
+    let mut exp = [0.0f64; 36];
+    for (band, e) in exp
+        .iter_mut()
+        .enumerate()
+        .take(if layout.short { 36 } else { 21 })
+    {
+        let (el, er, _) = band_stats(l, r, layout, band);
+        *e = if el <= 0.0 {
+            -30.0
+        } else if er <= 0.0 {
+            30.0
+        } else {
+            0.5 * (el / er).log2()
+        };
+    }
+    exp
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Rewrites bands `from..` of the (already M/S-transformed if `ms`)
-/// spectra `out0`/`out1` as an intensity source and silence: the source
-/// keeps the in-phase line shape `L+R`, scaled so the pan split preserves
-/// the band's total energy. The decoder's mid/side gain makes `A = 2·spec0`
-/// in M/S mode (`A = spec0` otherwise).
+/// Rewrites bands from the per-window starts of the (already
+/// M/S-transformed if `ms`) spectra `out0`/`out1` as an intensity source
+/// and silence: the source keeps the in-phase line shape `L+R`, scaled so
+/// the pan split preserves the band's total energy. The decoder's mid/side
+/// gain makes `A = 2·spec0` in M/S mode (`A = spec0` otherwise).
 fn apply_intensity(
     l: &[f32],
     r: &[f32],
     out0: &mut [f32; GRANULE_SAMPLES],
     out1: &mut [f32; GRANULE_SAMPLES],
     layout: &BandLayout,
-    from: usize,
-    pos: &[u8; 22],
+    from: &[usize; 3],
+    pos: &[u8; 36],
     ms: bool,
+    lsf_sh: Option<u8>,
 ) {
-    for band in from..22 {
-        let p = if band == 21 {
-            if from <= 20 {
+    for band in 0..if layout.short { 36 } else { 22 } {
+        let w = if layout.short { band % 3 } else { 0 };
+        if band < from[w] {
+            continue;
+        }
+        // Scalefactor-less / overridden tops: long band 21 and each short
+        // window's top band (`33 + w`) decode with band `20` / `30 + w`'s
+        // position, or the family default (MPEG-1 center 3, LSF mono 0)
+        // when that band itself lies above the right channel's top coded
+        // band — exactly the boundary refinement loop's converged state.
+        let p = if layout.short {
+            let w = band % 3;
+            if band == 33 + w {
+                if from[w] <= 30 + w {
+                    pos[30 + w]
+                } else if lsf_sh.is_some() {
+                    0
+                } else {
+                    3
+                }
+            } else {
+                pos[band]
+            }
+        } else if band == 21 {
+            if from[0] <= 20 {
                 pos[20]
+            } else if lsf_sh.is_some() {
+                0
             } else {
                 3
             }
         } else {
             pos[band]
         } as usize;
-        let (kl, kr) = (
-            f64::from(crate::tables::PAN[2 * p]),
-            f64::from(crate::tables::PAN[2 * p + 1]),
-        );
+        let (kl, kr) = match lsf_sh {
+            Some(sh) => {
+                let f = 2.0f64.powf(-f64::from((sh as i32 + 1) * (((p + 1) >> 1) as i32)) / 4.0);
+                if p & 1 != 0 {
+                    (f, 1.0)
+                } else {
+                    (1.0, f)
+                }
+            }
+            None => (
+                f64::from(crate::tables::PAN[2 * p]),
+                f64::from(crate::tables::PAN[2 * p + 1]),
+            ),
+        };
         let (el, er, _) = band_stats(l, r, layout, band);
         let sum_sq: f64 = (layout.line_start[band]..layout.line_end[band])
             .map(|i| f64::from(l[i] + r[i]).powi(2))
@@ -1889,16 +2168,22 @@ fn apply_intensity(
     }
 }
 
-/// The decoder's view of a planned right channel: the highest band with a
-/// non-zero coded line (-1 when none). Everything above it is decoded as
-/// intensity.
+/// The decoder's view of a planned right channel: per window (slot 0 only
+/// for long blocks), the highest band with a non-zero coded line (-1 when
+/// none). Everything above it is decoded as intensity.
 fn intensity_top_band(
     plan: &GranulePlan,
     spec: &[f32; GRANULE_SAMPLES],
     layout: &BandLayout,
     ms: bool,
-) -> i32 {
-    let gains = band_gains(plan.global_gain, &plan.scalefacs, plan.preflag, ms, 21);
+) -> [i32; 3] {
+    let gains = band_gains(
+        plan.global_gain,
+        &plan.scalefacs,
+        plan.preflag,
+        ms,
+        if layout.short { 36 } else { 21 },
+    );
     let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
     apply_ff_window(
         &mut ix,
@@ -1908,11 +2193,19 @@ fn intensity_top_band(
         layout,
     );
     let coded = 2 * plan.big_values as usize + 4 * plan.count1_quads as usize;
-    (0..coded.min(GRANULE_SAMPLES))
-        .filter(|&i| ix[i] != 0)
-        .map(|i| i32::from(layout.band_of_line[i]))
-        .max()
-        .unwrap_or(-1)
+    let mut top = [-1i32; 3];
+    for (&v, &band) in ix
+        .iter()
+        .zip(&layout.band_of_line)
+        .take(coded.min(GRANULE_SAMPLES))
+    {
+        if v != 0 {
+            let band = i32::from(band);
+            let w = (if layout.short { band % 3 } else { 0 }) as usize;
+            top[w] = top[w].max(band);
+        }
+    }
+    top
 }
 
 // ---------------------------------------------------------------------------
@@ -2005,7 +2298,8 @@ pub struct Mp3Encoder<W: Write + Seek> {
     /// This frame's per-slot block decisions (set during analysis):
     /// 0 long, 1 start, 2 short, 3 stop.
     slot_block: [u8; 4],
-    /// Opt-in intensity stereo (MPEG-1 stereo, long blocks).
+    /// Opt-in intensity stereo (stereo frames of every version family,
+    /// long and short blocks).
     intensity: bool,
     /// Whether the frame being emitted carries intensity stereo.
     frame_is: bool,
@@ -2134,12 +2428,16 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         })
     }
 
-    /// Enables intensity stereo (off by default): on MPEG-1 stereo frames
-    /// whose granules are all long blocks, the highest bands whose left and
-    /// right spectra are strongly in-phase are coded as one mono source
-    /// plus a per-band pan position (the right channel's scalefactors
-    /// carry the positions). It trades stereo-image detail above the
-    /// switch band for bitrate, so it suits low bitrates.
+    /// Enables intensity stereo (off by default): on stereo frames whose
+    /// granules all engage (per window for short-block granules, and only
+    /// when a granule's two channels share one window family — the decoder
+    /// runs joint stereo on the left channel's band structure), the
+    /// highest bands whose left and right spectra are strongly in-phase
+    /// are coded as one mono source plus a per-band pan position (the
+    /// right channel's scalefactors carry the positions). MPEG-1 pans
+    /// quantize to the 12-step `PAN` table; the LSF families to a coarser
+    /// power-of-two ladder. It trades stereo-image detail above the switch
+    /// band for bitrate, so it suits low bitrates.
     pub fn set_intensity_stereo(&mut self, on: bool) {
         self.intensity = on;
     }
@@ -2429,31 +2727,44 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             let front = pcm_energy(base, quarter);
             attacks[gr * channels + ch] =
                 front > 1e-9 && front > 25.0 * self.channel_state[ch].prev_back_energy.max(1e-12);
+            // Every channel of a granule must reach the same verdict: the
+            // zero-line stop/bridge machinery assumes both sides of a frame
+            // enter the short run together, and a per-channel split there
+            // yields a long -> short transition for one channel only.
+            for other in 0..channels {
+                attacks[gr * channels + other] = attacks[gr * channels + ch];
+            }
         }
         let look = self.lookahead_rows(ch);
         let mut prev_short = self.channel_state[ch].last_short;
+        // The next frame's granule-0 detector will compare its front half
+        // against *this* frame's last granule's back half — the value stored
+        // below. Arming the cross-frame lookahead needs that same baseline,
+        // so compute it before the window-sequence loop instead of after it
+        // (reading the previous frame's stale value here made `next_attack`
+        // disagree with the detector that actually fires on the next frame,
+        // so the zero-line stop that must precede a short run was silently
+        // dropped and the encoder emitted a bare long -> short transition).
+        let last_gr = n_granules - 1;
+        let back_energy = pcm_energy(last_gr * 2 * quarter + quarter, quarter);
         for gr in 0..n_granules {
             let attack = attacks[gr * channels + ch];
             let next_attack = if gr + 1 < n_granules {
                 attacks[(gr + 1) * channels + ch]
             } else {
                 // The next frame's first granule: its front half is the
-                // cross-frame lookahead PCM.
-                let base = self.samples_per_frame() * channels + ch;
-                let e_front = (0..quarter)
-                    .step_by(channels)
-                    .map(|i| {
-                        let idx = base + i;
-                        let v = if idx < self.pending.len() {
-                            f64::from(self.pending[idx])
-                        } else {
-                            0.0
-                        };
-                        v * v
-                    })
-                    .sum::<f64>();
-                e_front > 1e-9
-                    && e_front > 25.0 * self.channel_state[ch].prev_back_energy.max(1e-12)
+                // cross-frame lookahead PCM. It must be measured exactly the
+                // way that frame's own granule-0 detector will measure it —
+                // `pcm_energy(0, quarter)`, a contiguous `quarter`-sample
+                // window over the interleaved buffer spanning *both*
+                // channels. Measuring only this channel (striding by
+                // `channels`) made the two disagree, and a disagreement here
+                // drops the mandatory zero-line stop, so the encoder emitted a
+                // bare long -> short transition that decoders are free to
+                // interpret differently.
+                let base = self.samples_per_frame() * channels;
+                let e_front = pcm_energy(base, quarter);
+                e_front > 1e-9 && e_front > 25.0 * back_energy.max(1e-12)
             };
             let block = if attack {
                 2u8 // content short
@@ -2468,9 +2779,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             self.slot_block[gr * channels + ch] = block;
         }
         self.channel_state[ch].last_short = self.slot_block[(n_granules - 1) * channels + ch] == 2;
-        let last_gr = n_granules - 1;
-        self.channel_state[ch].prev_back_energy =
-            pcm_energy(last_gr * 2 * quarter + quarter + ch, quarter);
+        self.channel_state[ch].prev_back_energy = back_energy;
 
         for gr in 0..n_granules {
             let spec = &mut self.spec_scratch[ch * 2 + gr];
@@ -2709,7 +3018,11 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 self.lsf,
                 tolerance,
                 block,
-                is.filter(|_| ch == 1).map(|i| (i.from[gr], &i.pos[gr])),
+                is.filter(|_| ch == 1).map(|i| IsGranulePlan {
+                    from: i.from[gr],
+                    pos: &i.pos[gr],
+                    lsf: i.lsf,
+                }),
             );
             remaining -= cost.bits.min(remaining);
             costs[slot] = cost.worst_ratio;
@@ -2746,8 +3059,15 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                     } else {
                         &self.layout
                     };
-                    plan.part2_3_length =
-                        measure_plan(plan, &spec, layout, ms, self.lsf).min(4095) as u16;
+                    plan.part2_3_length = measure_plan(
+                        plan,
+                        &spec,
+                        layout,
+                        ms,
+                        self.lsf,
+                        is.filter(|_| ch == 1).and_then(|i| i.lsf),
+                    )
+                    .min(4095) as u16;
                 }
             }
         }
@@ -2772,30 +3092,57 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         }
 
         // Intensity stereo candidates: MPEG-1 stereo frames whose granules
-        // are all long blocks and whose top bands are in phase in every
-        // granule. The start bands are refined against the planned right
-        // channel below (the decoder infers the boundary from the right
-        // channel's highest non-zero band).
+        // all engage — each granule's two channels share one window family
+        // (the decoder runs joint stereo on the LEFT channel's band
+        // structure for both channels, so a long/short split between them
+        // is unrepresentable) and whose top bands are in phase in every
+        // granule, per window for short-block granules. The start bands are
+        // refined against the planned right channel below (the decoder
+        // infers the boundary from the right channel's highest non-zero
+        // band).
         let base_spec = self.spec_scratch.clone();
         let mut is_info: Option<IsInfo> = None;
 
-        if self.intensity
-            && channels == 2
-            && !lsf
-            && self.slot_block[..n_granules * channels]
-                .iter()
-                .all(|&b| b == 0)
-        {
-            let mut info = IsInfo {
-                from: [22; 2],
-                pos: [[3; 22]; 2],
-            };
-            for gr in 0..n_granules {
-                info.from[gr] = intensity_candidate(&lr_spec[gr], &lr_spec[2 + gr], &self.layout);
-                info.pos[gr] = intensity_positions(&lr_spec[gr], &lr_spec[2 + gr], &self.layout);
-            }
-            if info.from[..n_granules].iter().all(|&f| f < 22) {
-                is_info = Some(info);
+        let gr_is_short = |gr: usize| matches!(self.slot_block[gr * 2], 2 | 4);
+        if self.intensity && channels == 2 {
+            let families_match = (0..n_granules)
+                .all(|gr| gr_is_short(gr) == matches!(self.slot_block[gr * 2 + 1], 2 | 4));
+            if families_match {
+                let mut info = IsInfo {
+                    from: [[0; 3]; 2],
+                    pos: [[3; 36]; 2],
+                    lsf: None,
+                };
+                for gr in 0..n_granules {
+                    let layout = if gr_is_short(gr) {
+                        &self.short_layout
+                    } else {
+                        &self.layout
+                    };
+                    info.from[gr] = intensity_candidate(&lr_spec[gr], &lr_spec[2 + gr], layout);
+                    if lsf {
+                        // LSF pans ride the coarse power-of-two ladder, so
+                        // the positions and their transmission widths are
+                        // fitted together before the spectra are rewritten.
+                        let wanted =
+                            intensity_exponents_lsf(&lr_spec[gr], &lr_spec[2 + gr], layout);
+                        let (cfg, pos) =
+                            lsf_intensity_search(&wanted, &info.from[gr], layout.short);
+                        info.pos[gr] = pos;
+                        info.lsf = Some(cfg);
+                    } else {
+                        info.pos[gr] = intensity_positions(&lr_spec[gr], &lr_spec[2 + gr], layout);
+                    }
+                }
+                if (0..n_granules).all(|gr| {
+                    if gr_is_short(gr) {
+                        info.from[gr].iter().all(|&f| f < 36)
+                    } else {
+                        info.from[gr][0] < 22
+                    }
+                }) {
+                    is_info = Some(info);
+                }
             }
         }
 
@@ -2844,16 +3191,22 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             if let Some(info) = &is_info {
                 self.spec_scratch.clone_from(&base_spec);
                 for gr in 0..n_granules {
+                    let layout = if gr_is_short(gr) {
+                        &self.short_layout
+                    } else {
+                        &self.layout
+                    };
                     let (a, b) = self.spec_scratch.split_at_mut(2);
                     apply_intensity(
                         &lr_spec[gr],
                         &lr_spec[2 + gr],
                         &mut a[gr],
                         &mut b[gr],
-                        &self.layout,
-                        info.from[gr],
+                        layout,
+                        &info.from[gr],
                         &info.pos[gr],
                         ms,
+                        info.lsf.map(|c| c.sh),
                     );
                 }
             }
@@ -2872,16 +3225,24 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             let mut moved = false;
             if let Some(info) = &mut is_info {
                 for gr in 0..n_granules {
+                    let layout = if gr_is_short(gr) {
+                        &self.short_layout
+                    } else {
+                        &self.layout
+                    };
                     let top = intensity_top_band(
                         &plans[gr * 2 + 1],
                         &self.spec_scratch[2 + gr],
-                        &self.layout,
+                        layout,
                         ms,
                     );
-                    let wanted = (top + 1) as usize;
-                    if wanted < info.from[gr] {
-                        info.from[gr] = wanted;
-                        moved = true;
+                    let windows = if layout.short { 3 } else { 1 };
+                    for (w, &t) in top.iter().enumerate().take(windows) {
+                        let wanted = (t + 1) as usize;
+                        if wanted < info.from[gr][w] {
+                            info.from[gr][w] = wanted;
+                            moved = true;
+                        }
                     }
                 }
             }
@@ -2930,7 +3291,12 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 };
                 let _ = plan.block_type;
                 let before = mw.bit_pos;
-                emit_granule_data(&mut mw, plan, &spec, layout, ms, lsf);
+                let lsf_is = if ch == 1 {
+                    is_info.as_ref().and_then(|i| i.lsf)
+                } else {
+                    None
+                };
+                emit_granule_data(&mut mw, plan, &spec, layout, ms, lsf, lsf_is);
                 debug_assert_eq!(
                     (mw.bit_pos - before) as u64,
                     plan.part2_3_length as u64,
@@ -3070,6 +3436,7 @@ fn transmitted_sfac(plan: &GranulePlan, band: usize) -> u8 {
 /// Writes one granule/channel's complete main data (scalefactors, big_values
 /// pairs through the three Huffman regions, count1 quads) exactly as the
 /// decoder reads it.
+#[allow(clippy::too_many_arguments)]
 fn emit_granule_data(
     bw: &mut BitWriter,
     plan: &GranulePlan,
@@ -3077,6 +3444,7 @@ fn emit_granule_data(
     layout: &BandLayout,
     ms_stereo: bool,
     lsf: bool,
+    lsf_is: Option<LsfIsConfig>,
 ) {
     let gains = band_gains(
         plan.global_gain,
@@ -3110,7 +3478,12 @@ fn emit_granule_data(
             }
         }
     } else if lsf {
-        let (sizes, counts) = lsf_sf_layout(plan.scalefac_compress, plan.block_type == 2);
+        let (sizes, counts) = match lsf_is {
+            // The intensity channel's positions ride the preselected
+            // partition, not the compress value's own one.
+            Some(cfg) => (cfg.sizes, cfg.counts),
+            None => lsf_sf_layout(plan.scalefac_compress, plan.block_type == 2),
+        };
         let mut band = 0usize;
         for (&w, &c) in sizes.iter().zip(counts.iter()) {
             for _ in 0..c {
@@ -3171,15 +3544,17 @@ fn emit_granule_data(
 /// Re-measures a plan's exact `part2_3_length` by writing it into a scratch
 /// writer (used only by the rare trim backstop, where a plan's tail had to
 /// be cut after the fact).
+#[allow(clippy::too_many_arguments)]
 fn measure_plan(
     plan: &GranulePlan,
     spec: &[f32; GRANULE_SAMPLES],
     layout: &BandLayout,
     ms_stereo: bool,
     lsf: bool,
+    lsf_is: Option<LsfIsConfig>,
 ) -> u64 {
     let mut scratch = BitWriter::new();
-    emit_granule_data(&mut scratch, plan, spec, layout, ms_stereo, lsf);
+    emit_granule_data(&mut scratch, plan, spec, layout, ms_stereo, lsf, lsf_is);
     scratch.bit_pos as u64
 }
 
@@ -4147,7 +4522,7 @@ mod tests {
         let mut plan = cost.plan;
         assert!(plan.block_type == 2, "planner must keep the short layout");
         while plan.big_values > 0 || plan.count1_quads > 0 {
-            if measure_plan(&plan, &spec, &layout, false, false) <= budget {
+            if measure_plan(&plan, &spec, &layout, false, false, None) <= budget {
                 break;
             }
             if plan.count1_quads > 0 {
@@ -4156,10 +4531,11 @@ mod tests {
                 plan.big_values -= 1;
             }
         }
-        plan.part2_3_length = measure_plan(&plan, &spec, &layout, false, false).min(4095) as u16;
+        plan.part2_3_length =
+            measure_plan(&plan, &spec, &layout, false, false, None).min(4095) as u16;
 
         let mut bw = BitWriter::new();
-        emit_granule_data(&mut bw, &plan, &spec, &layout, false, false);
+        emit_granule_data(&mut bw, &plan, &spec, &layout, false, false, None);
         assert_eq!(bw.bit_pos as u64, plan.part2_3_length as u64);
 
         let info = crate::sideinfo::GranuleInfo {
@@ -4277,7 +4653,7 @@ mod tests {
         );
         let mut plan = cost.plan;
         while plan.big_values > 0 || plan.count1_quads > 0 {
-            if measure_plan(&plan, &spec, &layout, false, false) <= budget {
+            if measure_plan(&plan, &spec, &layout, false, false, None) <= budget {
                 break;
             }
             if plan.count1_quads > 0 {
@@ -4286,11 +4662,12 @@ mod tests {
                 plan.big_values -= 1;
             }
         }
-        plan.part2_3_length = measure_plan(&plan, &spec, &layout, false, false).min(4095) as u16;
+        plan.part2_3_length =
+            measure_plan(&plan, &spec, &layout, false, false, None).min(4095) as u16;
         assert!(plan.part2_3_length as u64 <= budget, "budget exceeded");
 
         let mut bw = BitWriter::new();
-        emit_granule_data(&mut bw, &plan, &spec, &layout, false, false);
+        emit_granule_data(&mut bw, &plan, &spec, &layout, false, false, None);
         assert_eq!(bw.bit_pos as u64, plan.part2_3_length as u64);
 
         let info = crate::sideinfo::GranuleInfo {

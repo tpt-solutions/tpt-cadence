@@ -1,6 +1,6 @@
 [package]
 name = "tpt-av-cadence-vorbis"
-description = "Ogg Vorbis I decoder for the tpt-cadence audio codec suite."
+description = "Ogg Vorbis I decoder and encoder for the tpt-cadence audio codec suite."
 readme = "README.md"
 keywords = ["audio", "vorbis", "ogg", "codec", "decoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]

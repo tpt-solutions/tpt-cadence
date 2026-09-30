@@ -93,6 +93,10 @@ pub(crate) fn decode_scalefactors(
     let scf_shift = gr.scalefac_scale + 1;
     let mut scfsi = gr.scfsi as i32;
     // Byte offset into the flat partition array (nonzero only for LSF).
+    // `k` walks the `SCF_MOD` digit rows; the count groups are read from
+    // the row ONE GROUP LATER (the post-increment `k`), matching the
+    // reference's flat-table arrangement — the intensity count rows sit
+    // one group after their mod row.
     let mut k = 0usize;
 
     if hdr.mpeg1 {
