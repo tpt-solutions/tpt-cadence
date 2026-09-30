@@ -3799,11 +3799,24 @@ LAME tags) is complete; the only caveat is confirming patent status before
 any commercial distribution.
 
 Open work:
-1. **LSF short-block defect** — repeated attack/bridge cycles in the plain
-   MPEG-2/2.5 short-block path make this crate's decoder and FFmpeg disagree
-   on our own bytes (29-45 dB per-frame SNR). Repro and bisect plan are in
-   the "MP3 intensity stereo extended to LSF" session log above.
-2. **Release prep** — commit and push the working tree (master is ahead of
-   origin), run `tools/release_prep.py --prepare 0.1.0`, tag, push the tag.
-3. **Future enhancements (not blocking 0.1.0)** — Vorbis block switching,
+1. **Release prep** — the working tree is clean and the session's work is
+   committed (`ec068b9`), but master is 7 commits ahead of `origin`. Push
+   master, run `tools/release_prep.py --prepare 0.1.0`, tag, push the tag.
+   (The script only writes a local patch: it never commits, tags, or pushes.)
+2. **Future enhancements (not blocking 0.1.0)** — Vorbis block switching,
    per-file adaptive Huffman books, and a real psychoacoustic model.
+
+Closed since this list was written: the **LSF short-block defect** — repeated
+attack/bridge cycles in the plain MPEG-2/2.5 short-block path made this
+crate's decoder and FFmpeg disagree on our own bytes (22-45 dB per-frame SNR
+on alternating click cycles). Root-caused and fixed in the 2026-09-30 fourth
+session: the window-sequence cross-frame `next_attack` lookahead measured a
+different quantity than the granule-0 detector it was predicting, so the
+mandatory zero-line stop was dropped and the encoder emitted a bare
+`long -> short` transition. Gated by `lsf_repeated_transients_agree_with_ffmpeg`
+at 101.9 dB worst-per-granule. Re-verified by reverting each of the three
+claimed fixes: only the stale-baseline one (compare against the *current*
+frame's back half, not the previous frame's stored value) reproduces the
+defect on the dual-mono click train; the measurement-domain and shared
+per-channel-verdict fixes are hardening for asymmetric stereo, not what
+cured this repro.
