@@ -22,6 +22,7 @@ mod fft;
 mod floor;
 mod header;
 mod mdct;
+mod psy;
 mod residue;
 
 use std::io::Read;

@@ -1,24 +1,34 @@
 //! Ogg Vorbis I encoder.
 //!
-//! A deliberately compact, fixed-configuration encoder built on the
-//! decoder's own parsed structures:
+//! A compact, fixed-configuration encoder built on the decoder's own parsed
+//! structures:
 //!
-//! - **One block size** (2048 samples, 1024 new samples per packet), one
-//!   mode, one mapping; stereo uses square-polar channel coupling.
-//! - **Floor 1** with 34 posts (multiplier 2, range 128) fitted to the
-//!   smoothed spectral envelope minus a quality-dependent offset. The
-//!   encoder writes each floor, then decodes it back through the real
-//!   [`Floor1::decode`] so the residue is computed against the *exact*
-//!   curve the decoder will apply.
+//! - **Two block sizes with block switching**: long (2048 samples) and short
+//!   (256) blocks, two modes and two mappings (one per size). A transient
+//!   detector (highpassed energy rise over the region the next long block
+//!   would newly cover) starts a run of short blocks that walks up to the
+//!   attack and ends after it; the Vorbis window shapes (long slopes next to
+//!   long blocks, short slopes next to short ones) follow from each block's
+//!   neighbours. Stereo uses square-polar channel coupling.
+//! - **Floor 1** (34 posts for long blocks, 16 for short) fitted to a
+//!   masking threshold minus a quality-dependent offset. The encoder writes
+//!   each floor, then decodes it back through the real [`Floor1::decode`] so
+//!   the residue is computed against the *exact* curve the decoder will
+//!   apply.
 //! - **Residue type 1** with four partition classes (silent / +-1 / +-5 /
 //!   coarse+fine cascade) coded through static Huffman-shaped VQ books.
 //! - Codebooks, floor and residue configuration are written into the setup
 //!   header and immediately parsed back with [`parse_setup`], so an
 //!   internally inconsistent header fails at construction, not in a player.
 //!
-//! Quality is a constant band-SNR model (the floor tracks the spectral
-//! envelope), with a lowpass and an absolute floor floor; there is no
-//! masking model yet.
+//! Noise shaping follows a psychoacoustic model (`psy`): Bark-band power
+//! and spectral flatness, Schroeder spreading, tonality-dependent masking
+//! offsets and the absolute threshold of hearing, floored per bin and turned
+//! into floor-1 post targets. It is a standard model with unvalidated
+//! constants — no listening tests back it — and an objective band-SNR proxy
+//! puts it level with the envelope-tracking rule it replaced, so treat the
+//! quality ladder as calibrated for bitrate, not proven perceptually.
+//! Per-file adaptive Huffman books remain future work.
 //!
 //! Stream layout: one Ogg packet per page (`OggPageWriter`), granule
 //! positions trimming the final packet to the exact input length.
@@ -34,20 +44,23 @@ use crate::bitreader::BitReader;
 use crate::fft::{Fft, C};
 use crate::floor::{Floor, Floor1, FLOOR1_INVERSE_DB};
 use crate::header::{parse_id, parse_setup, Setup};
+use crate::psy::Psy;
 
-const BS_EXP: u32 = 11;
-const N: usize = 1 << BS_EXP;
+const BS_LONG_EXP: u32 = 11;
+const BS_SHORT_EXP: u32 = 8;
+/// Long block size / coefficient count.
+const N: usize = 1 << BS_LONG_EXP;
 const M: usize = N / 2;
+/// Short block size / coefficient count.
+const SN: usize = 1 << BS_SHORT_EXP;
+const SM: usize = SN / 2;
 const FLOOR_RANGE: i32 = 128;
 const FLOOR_RANGE_BITS: u32 = 7;
-/// Exponent blending the floor between tracking the local envelope (1.0,
-/// constant band SNR) and a flat absolute noise level (0.0, minimum MSE):
-/// noise follows the spectrum partially, as masking does.
-const FLOOR_ALPHA: f32 = 0.7;
+/// Floor step-to-mask ratio (dB) at quality 0, and its decrease per quality
+/// step. Calibrated so the quality ladder spans roughly 60-180 kbps.
+const FLOOR_GAIN_DB_Q0: f64 = 12.0;
+const FLOOR_GAIN_DB_PER_Q: f64 = 2.0;
 const SERIAL: u32 = 0x5450_5456;
-/// Forward MDCT scale: makes the decoder's unnormalized IMDCT + window
-/// overlap-add reconstruct unity gain.
-const MDCT_SCALE: f32 = 4.0 / N as f32;
 /// Residue partition size and class count.
 const PARTITION: usize = 16;
 const CLASSES: usize = 4;
@@ -59,6 +72,9 @@ const POSTS: [u32; 32] = [
     3, 6, 9, 12, 16, 20, 24, 28, 34, 40, 48, 56, 64, 74, 86, 100, 116, 134, 156, 180, 210, 244,
     284, 330, 384, 448, 520, 600, 690, 790, 900, 1010,
 ];
+
+/// Floor post positions for the short block size (end post is `SM`).
+const SHORT_POSTS: [u32; 16] = [2, 4, 6, 8, 10, 13, 16, 20, 25, 31, 38, 47, 58, 72, 90, 110];
 
 // Codebook indices in the setup header.
 const BOOK_FLOOR: usize = 0;
@@ -308,6 +324,99 @@ fn header_packet(kind: u8, body: &[u8]) -> Vec<u8> {
     p
 }
 
+/// Vorbis window slope (`length` samples rising from 0 to 1).
+fn slope(length: usize) -> Vec<f32> {
+    (0..length)
+        .map(|i| {
+            let s = (std::f64::consts::PI * (i as f64 + 0.5) / (2.0 * length as f64)).sin();
+            (0.5 * std::f64::consts::PI * s * s).sin() as f32
+        })
+        .collect()
+}
+
+/// Forward MDCT for one block size.
+struct Transform {
+    n: usize,
+    fft: Fft,
+    pre: Vec<C>,
+    post: Vec<C>,
+}
+
+impl Transform {
+    fn new(n: usize) -> Self {
+        let nf = n as f64;
+        let pre = (0..n)
+            .map(|k| {
+                let a = -std::f64::consts::PI * k as f64 / nf;
+                C::new(a.cos() as f32, a.sin() as f32)
+            })
+            .collect();
+        let n0 = 0.5 + nf / 4.0;
+        let post = (0..n / 2)
+            .map(|k| {
+                let a = -2.0 * std::f64::consts::PI * n0 * (k as f64 + 0.5) / nf;
+                C::new(a.cos() as f32, a.sin() as f32)
+            })
+            .collect();
+        Transform {
+            n,
+            fft: Fft::new(n, true),
+            pre,
+            post,
+        }
+    }
+
+    /// MDCT of `n` already-windowed samples into `n / 2` coefficients.
+    fn forward(&mut self, x: &[f32], out: &mut [f32]) {
+        let n = self.n;
+        let scale = 4.0 / n as f32;
+        let mut g = vec![C::default(); n];
+        for k in 0..n {
+            g[k] = C::new(x[k] * self.pre[k].re, x[k] * self.pre[k].im);
+        }
+        let mut o = vec![C::default(); n];
+        self.fft.run(&g, &mut o);
+        for k in 0..n / 2 {
+            out[k] = scale * (o[k].re * self.post[k].re - o[k].im * self.post[k].im);
+        }
+    }
+}
+
+/// Which block is being coded and how its neighbors are sized (the
+/// neighbors decide the window shape).
+#[derive(Clone, Copy)]
+struct BlockSpec {
+    long: bool,
+    prev_long: bool,
+    next_long: bool,
+}
+
+/// MDCT coefficient amplitude of a full-scale sine in a long block (the
+/// 96 dB SPL reference of the masking model): the maximum over a few tone
+/// phases.
+fn full_scale_amplitude(tr: &mut Transform, long_slope: &[f32]) -> f64 {
+    let n = tr.n;
+    let mut best = 0.0f32;
+    for phase in 0..8 {
+        let ph = phase as f64 * std::f64::consts::PI / 8.0;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let w = if i < n / 2 {
+                    long_slope[i]
+                } else {
+                    long_slope[n - 1 - i]
+                };
+                let t = 2.0 * std::f64::consts::PI * 44.5 * (i as f64 + 0.5) / n as f64;
+                w * (t + ph).sin() as f32
+            })
+            .collect();
+        let mut out = vec![0.0f32; n / 2];
+        tr.forward(&x, &mut out);
+        best = best.max(out.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+    }
+    f64::from(best)
+}
+
 /// Ogg Vorbis encoder.
 pub struct VorbisEncoder<W: Write + Send> {
     sink: W,
@@ -319,24 +428,93 @@ pub struct VorbisEncoder<W: Write + Send> {
     b1: VqBook,
     b2: VqBook,
     b3: VqBook,
-    fft: Fft,
-    pre: Vec<C>,
-    post: Vec<C>,
-    window: Vec<f32>,
-    /// Floor offset below the envelope, as an amplitude ratio.
+    /// `[short, long]` transforms and window slopes.
+    transforms: [Transform; 2],
+    slopes: [Vec<f32>; 2],
+    /// Masking model deriving per-bin noise thresholds from each spectrum.
+    psy: Psy,
+    /// Floor amplitude relative to the masking threshold's amplitude
+    /// (quantization-step-to-mask ratio; lower = finer quantization).
     floor_gain: f32,
-    alpha: f32,
-    /// Absolute noise level the floor is pulled toward (amplitude).
-    floor_d: f32,
-    /// First bin forced to zero (lowpass).
+    /// First bin forced to zero (lowpass) for the long block size.
     cutoff_bin: usize,
+    /// Input history; `inbuf[c][0]` sits at absolute (padded) index
+    /// `buf_start`. Absolute index 0 is `M` samples before the first real
+    /// sample, so the first (long) block's center is the first real sample.
     inbuf: Vec<Vec<f32>>,
+    buf_start: usize,
+    /// Absolute index of the next block's center.
+    center: usize,
+    cur_long: bool,
+    prev_long: bool,
     /// Frames submitted so far.
     total_in: u64,
     /// Packets emitted so far.
     packets: u64,
     pending: Option<(Vec<u8>, i64)>,
     finished: bool,
+    /// Set once the packet whose granule reaches `total_in` was emitted.
+    done: bool,
+    /// Blocks coded short so far.
+    short_blocks: u64,
+}
+
+/// Samples of look-ahead past a block's boundary point used by the
+/// transient detector.
+const LOOKAHEAD: usize = 1088;
+/// Transient detector sub-block length.
+const DET_BLOCK: usize = 64;
+
+/// Writes one floor-1 configuration (4 posts per partition).
+fn write_floor_config(s: &mut BitWriter, posts: &[u32], rangebits: u32) {
+    s.write(1, 16); // floor type 1
+    s.write(posts.len() as u32 / 4, 5); // partitions
+    for _ in 0..posts.len() / 4 {
+        s.write(0, 4); // all class 0
+    }
+    s.write(3, 3); // class dimension 4
+    s.write(0, 2); // no subclasses
+    s.write(BOOK_FLOOR as u32 + 1, 8);
+    s.write(1, 2); // multiplier 2
+    s.write(rangebits, 4);
+    for &x in posts {
+        s.write(x, rangebits);
+    }
+}
+
+/// Writes one residue-1 configuration covering `end` coefficients.
+fn write_residue_config(s: &mut BitWriter, end: usize) {
+    s.write(1, 16);
+    s.write(0, 24);
+    s.write(end as u32, 24);
+    s.write(PARTITION as u32 - 1, 24);
+    s.write(CLASSES as u32 - 1, 6);
+    s.write(BOOK_CLASS as u32, 8);
+    for cascade in [0u32, 1, 1, 3] {
+        s.write(cascade, 3);
+        s.write(0, 1);
+    }
+    for book in [BOOK_B1, BOOK_B2, BOOK_B3, BOOK_B2] {
+        s.write(book as u32, 8);
+    }
+}
+
+/// Writes one mapping-0 configuration using `floor`/`residue`.
+fn write_mapping_config(s: &mut BitWriter, ch: usize, floor: u32, residue: u32) {
+    s.write(0, 16);
+    s.write(0, 1); // one submap
+    if ch == 2 {
+        s.write(1, 1);
+        s.write(0, 8); // one coupling step
+        s.write(0, 1); // magnitude = channel 0
+        s.write(1, 1); // angle = channel 1
+    } else {
+        s.write(0, 1);
+    }
+    s.write(0, 2);
+    s.write(0, 8);
+    s.write(floor, 8);
+    s.write(residue, 8);
 }
 
 impl<W: Write + Send> VorbisEncoder<W> {
@@ -375,7 +553,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
         id.write(0, 32);
         id.write(0, 32);
         id.write(0, 32);
-        id.write(BS_EXP | (BS_EXP << 4), 8);
+        id.write(BS_SHORT_EXP | (BS_LONG_EXP << 4), 8);
         id.write(1, 1);
         let id_packet = header_packet(1, &id.finish());
 
@@ -400,58 +578,26 @@ impl<W: Write + Send> VorbisEncoder<W> {
         write_vq_book(&mut s, &b3);
         s.write(0, 6); // one time-domain placeholder
         s.write(0, 16);
-        // Floor 1.
-        s.write(0, 6);
-        s.write(1, 16);
-        s.write(8, 5); // partitions
-        for _ in 0..8 {
-            s.write(0, 4); // all class 0
+        // Floors: 0 = long block, 1 = short block.
+        s.write(1, 6);
+        write_floor_config(&mut s, &POSTS, 10);
+        write_floor_config(&mut s, &SHORT_POSTS, 7);
+        // Residues: 0 = long, 1 = short.
+        s.write(1, 6);
+        write_residue_config(&mut s, M);
+        write_residue_config(&mut s, SM);
+        // Mappings: 0 = long, 1 = short.
+        s.write(1, 6);
+        write_mapping_config(&mut s, ch, 0, 0);
+        write_mapping_config(&mut s, ch, 1, 1);
+        // Modes: 0 = short block (mapping 1), 1 = long block (mapping 0).
+        s.write(1, 6);
+        for (blockflag, mapping) in [(0u32, 1u32), (1, 0)] {
+            s.write(blockflag, 1);
+            s.write(0, 16);
+            s.write(0, 16);
+            s.write(mapping, 8);
         }
-        s.write(3, 3); // class dimension 4
-        s.write(0, 2); // no subclasses
-        s.write(BOOK_FLOOR as u32 + 1, 8);
-        s.write(1, 2); // multiplier 2
-        s.write(10, 4); // rangebits: posts up to 1023, end at 1024
-        for &x in &POSTS {
-            s.write(x, 10);
-        }
-        // Residue 1.
-        s.write(0, 6);
-        s.write(1, 16);
-        s.write(0, 24);
-        s.write(M as u32, 24);
-        s.write(PARTITION as u32 - 1, 24);
-        s.write(CLASSES as u32 - 1, 6);
-        s.write(BOOK_CLASS as u32, 8);
-        for cascade in [0u32, 1, 1, 3] {
-            s.write(cascade, 3);
-            s.write(0, 1);
-        }
-        for book in [BOOK_B1, BOOK_B2, BOOK_B3, BOOK_B2] {
-            s.write(book as u32, 8);
-        }
-        // Mapping 0.
-        s.write(0, 6);
-        s.write(0, 16);
-        s.write(0, 1); // one submap
-        if ch == 2 {
-            s.write(1, 1);
-            s.write(0, 8); // one coupling step
-            s.write(0, 1); // magnitude = channel 0
-            s.write(1, 1); // angle = channel 1
-        } else {
-            s.write(0, 1);
-        }
-        s.write(0, 2);
-        s.write(0, 8);
-        s.write(0, 8);
-        s.write(0, 8);
-        // Mode 0: short-flag block, mapping 0.
-        s.write(0, 6);
-        s.write(0, 1);
-        s.write(0, 16);
-        s.write(0, 16);
-        s.write(0, 8);
         s.write(1, 1);
         let setup_packet = header_packet(5, &s.finish());
 
@@ -463,29 +609,11 @@ impl<W: Write + Send> VorbisEncoder<W> {
         sink.write_all(&page_writer.write_page(&comment_packet, 0, false, false))?;
         sink.write_all(&page_writer.write_page(&setup_packet, 0, false, false))?;
 
-        // --- Transform tables ---
-        let nf = N as f64;
-        let pre = (0..N)
-            .map(|n| {
-                let a = -std::f64::consts::PI * n as f64 / nf;
-                C::new(a.cos() as f32, a.sin() as f32)
-            })
-            .collect();
-        let n0 = 0.5 + nf / 4.0;
-        let post = (0..M)
-            .map(|k| {
-                let a = -2.0 * std::f64::consts::PI * n0 * (k as f64 + 0.5) / nf;
-                C::new(a.cos() as f32, a.sin() as f32)
-            })
-            .collect();
-        let window = (0..N)
-            .map(|n| {
-                let s = (std::f64::consts::PI * (n as f64 + 0.5) / nf).sin();
-                (0.5 * std::f64::consts::PI * s * s).sin() as f32
-            })
-            .collect();
-
-        let snr_db = -8.0 + 1.6 * f64::from(quality);
+        let mut transforms = [Transform::new(SN), Transform::new(N)];
+        let slopes = [slope(SM), slope(M)];
+        let amp_ref = full_scale_amplitude(&mut transforms[1], &slopes[1]);
+        let psy = Psy::new(sample_rate, amp_ref, SM, M);
+        let gain_db = FLOOR_GAIN_DB_Q0 - FLOOR_GAIN_DB_PER_Q * f64::from(quality);
         let cutoff_hz = 12_000.0 + 1_000.0 * f64::from(quality);
         let cutoff_bin = ((cutoff_hz / (f64::from(sample_rate) / 2.0)) * M as f64) as usize;
 
@@ -499,50 +627,110 @@ impl<W: Write + Send> VorbisEncoder<W> {
             b1,
             b2,
             b3,
-            fft: Fft::new(N, true),
-            pre,
-            post,
-            window,
-            floor_gain: 10f64.powf(-snr_db / 20.0) as f32,
-            alpha: FLOOR_ALPHA,
-            floor_d: 10f32.powf(-(50.0 + 1.5 * quality) / 20.0),
+            transforms,
+            slopes,
+            psy,
+            floor_gain: 10f64.powf(gain_db / 20.0) as f32,
             cutoff_bin: cutoff_bin.min(M),
             inbuf: vec![vec![0.0; M]; ch],
+            buf_start: 0,
+            center: M,
+            cur_long: true,
+            prev_long: true,
             total_in: 0,
             packets: 0,
             pending: None,
             finished: false,
+            done: false,
+            short_blocks: 0,
         })
     }
 
-    /// Windowed forward MDCT of `N` samples into `M` coefficients.
-    fn mdct(&mut self, x: &[f32], out: &mut [f32]) {
-        let mut g = vec![C::default(); N];
-        for n in 0..N {
-            let z = x[n] * self.window[n];
-            g[n] = C::new(z * self.pre[n].re, z * self.pre[n].im);
-        }
-        let mut o = vec![C::default(); N];
-        self.fft.run(&g, &mut o);
-        for k in 0..M {
-            out[k] = MDCT_SCALE * (o[k].re * self.post[k].re - o[k].im * self.post[k].im);
-        }
+    /// Number of blocks coded with the short block size so far.
+    pub fn short_block_count(&self) -> u64 {
+        self.short_blocks
     }
 
-    /// Floor 1 post values (`Y` per x-list entry) for a spectrum.
-    fn fit_floor(&self, spec: &[f32]) -> Vec<i32> {
-        let f1 = self.floor1();
+    /// The Vorbis window for a block of the given size and neighbors.
+    fn window(&self, spec: BlockSpec) -> Vec<f32> {
+        let n = if spec.long { N } else { SN };
+        let half = n / 2;
+        let mut w = vec![0.0f32; n];
+        // A long block next to a short one uses the short slope on that
+        // side (centered at a quarter of the block); every other side uses
+        // the block's own full-width slope.
+        let fill = |out: &mut [f32], neighbor_long: bool| {
+            let sl = if spec.long && neighbor_long {
+                &self.slopes[1]
+            } else {
+                &self.slopes[0]
+            };
+            let start = n / 4 - sl.len() / 2;
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = if i < start {
+                    0.0
+                } else if i >= start + sl.len() {
+                    1.0
+                } else {
+                    sl[i - start]
+                };
+            }
+        };
+        fill(&mut w[..half], spec.prev_long);
+        let mut right = vec![0.0f32; half];
+        fill(&mut right, spec.next_long);
+        for (j, &v) in right.iter().enumerate() {
+            w[n - 1 - j] = v;
+        }
+        w
+    }
+
+    /// True when a sharp energy rise sits in the region the *next* block
+    /// would newly cover, starting at boundary point `b`.
+    fn attack_ahead(&self, b: usize) -> bool {
+        let from = b - 256;
+        let count = (b + LOOKAHEAD - from) / DET_BLOCK;
+        let mut energy = vec![0.0f32; count];
+        for (k, e) in energy.iter_mut().enumerate() {
+            let s0 = from + k * DET_BLOCK - self.buf_start;
+            let mut acc = 0.0f32;
+            for i in s0..s0 + DET_BLOCK {
+                let mut hp = 0.0f32;
+                for c in 0..self.channels {
+                    hp += self.inbuf[c][i] - self.inbuf[c][i - 1];
+                }
+                acc += hp * hp;
+            }
+            *e = acc;
+        }
+        let abs_floor = DET_BLOCK as f32 * 1e-4;
+        // Sub-blocks 3.. cover [b - 64, ...): where a short block's
+        // support could begin.
+        (3..count).any(|k| {
+            let prev = (energy[k - 3] + energy[k - 2] + energy[k - 1]) / 3.0;
+            energy[k] > 10.0 * prev + abs_floor
+        })
+    }
+
+    /// Floor 1 post values (`Y` per x-list entry) for a spectrum of `m`
+    /// coefficients.
+    fn fit_floor(&self, thr: &[f32], floor_idx: usize) -> Vec<i32> {
+        let m = thr.len();
+        let f1 = self.floor1(floor_idx);
+        let min_hw = if m == M { 3 } else { 1 };
         f1.x.iter()
             .map(|&x| {
                 let pos = x as usize;
-                let hw = (pos / 5).max(3);
-                let lo = pos.saturating_sub(hw).min(M - 1);
-                let hi = (pos + hw).min(M - 1);
-                let e: f32 =
-                    spec[lo..=hi].iter().map(|v| v * v).sum::<f32>() / (hi - lo + 1) as f32;
-                let target = ((e.sqrt().max(1e-9) * self.floor_gain).powf(self.alpha)
-                    * self.floor_d.powf(1.0 - self.alpha))
-                .max(1e-5);
+                let hw = (pos / 5).max(min_hw);
+                let lo = pos.saturating_sub(hw).min(m - 1);
+                let hi = (pos + hw).min(m - 1);
+                // Log-mean masking power over the post's neighbourhood.
+                let log_mean = thr[lo..=hi]
+                    .iter()
+                    .map(|v| f64::from(v.max(1e-20)).ln())
+                    .sum::<f64>()
+                    / (hi - lo + 1) as f64;
+                let target = (log_mean.exp().sqrt() as f32 * self.floor_gain).max(1e-5);
                 let idx = FLOOR1_INVERSE_DB.partition_point(|&t| t < target);
                 let idx = if idx > 0
                     && idx < 256
@@ -557,16 +745,16 @@ impl<W: Write + Send> VorbisEncoder<W> {
             .collect()
     }
 
-    fn floor1(&self) -> &Floor1 {
-        match &self.setup.floors[0] {
+    fn floor1(&self, idx: usize) -> &Floor1 {
+        match &self.setup.floors[idx] {
             Floor::One(f) => f,
             Floor::Zero(_) => unreachable!("setup declares floor 1"),
         }
     }
 
     /// Serializes floor 1 for post values `y` (audible-channel flag set).
-    fn write_floor(&self, bw: &mut BitWriter, y: &[i32]) {
-        let f1 = self.floor1();
+    fn write_floor(&self, bw: &mut BitWriter, y: &[i32], floor_idx: usize) {
+        let f1 = self.floor1(floor_idx);
         bw.write(1, 1);
         bw.write(y[0] as u32, FLOOR_RANGE_BITS);
         bw.write(y[1] as u32, FLOOR_RANGE_BITS);
@@ -596,34 +784,55 @@ impl<W: Write + Send> VorbisEncoder<W> {
         }
     }
 
-    /// Encodes one block from the first `N` samples of each channel buffer.
-    fn encode_block(&mut self) -> Vec<u8> {
+    /// Encodes the block centered at `self.center`.
+    fn encode_block(&mut self, spec: BlockSpec) -> Vec<u8> {
         let ch = self.channels;
+        let (n, m, fidx) = if spec.long { (N, M, 0) } else { (SN, SM, 1) };
+        let cutoff = if spec.long {
+            self.cutoff_bin
+        } else {
+            (self.cutoff_bin * SM).div_ceil(M)
+        };
         let mut pkt = BitWriter::default();
         pkt.write(0, 1); // audio packet
+        pkt.write(u32::from(spec.long), 1); // mode: 0 short, 1 long
+        if spec.long {
+            pkt.write(u32::from(spec.prev_long), 1);
+            pkt.write(u32::from(spec.next_long), 1);
+        }
+
+        let window = self.window(spec);
+        let start = self.center - n / 2 - self.buf_start;
 
         // Analysis + floors.
         let mut res: Vec<Vec<f32>> = Vec::with_capacity(ch);
         for c in 0..ch {
-            let block: Vec<f32> = self.inbuf[c][..N].to_vec();
-            let mut spec = vec![0.0f32; M];
-            self.mdct(&block, &mut spec);
-            let y = self.fit_floor(&spec);
-            self.write_floor(&mut pkt, &y);
+            let windowed: Vec<f32> = self.inbuf[c][start..start + n]
+                .iter()
+                .zip(&window)
+                .map(|(x, w)| x * w)
+                .collect();
+            let mut coefs = vec![0.0f32; m];
+            self.transforms[usize::from(spec.long)].forward(&windowed, &mut coefs);
+            let mut thr = vec![0.0f32; m];
+            self.psy.thresholds(spec.long, &coefs, &mut thr);
+            let y = self.fit_floor(&thr, fidx);
+            self.write_floor(&mut pkt, &y, fidx);
             // Decode the floor back for the exact curve.
             let mut scratch = BitWriter::default();
-            self.write_floor(&mut scratch, &y);
+            self.write_floor(&mut scratch, &y, fidx);
             let bytes = scratch.finish();
             let mut br = BitReader::new(&bytes);
-            let mut curve = vec![0.0f32; M];
-            self.floor1()
-                .decode(&self.setup.codebooks, &mut br, &mut curve, M)
+            let mut curve = vec![0.0f32; m];
+            self.floor1(fidx)
+                .decode(&self.setup.codebooks, &mut br, &mut curve, m)
                 .expect("self-written floor decodes");
             res.push(
-                spec.iter()
+                coefs
+                    .iter()
                     .zip(&curve)
                     .enumerate()
-                    .map(|(k, (&s, &f))| if k < self.cutoff_bin { s / f } else { 0.0 })
+                    .map(|(k, (&s, &f))| if k < cutoff { s / f } else { 0.0 })
                     .collect(),
             );
         }
@@ -636,12 +845,12 @@ impl<W: Write + Send> VorbisEncoder<W> {
                     l.round().clamp(-250.0, 250.0),
                     r.round().clamp(-250.0, 250.0),
                 );
-                let (m, ang) = if lq.abs() > rq.abs() {
+                let (mag, ang) = if lq.abs() > rq.abs() {
                     (lq, if lq > 0.0 { lq - rq } else { rq - lq })
                 } else {
                     (rq, if rq > 0.0 { lq - rq } else { rq - lq })
                 };
-                *l = m;
+                *l = mag;
                 *r = ang;
             }
         }
@@ -655,18 +864,18 @@ impl<W: Write + Send> VorbisEncoder<W> {
             .collect();
 
         // Classification.
-        let parts = M / PARTITION;
+        let parts = m / PARTITION;
         let classes: Vec<Vec<usize>> = q
             .iter()
             .map(|v| {
                 (0..parts)
                     .map(|p| {
-                        let m = v[p * PARTITION..(p + 1) * PARTITION]
+                        let mx = v[p * PARTITION..(p + 1) * PARTITION]
                             .iter()
                             .map(|x| x.abs())
                             .max()
                             .unwrap();
-                        match m {
+                        match mx {
                             0 => 0,
                             1 => 1,
                             2..=5 => 2,
@@ -741,20 +950,43 @@ impl<W: Write + Send> VorbisEncoder<W> {
         Ok(())
     }
 
-    /// Encodes every block for which `2 * M` samples are buffered.
+    /// Encodes every block whose input (plus detector look-ahead) is buffered.
     fn drain(&mut self) -> Result<()> {
-        while self.inbuf[0].len() >= N {
-            let packet = self.encode_block();
-            let j = self.packets;
-            self.packets += 1;
-            let granule = if j == 0 {
-                0
-            } else {
-                (j * M as u64).min(self.total_in) as i64
+        while !self.done {
+            let n = if self.cur_long { N } else { SN };
+            let boundary = self.center + n / 4;
+            if self.buf_start + self.inbuf[0].len() < boundary + LOOKAHEAD {
+                break;
+            }
+            let next_long = !self.attack_ahead(boundary);
+            let spec = BlockSpec {
+                long: self.cur_long,
+                prev_long: self.prev_long,
+                next_long,
             };
+            let packet = self.encode_block(spec);
+            if !spec.long {
+                self.short_blocks += 1;
+            }
+            let produced = (self.center - M) as u64;
+            let granule = produced.min(self.total_in) as i64;
+            self.packets += 1;
             self.emit(packet, granule)?;
-            for b in &mut self.inbuf {
-                b.drain(..M);
+            if produced >= self.total_in {
+                self.done = true;
+            }
+            let next_n = if next_long { N } else { SN };
+            self.center += n / 4 + next_n / 4;
+            self.prev_long = self.cur_long;
+            self.cur_long = next_long;
+            // Keep enough history for the next block and the detector.
+            let keep_from = self.center.saturating_sub(N / 2 + 256);
+            if keep_from > self.buf_start {
+                let drop = keep_from - self.buf_start;
+                for b in &mut self.inbuf {
+                    b.drain(..drop);
+                }
+                self.buf_start = keep_from;
             }
         }
         Ok(())
@@ -790,8 +1022,7 @@ impl<W: Write + Send> Encoder for VorbisEncoder<W> {
             return Ok(());
         }
         self.finished = true;
-        let needed = self.total_in.div_ceil(M as u64) + 1;
-        while self.packets < needed {
+        while !self.done {
             for b in &mut self.inbuf {
                 b.resize(b.len() + M, 0.0);
             }
