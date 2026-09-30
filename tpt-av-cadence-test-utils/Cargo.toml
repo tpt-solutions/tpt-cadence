@@ -1,6 +1,7 @@
 [package]
 name = "tpt-av-cadence-test-utils"
 description = "Shared conformance-testing harness for tpt-cadence: FFmpeg comparison, fuzz helpers, and checksum utilities."
+publish = false
 readme = "README.md"
 keywords = ["audio", "testing", "conformance"]
 categories = ["development-tools::testing"]

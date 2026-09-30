@@ -1,7 +1,7 @@
 # tpt-av-cadence-flac
 
-FLAC (lossless, LPC + Rice coding) parser and decoder for the `tpt-cadence`
-audio codec suite.
+FLAC (lossless, LPC + Rice coding) parser, decoder and encoder (`FlacEncoder`) for the
+`tpt-cadence` audio codec suite.
 
 **Status:** ✅ Stable — MD5-verified against the official IETF FLAC decoder
 testbench vectors.
@@ -34,7 +34,7 @@ loop {
 
 Dual-licensed under either of
 
-- Apache License, Version 2.0 ([../LICENSE-APACHE](../LICENSE-APACHE))
-- MIT license ([../LICENSE-MIT](../LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.

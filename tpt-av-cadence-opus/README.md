@@ -49,19 +49,19 @@ autocorrelation, smoothed spectral tilt, harmonic shaping gain and the
 rate/distortion factor — which is worth roughly +1 dB SNR over the
 frame-level gain proxy it replaced; the shaping filter itself is not yet
 closed into the quantizer's error-feedback loop (see
-[`todo.md`](../todo.md) for the measurements). The encoder's simulated
+[`todo.md`](https://github.com/tpt-solutions/tpt-cadence/blob/master/todo.md) for the measurements). The encoder's simulated
 reconstruction is bit-identical to the real decoder's output, which the
 test suite pins for every rate and packet-size combination.
 
 Remaining: the per-frame rate-control ramp, the SILK shaping feedback loop
 and LBRR/FEC/DTX, psychoacoustic-model tuning, and the other format
-encoders — tracked in [`todo.md`](../todo.md) at the repository root.
+encoders — tracked in [`todo.md`](https://github.com/tpt-solutions/tpt-cadence/blob/master/todo.md) at the repository root.
 
 ## License
 
 Dual-licensed under either of
 
-- Apache License, Version 2.0 ([../LICENSE-APACHE](../LICENSE-APACHE))
-- MIT license ([../LICENSE-MIT](../LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.

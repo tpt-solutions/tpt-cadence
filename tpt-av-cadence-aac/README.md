@@ -72,7 +72,7 @@ channel-layout support in the core `StreamInfo`.
 
 Dual-licensed under either of
 
-- Apache License, Version 2.0 ([../LICENSE-APACHE](../LICENSE-APACHE))
-- MIT license ([../LICENSE-MIT](../LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.

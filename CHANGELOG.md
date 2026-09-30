@@ -1,9 +1,8 @@
 # Changelog
 
 All notable changes to `tpt-cadence` are documented here, grouped by dated
-development milestone. The project has not yet published a crates.io release
-(see `todo.md`), so entries are organized by date rather than semantic
-version. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+development milestone. Entries before 0.1.0 are organized by date rather than semantic
+version; 0.1.0 is the first crates.io release. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 

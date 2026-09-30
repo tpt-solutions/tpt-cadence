@@ -2,6 +2,8 @@
 name = "tpt-av-cadence-vorbis"
 description = "Ogg Vorbis I decoder and encoder for the tpt-cadence audio codec suite."
 readme = "README.md"
+# The f32 reference decodes (~12 MB) would push the tarball past crates.io's 10 MiB limit; they stay in the repo.
+exclude = ["tests/data/*.ref"]
 keywords = ["audio", "vorbis", "ogg", "codec", "decoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 version.workspace = true

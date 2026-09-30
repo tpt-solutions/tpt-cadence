@@ -1,6 +1,6 @@
 # tpt-av-cadence-vorbis
 
-Ogg Vorbis I decoder for the `tpt-cadence` audio codec suite, built on the
+Ogg Vorbis I decoder and encoder for the `tpt-cadence` audio codec suite, built on the
 shared `tpt-av-cadence-ogg` page/packet layer.
 
 **Status:** ✅ Conformance-tested. Implemented:
@@ -10,6 +10,7 @@ shared `tpt-av-cadence-ogg` page/packet layer.
   FFT-based synthesis MDCT, FFmpeg-compatible overlap-add, block-size
   switching, granule end-trimming, decode-and-discard seek
 - Core `Decoder`/`FormatReader` impls (`VorbisDecoder`/`VorbisFormatReader`)
+- `VorbisEncoder` (floor 1, coupled residue type 1, quality 0..=10; FFmpeg-verified). Block switching and a psychoacoustic model are future work.
 
 Conformance (`tests/conformance.rs`): six bundled libvorbis fixtures
 (mono/stereo, 32/44.1/48 kHz, quality −1…4, heavy block switching) decode
@@ -21,7 +22,7 @@ seek rejoin, and malformed-input no-panic coverage.
 
 Dual-licensed under either of
 
-- Apache License, Version 2.0 ([../LICENSE-APACHE](../LICENSE-APACHE))
-- MIT license ([../LICENSE-MIT](../LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.

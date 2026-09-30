@@ -52,7 +52,7 @@ by the scale-defect regression).
 ## Usage
 
 The public decoder API follows the same `Decoder`/`FormatReader` shape used
-throughout the suite (see the root [README](../README.md#quickstart) for the
+throughout the suite (see the root [README](https://github.com/tpt-solutions/tpt-cadence/blob/master/README.md#quickstart) for the
 general pattern). Consult `src/lib.rs` in this crate for the exact reader
 type and entry points, as the public API is still settling while conformance
 work continues.
@@ -61,7 +61,7 @@ work continues.
 
 Dual-licensed under either of
 
-- Apache License, Version 2.0 ([../LICENSE-APACHE](../LICENSE-APACHE))
-- MIT license ([../LICENSE-MIT](../LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.

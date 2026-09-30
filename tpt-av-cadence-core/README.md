@@ -29,13 +29,13 @@ fn print_info(info: &StreamInfo) {
 ```
 
 Concrete decoders are provided by the format-specific crates, e.g.
-[`tpt-av-cadence-wav`](../tpt-av-cadence-wav), [`tpt-av-cadence-flac`](../tpt-av-cadence-flac).
+[`tpt-av-cadence-wav`](https://crates.io/crates/tpt-av-cadence-wav), [`tpt-av-cadence-flac`](https://crates.io/crates/tpt-av-cadence-flac).
 
 ## License
 
 Dual-licensed under either of
 
-- Apache License, Version 2.0 ([../LICENSE-APACHE](../LICENSE-APACHE))
-- MIT license ([../LICENSE-MIT](../LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
