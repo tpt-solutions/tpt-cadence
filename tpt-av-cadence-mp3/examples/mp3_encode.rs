@@ -1,12 +1,10 @@
 //! Writes a one-second, 440 Hz sine tone to a 128 kbps stereo MPEG-1 Layer
-//! III (MP3) file:
+//! III (MP3) file with an Info tag (gapless delay/padding):
 //! `cargo run -p tpt-av-cadence-mp3 --example mp3_encode -- tone.mp3`
 //!
-//! See `src/encoder.rs`'s module doc comment for this encoder's reduced
-//! feature scope and known quality limitations. It produces valid, decodable
-//! MP3 streams with active mono and independent-stereo fidelity gates, while
-//! psychoacoustics, reservoir borrowing, short blocks, and stereo coupling
-//! remain out of scope.
+//! The encoder covers MPEG-1/2/2.5 at CBR or VBR, with bit-reservoir
+//! borrowing, window switching, mid/side and intensity stereo. See
+//! `src/encoder.rs`'s module doc comment for its scope.
 
 use std::f32::consts::PI;
 use std::fs::File;
@@ -24,8 +22,8 @@ fn main() {
         .nth(1)
         .expect("usage: mp3_encode <out.mp3>");
     let file = File::create(&path).expect("create output");
-    let mut encoder =
-        Mp3Encoder::new(file, SAMPLE_RATE, CHANNELS, BITRATE_KBPS).expect("open mp3 encoder");
+    let mut encoder = Mp3Encoder::new_cbr_with_info(file, SAMPLE_RATE, CHANNELS, BITRATE_KBPS)
+        .expect("open mp3 encoder");
 
     let frames = SAMPLE_RATE as usize;
     let mut buf = vec![0.0f32; frames * CHANNELS as usize];

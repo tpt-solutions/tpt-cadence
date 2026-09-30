@@ -54,11 +54,12 @@ fn info_tag_cbr_counts_and_toc() {
             data.len(),
             "bytes count must equal the file size"
         );
-        // 2 seconds at 44.1 kHz: 76.5 audio frames + the tag frame; the
-        // finish padding emits the trailing partial frame.
-        let audio_frames = (frames as usize).saturating_sub(1);
+        // 2 seconds at 44.1 kHz: 76.5 audio frames, the trailing partial
+        // frame, and the gapless flush frame. The count excludes the tag
+        // frame itself (LAME/FFmpeg convention).
+        let audio_frames = frames as usize;
         assert!(
-            (75..=78).contains(&audio_frames),
+            (76..=79).contains(&audio_frames),
             "audio frames {audio_frames} out of range for 2 s"
         );
         // TOC: nondecreasing, spans 0..=255.
@@ -115,7 +116,7 @@ fn untagged_constructors_stay_tag_free() {
 }
 
 /// The LAME gapless extension: the 24-bit delay/padding field must parse
-/// back with delay = the measured encoder pipeline delay (574) and padding
+/// back with delay = the measured encoder pipeline delay (528) and padding
 /// = (audio frames)·spf − delay − source pairs, and applying that trim to
 /// our decode must yield exactly the source sample count.
 #[test]
@@ -145,7 +146,7 @@ fn lame_gapless_field_and_trim() {
         | u32::from(data[field + 2]);
     let delay = (v >> 12) as usize;
     let padding = (v & 0xFFF) as usize;
-    assert_eq!(delay, 574, "measured encoder delay");
+    assert_eq!(delay, 528, "measured encoder delay");
     let audio_frames = ((data.len() - 36) / 417).max(1); // CBR 417-byte frames incl. tag
     let expected_pad = (audio_frames * 1152)
         .saturating_sub(delay + src_pairs)
@@ -174,4 +175,28 @@ fn lame_gapless_field_and_trim() {
         src_pairs,
         "gapless trim must recover the exact source sample count"
     );
+}
+
+/// Seeking back to the start must skip the gapless delay again (the front
+/// skip used to be consumed once and never restored).
+#[test]
+fn seek_to_start_repeats_the_gapless_skip() {
+    let sr = 44_100u32;
+    let n = sr as usize; // one second, mono
+    let samples: Vec<f32> = (0..n)
+        .map(|i| 0.4 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin())
+        .collect();
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut enc = Mp3Encoder::new_cbr_with_info(&mut buf, sr, 1, 128).unwrap();
+        enc.encode(&samples).unwrap();
+        Encoder::finish(&mut enc).unwrap();
+    }
+    let mut dec = Mp3Decoder::from_source(Box::new(Cursor::new(buf.into_inner()))).unwrap();
+    let mut first = vec![0.0f32; 2048];
+    assert_eq!(dec.decode(&mut first).unwrap(), 2048);
+    dec.seek(0).unwrap();
+    let mut again = vec![0.0f32; 2048];
+    assert_eq!(dec.decode(&mut again).unwrap(), 2048);
+    assert_eq!(first, again, "seek(0) must reproduce the initial output");
 }

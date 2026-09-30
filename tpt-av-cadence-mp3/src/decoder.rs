@@ -19,6 +19,9 @@ use crate::synth;
 
 /// Bit reservoir cap (`main_data_begin` is 9 bits).
 const MAX_BITRESERVOIR_BYTES: usize = 511;
+/// Samples of decoder synthesis delay that LAME-style gapless trimming removes
+/// on top of the tag's encoder delay (the polyphase synthesis pipeline).
+const DECODER_DELAY: usize = 528 + 1;
 /// Largest legal (non-free-format) Layer III frame payload plus slack.
 const MAX_L3_FRAME_PAYLOAD_BYTES: usize = 1440;
 /// Side information byte sizes, `[mono, stereo]` per row: row 0 is the
@@ -71,6 +74,11 @@ pub struct Mp3Decoder {
     gapless_delay_front: usize,
     /// LAME gapless trim (delay, padding) from a leading Info/Xing tag.
     gapless: Option<(usize, usize)>,
+    /// Front samples to skip at the start of the stream (encoder delay + the
+    /// decoder's own synthesis delay); restored on every seek to the start.
+    gapless_delay_start: usize,
+    /// Total samples the stream decodes to when the tag's frame count is known.
+    gapless_total: Option<u64>,
 
     /// Scratch for decode-and-discard seeking.
     seek_scratch: Box<[f32]>,
@@ -126,6 +134,7 @@ impl Mp3Decoder {
         // ancillary, not audio: decode nothing for it and resume at the
         // first real audio frame, matching FFmpeg's demuxer.
         let mut gapless: Option<(usize, usize)> = None;
+        let mut gapless_total: Option<u64> = None;
         loop {
             let nch: usize = if hdr.mono { 1 } else { 2 };
             let si_len = SIDE_INFO[hdr.mpeg1 as usize][nch - 1];
@@ -150,6 +159,21 @@ impl Mp3Decoder {
                 let padding = (v & 0xFFF) as usize;
                 if delay > 0 || padding > 0 {
                     gapless = Some((delay, padding));
+                    // The tag's frame count (audio frames, tag frame excluded)
+                    // fixes the total output length, so trailing padding may
+                    // span several frames.
+                    if fourcc_off + 12 <= valid {
+                        let be32 = |o: usize| {
+                            u32::from_be_bytes([probe[o], probe[o + 1], probe[o + 2], probe[o + 3]])
+                        };
+                        let flags = be32(fourcc_off + 4);
+                        let frames = u64::from(be32(fourcc_off + 8));
+                        if flags & 1 != 0 && frames > 0 {
+                            let spf: u64 = if hdr.mpeg1 { 1152 } else { 576 };
+                            gapless_total =
+                                Some((frames * spf).saturating_sub((delay + padding) as u64));
+                        }
+                    }
                 }
             }
 
@@ -172,6 +196,11 @@ impl Mp3Decoder {
         // so seek() resets to the real first frame.
         audio_start += off as u64;
         let (gapless_delay, gapless_pad) = gapless.unwrap_or((0, 0));
+        let gapless_delay_start = if gapless_delay > 0 || gapless_pad > 0 {
+            gapless_delay + DECODER_DELAY
+        } else {
+            0
+        };
 
         let channels: usize = if hdr.mono { 1 } else { 2 };
         let info = StreamInfo::new(Format::Mp3, hdr.sample_rate_hz, channels as u16, 16);
@@ -209,7 +238,12 @@ impl Mp3Decoder {
             } else {
                 None
             },
-            gapless_delay_front: gapless_delay,
+            // The tag's delay counts encoder samples only; the decoder's own
+            // synthesis delay (528 + 1 samples) comes off the front too, exactly
+            // as LAME-aware decoders (FFmpeg: `start_pad + 528 + 1`) apply it.
+            gapless_delay_front: gapless_delay_start,
+            gapless_delay_start,
+            gapless_total,
             seek_scratch: vec![0.0f32; channels * 576].into_boxed_slice(),
         })
     }
@@ -229,6 +263,7 @@ impl Mp3Decoder {
         self.staged_frames = 0;
         self.staged_pos = 0;
         self.frames_out = 0;
+        self.gapless_delay_front = self.gapless_delay_start;
         self.window_valid = 0;
         self.window_pos = 0;
         self.source_eof = false;
@@ -330,8 +365,11 @@ impl Mp3Decoder {
                     // LAME end padding: the stream's final frame gives up
                     // its last `padding` samples (the synth pipeline tail
                     // the source never filled).
-                    if let Some((_, pad)) = self.gapless {
+                    if let (Some((_, pad)), None) = (self.gapless, self.gapless_total) {
                         if self.source_eof && self.window_pos >= self.window_valid {
+                            // The tag's padding includes the decoder delay that
+                            // the front skip already consumed.
+                            let pad = pad.saturating_sub(DECODER_DELAY);
                             self.staged_frames -= pad.min(frames);
                         }
                     }
@@ -617,7 +655,10 @@ impl Decoder for Mp3Decoder {
             )));
         }
 
-        let want = buffer.len() / channels;
+        let mut want = buffer.len() / channels;
+        if let Some(total) = self.gapless_total {
+            want = want.min(total.saturating_sub(self.frames_out) as usize);
+        }
         let mut written = 0;
         while written < want {
             if self.staged_pos >= self.staged_frames && !self.decode_next_frame()? {

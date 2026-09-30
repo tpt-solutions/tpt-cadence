@@ -10,15 +10,19 @@
 //!   (quality 0..=9) picks the smallest standard bitrate index per frame
 //!   whose planned content meets the quality tolerance — the decoder-
 //!   recommended MP3 VBR (every frame header self-describes its size).
-//! - **Short blocks (block switching)**: attacks detected on the raw PCM
-//!   (front-half vs prior back-half energy — the polyphase window smears
-//!   attacks in the subband domain) code as three 12-point windows through
-//!   a closed-form analysis whose round trip through the decoder's own
-//!   `imdct12` chain is exact; the granule before an attack and the first
-//!   after a short run are zero-line stop/bridge granules that drive the
-//!   decoder's overlap state to exactly zero, making the handover
-//!   convention-free. Verified against FFmpeg at 121 dB on transient
-//!   material, with only pure short blocks and no mixed blocks emitted.
+//! - **Window switching** (all version families): attacks are detected on
+//!   the raw PCM (an energy jump over the two preceding quarter-granule
+//!   blocks — the polyphase window smears attacks in the subband domain),
+//!   with one granule of look-ahead. The ISO window sequence
+//!   `long → start → short → stop → long` is coded with true TDAC: every
+//!   block's forward transform uses the window its neighbours' decoders will
+//!   apply (the forward bases are derived by probing this crate's own
+//!   decoder kernels), so start/short/stop blocks reconstruct the source
+//!   exactly. A short block owns the middle 24 subband rows of its 36-row
+//!   frame; an attack in granule `k` codes blocks `k` and `k + 1` short.
+//!   Verified against the *source*, not just against FFmpeg: click trains
+//!   come back at the right position with the energy ahead of each onset
+//!   confined to the short block's reach (`tests/encoder_fidelity.rs`).
 //! - **Full bit reservoir** (`main_data_begin` reach-back, capped by the
 //!   9-bit MPEG-1 / 8-bit LSF field): a frame's unspent payload tail is
 //!   held back from the sink (zero padding until patched) and lent to the
@@ -40,17 +44,25 @@
 //!   outer psychoacoustic loop that amplifies the worst band per
 //!   scalefactor unit against ISO model I-style masking thresholds
 //!   (spreading function, ATH, tonality), with `scalefac_compress`
-//!   selection. The outer loop also enforces FFmpeg's escape-line
-//!   requantization window (see `apply_ff_window`): escape-coded lines
-//!   outside it decode as zero in FFmpeg's integer requant, so the loop
-//!   amplifies around them and the quantizer masks them, keeping encoder,
-//!   our decoder, and FFmpeg in exact agreement.
+//!   selection. The outer loop's amplification rounds are currently set to
+//!   zero (`PSY_AMPLIFICATION_ROUNDS`): with a flat quantizer the encoder
+//!   is an MSE-optimal rate-limited coder, whose measured SNR matches
+//!   libmp3lame's at equal bitrate (96-192 kbps stereo music), while noise
+//!   shaping against the masking model would trade SNR for (unmeasured)
+//!   perceptual gain. The loop machinery stays in place and tested for that
+//!   experiment. Both loops enforce FFmpeg's escape-line requantization
+//!   window (see `apply_ff_window`): escape-coded lines outside it decode
+//!   as zero in FFmpeg's integer requant, so the quantizer masks them,
+//!   keeping encoder, our decoder, and FFmpeg in exact agreement.
 //! - **Mid/side stereo**, decided per frame (joint stereo + mode_ext bit 2)
 //!   when the side channel carries less than half the mid-channel energy:
-//!   `M = (L+R)·2^-3/2`, `S = (L−R)·2^-3/2`, which combined with the
-//!   decoder's ms requant gain (√2) and `m+s`/`m−s` reconstruction yields
-//!   exactly L and R. Verified against FFmpeg at 113.8 dB inter-decoder
-//!   agreement on dual-mono noise.
+//!   `M = (L+R)/2`, `S = (L−R)/2`. The decoder's ms global-gain shift
+//!   (−2 quarter steps) only moves the quantizer step and the encoder
+//!   quantizes with the same shifted gain, so the decoded lines equal these
+//!   targets and `m+s`/`m−s` reconstructs exactly L and R. (An earlier
+//!   `2^-3/2` factor coded every mid/side frame 3 dB quiet; inter-decoder
+//!   checks could not see it — the level gates in `tests/encoder_fidelity.rs`
+//!   can.)
 //! - **Subband splitting uses the ISO reference's published 512-tap
 //!   polyphase analysis filter** (`tables::ANALYSIS_WINDOW`), verified
 //!   against the live `shine` encoder source line by line. The per-band
@@ -62,9 +74,12 @@
 //! Output is spec-compliant Layer III: valid headers, side info,
 //! scalefactors, and Huffman-coded data; it decodes cleanly in this
 //! crate's own decoder and in FFmpeg, whose decode of the encoder's output
-//! agrees with ours at 114-120 dB across the full bitrate ladder, for
+//! agrees with ours at 90-120 dB across the full bitrate ladder, for
 //! tonal, noise, and mid/side material alike (see
-//! `tests/encoder_ffmpeg_crosscheck.rs`).
+//! `tests/encoder_ffmpeg_crosscheck.rs`), and the decode reproduces the
+//! *source*: tones at 55-80 dB tone-to-noise in every version family,
+//! sample-exact gapless alignment, and stereo music at the SNR
+//! libmp3lame reaches at the same bitrate (see `tests/encoder_fidelity.rs`).
 
 use std::io::{Seek, SeekFrom, Write};
 
@@ -482,7 +497,13 @@ fn mat18_inverse(m: &Mat18) -> Mat18 {
 }
 
 fn mdct_window_halves() -> ([f64; 9], [f64; 9]) {
-    let window = &crate::tables::MDCT_WINDOW[0];
+    window_halves(0)
+}
+
+/// Halves of `MDCT_WINDOW[idx]`: index 0 is the normal long window, index 1
+/// the start/stop slope pattern (ones, short slope, zeros).
+fn window_halves(idx: usize) -> ([f64; 9], [f64; 9]) {
+    let window = &crate::tables::MDCT_WINDOW[idx];
     let mut w1 = [0.0f64; 9];
     let mut w2 = [0.0f64; 9];
     for i in 0..9 {
@@ -520,10 +541,15 @@ struct Mdct36Basis {
 }
 
 impl Mdct36Basis {
-    fn new() -> Self {
+    /// Basis for a long-shaped block whose first half uses window array
+    /// `cur` (`MDCT_WINDOW[cur]`) and whose second half is windowed by the
+    /// *next* block as window array `next` (the decoder applies each block's
+    /// window to the previous block's overlap).
+    fn new(cur: usize, next: usize) -> Self {
         let l = probe_l();
         let l_inv = mat18_inverse(&l);
-        let (w1, w2) = mdct_window_halves();
+        let (cw1, cw2) = window_halves(cur);
+        let (nw1, nw2) = window_halves(next);
 
         let mut a = mat18_zero();
         let mut b = mat18_zero();
@@ -531,10 +557,10 @@ impl Mdct36Basis {
             for row in 0..18 {
                 let col_i = l_inv[row][i]; // L^-1[:, i]
                 let col_9i = l_inv[row][9 + i]; // L^-1[:, 9+i]
-                b[row][i] = col_9i * w1[i];
-                b[row][17 - i] = col_9i * w2[i];
-                a[row][i] = col_i * -w2[i];
-                a[row][17 - i] = col_i * w1[i];
+                b[row][i] = col_9i * nw1[i];
+                b[row][17 - i] = col_9i * nw2[i];
+                a[row][i] = col_i * -cw2[i];
+                a[row][17 - i] = col_i * cw1[i];
             }
         }
         Mdct36Basis { a, b }
@@ -555,9 +581,24 @@ impl Mdct36Basis {
     }
 }
 
-fn mdct_basis() -> &'static Mdct36Basis {
-    static BASIS: std::sync::OnceLock<Mdct36Basis> = std::sync::OnceLock::new();
-    BASIS.get_or_init(Mdct36Basis::new)
+/// Forward basis for a long-shaped block of `block_type` 0 (normal: long
+/// window both sides), 1 (start: long left, start-slope right) or 3 (stop:
+/// stop-slope left, long right).
+fn mdct_basis(block_type: u8) -> &'static Mdct36Basis {
+    static BASES: std::sync::OnceLock<[Mdct36Basis; 3]> = std::sync::OnceLock::new();
+    let bases = BASES.get_or_init(|| {
+        [
+            Mdct36Basis::new(0, 0),
+            Mdct36Basis::new(0, 1),
+            Mdct36Basis::new(1, 0),
+        ]
+    });
+    match block_type {
+        0 => &bases[0],
+        1 => &bases[1],
+        3 => &bases[2],
+        _ => panic!("no long-shaped forward basis for block_type {block_type}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,8 +702,8 @@ fn short_decode_chunk(lines: &[f32; 18], ov_in: &[f32; 9]) -> ([f32; 18], [f32; 
 /// Forward 36-point MDCT for one band: 36 time samples (18 carried from the
 /// previous granule + 18 new) in, 18 spectral lines out, using the basis
 /// derived by [`Mdct36Basis`].
-fn forward_mdct36(x: &[f32; 36]) -> [f32; 18] {
-    mdct_basis().forward(x)
+fn forward_mdct36(x: &[f32; 36], block_type: u8) -> [f32; 18] {
+    mdct_basis(block_type).forward(x)
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,16 +1462,21 @@ fn evaluate_granule(
     let (bv_min, quads) = split_big_values(&ix);
     let all_pairs_end = ix.iter().rposition(|&v| v != 0).map_or(0, |i| i / 2 + 1);
 
-    let regions_pairs = if layout.short {
-        plan_two_regions(&ix, all_pairs_end, layout, 9)
+    // Window-switched granules (short, start, stop) transmit two table
+    // selects with implied region bounds: region 0 spans 36 lines -- nine
+    // (sfb, window) bands at short widths, eight long bands otherwise.
+    let switched = block_type != 0;
+    let region0_bands = if layout.short { 9 } else { 8 };
+    let regions_pairs = if switched {
+        plan_two_regions(&ix, all_pairs_end, layout, region0_bands)
     } else {
         plan_regions(&ix, all_pairs_end, layout)
     };
     let mut best_bits = regions_pairs.bits;
     let mut best_struct = (all_pairs_end, 0u16, regions_pairs, 0u8);
     if quads > 0 {
-        let regions_split = if layout.short {
-            plan_two_regions(&ix, bv_min, layout, 9)
+        let regions_split = if switched {
+            plan_two_regions(&ix, bv_min, layout, region0_bands)
         } else {
             plan_regions(&ix, bv_min, layout)
         };
@@ -2090,8 +2136,9 @@ fn intensity_exponents_lsf(l: &[f32], r: &[f32], layout: &BandLayout) -> [f64; 3
 /// Rewrites bands from the per-window starts of the (already
 /// M/S-transformed if `ms`) spectra `out0`/`out1` as an intensity source
 /// and silence: the source keeps the in-phase line shape `L+R`, scaled so
-/// the pan split preserves the band's total energy. The decoder's mid/side
-/// gain makes `A = 2·spec0` in M/S mode (`A = spec0` otherwise).
+/// the pan split preserves the band's total energy. In M/S mode the decoder's
+/// intensity path multiplies by sqrt(2) on top of the (already -2 shifted)
+/// dequantization, so the coded source is `A / sqrt(2)` (`A = spec0` otherwise).
 fn apply_intensity(
     l: &[f32],
     r: &[f32],
@@ -2160,7 +2207,11 @@ fn apply_intensity(
         } else {
             0.0
         };
-        let scale = if ms { 0.5 } else { 1.0 } * g;
+        let scale = if ms {
+            std::f64::consts::FRAC_1_SQRT_2
+        } else {
+            1.0
+        } * g;
         for i in layout.line_start[band]..layout.line_end[band] {
             out0[i] = ((f64::from(l[i] + r[i])) * scale) as f32;
             out1[i] = 0.0;
@@ -2221,6 +2272,18 @@ const MPEG1_BITRATES_KBPS: [u32; 15] = [
 /// Bitrate table shared by the MPEG-2 and MPEG-2.5 (LSF) families.
 const LSF_BITRATES_KBPS: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
+/// Window-sequence state carried across frames (shared by all channels).
+#[derive(Default)]
+struct SwitchState {
+    /// Window type of the previous frame's last granule (0 long, 1 start,
+    /// 2 short, 3 stop).
+    prev_type: u8,
+    /// Whether the previous frame's last granule held an attack.
+    prev_attack: bool,
+    /// Energies of the two detector blocks before the next frame.
+    prev_q: [f64; 2],
+}
+
 /// Per-channel state carried across granules/frames.
 struct ChannelState {
     /// Previous granule's last 18 subband-time samples, per band (for the
@@ -2232,12 +2295,6 @@ struct ChannelState {
     analysis_hist: [f32; HAN_SIZE],
     /// Current write offset into `analysis_hist`.
     analysis_off: usize,
-    /// Whether the channel's latest granule was a content-bearing short
-    /// block (the window-sequence state machine's cross-frame memory).
-    last_short: bool,
-    /// PCM energy of the channel's latest granule's back half — the
-    /// reference level for the transient detector's next decision.
-    prev_back_energy: f64,
 }
 
 impl ChannelState {
@@ -2246,8 +2303,6 @@ impl ChannelState {
             history: [[0.0; 18]; 32],
             analysis_hist: [0.0; HAN_SIZE],
             analysis_off: 0,
-            last_short: false,
-            prev_back_energy: 0.0,
         }
     }
 }
@@ -2298,6 +2353,8 @@ pub struct Mp3Encoder<W: Write + Seek> {
     /// This frame's per-slot block decisions (set during analysis):
     /// 0 long, 1 start, 2 short, 3 stop.
     slot_block: [u8; 4],
+    /// Window-sequence state carried across frames.
+    sw: SwitchState,
     /// Opt-in intensity stereo (stereo frames of every version family,
     /// long and short blocks).
     intensity: bool,
@@ -2420,6 +2477,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             layout: BandLayout::new(sideinfo::sr_table_idx_for_sr(sample_rate)),
             short_layout: BandLayout::new_short(sideinfo::sr_table_idx_for_sr(sample_rate)),
             slot_block: [0; 4],
+            sw: SwitchState::default(),
             intensity: false,
             frame_is: false,
             meta: None,
@@ -2645,6 +2703,10 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         // twelve subband rows, so the polyphase runs for all granules
         // before any spectral work. The previous frame's tail rows (the
         // history at entry) seed the transient detector for granule 0.
+        // The previous frame's last granule of subband rows: the first
+        // granule's MDCT overlap half. (`state.history` itself is advanced
+        // to *this* frame's last granule by the polyphase loop below.)
+        let entry_history = self.channel_state[ch].history;
         let mut sub: [[[f32; 18]; 32]; 2] = [[[0.0; 18]; 32]; 2];
         for gr in 0..n_granules {
             let mut new_subband = [[0.0f32; 18]; 32];
@@ -2695,119 +2757,32 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             history.copy_from_slice(&new_subband);
         }
 
-        // The window-sequence state machine (all version families). Attacks are detected on the raw PCM — the polyphase
-        // analysis window smears attacks across granule boundaries, so the
-        // subband domain localizes them poorly: each granule's front-half
-        // PCM energy is compared against the previous granule's back-half
-        // energy. An attack codes as three 12-point windows; the granule
-        // before an attack and the first granule after a short run are
-        // zero-line stop/bridge granules whose only job is to drive the
-        // decoder's overlap state to exactly zero — a pure function of the
-        // (empty) lines, so the handover is convention-free in every
-        // decoder.
-        // Per channel: the frame's 576 pairs split into two granules of
-        // 288 pairs = 576 interleaved entries; each granule's front-half
-        // energy vs the previous granule's back-half energy.
-        let quarter = GRANULE_SAMPLES * channels / 2; // half a granule, interleaved
-        let pcm_energy = |from: usize, len: usize| -> f64 {
-            (from..from + len)
-                .map(|i| {
-                    let v = if i < self.pending.len() {
-                        f64::from(self.pending[i])
-                    } else {
-                        0.0
-                    };
-                    v * v
-                })
-                .sum::<f64>()
-        };
-        let mut attacks = [false; 4];
+        // MDCT per granule. Block `gr` covers the subband rows of the
+        // previous granule and of this one; `compute_block_schedule` picked
+        // its window type (normal / start / short / stop).
         for gr in 0..n_granules {
-            let base = gr * 2 * quarter;
-            let front = pcm_energy(base, quarter);
-            attacks[gr * channels + ch] =
-                front > 1e-9 && front > 25.0 * self.channel_state[ch].prev_back_energy.max(1e-12);
-            // Every channel of a granule must reach the same verdict: the
-            // zero-line stop/bridge machinery assumes both sides of a frame
-            // enter the short run together, and a per-channel split there
-            // yields a long -> short transition for one channel only.
-            for other in 0..channels {
-                attacks[gr * channels + other] = attacks[gr * channels + ch];
-            }
-        }
-        let look = self.lookahead_rows(ch);
-        let mut prev_short = self.channel_state[ch].last_short;
-        // The next frame's granule-0 detector will compare its front half
-        // against *this* frame's last granule's back half — the value stored
-        // below. Arming the cross-frame lookahead needs that same baseline,
-        // so compute it before the window-sequence loop instead of after it
-        // (reading the previous frame's stale value here made `next_attack`
-        // disagree with the detector that actually fires on the next frame,
-        // so the zero-line stop that must precede a short run was silently
-        // dropped and the encoder emitted a bare long -> short transition).
-        let last_gr = n_granules - 1;
-        let back_energy = pcm_energy(last_gr * 2 * quarter + quarter, quarter);
-        for gr in 0..n_granules {
-            let attack = attacks[gr * channels + ch];
-            let next_attack = if gr + 1 < n_granules {
-                attacks[(gr + 1) * channels + ch]
-            } else {
-                // The next frame's first granule: its front half is the
-                // cross-frame lookahead PCM. It must be measured exactly the
-                // way that frame's own granule-0 detector will measure it —
-                // `pcm_energy(0, quarter)`, a contiguous `quarter`-sample
-                // window over the interleaved buffer spanning *both*
-                // channels. Measuring only this channel (striding by
-                // `channels`) made the two disagree, and a disagreement here
-                // drops the mandatory zero-line stop, so the encoder emitted a
-                // bare long -> short transition that decoders are free to
-                // interpret differently.
-                let base = self.samples_per_frame() * channels;
-                let e_front = pcm_energy(base, quarter);
-                e_front > 1e-9 && e_front > 25.0 * back_energy.max(1e-12)
-            };
-            let block = if attack {
-                2u8 // content short
-            } else if prev_short {
-                4u8 // zero-line short: fade the run out, overlap -> 0
-            } else if next_attack {
-                3u8 // zero-line stop: overlap -> 0 before the short run
-            } else {
-                0u8
-            };
-            prev_short = block == 2;
-            self.slot_block[gr * channels + ch] = block;
-        }
-        self.channel_state[ch].last_short = self.slot_block[(n_granules - 1) * channels + ch] == 2;
-        self.channel_state[ch].prev_back_energy = back_energy;
-
-        for gr in 0..n_granules {
+            let block = self.slot_block[gr * channels + ch];
             let spec = &mut self.spec_scratch[ch * 2 + gr];
-            match self.slot_block[gr * channels + ch] {
-                2 => {
-                    Self::solve_short_granule(&sub[gr], &look, spec, &self.short_layout);
-                    continue;
+            let prev_rows = if gr == 0 {
+                &entry_history
+            } else {
+                &sub[gr - 1]
+            };
+            if block == 2 {
+                // A short block owns the middle of its 36-row frame: rows
+                // 6..18 of the previous granule and 0..12 of this one.
+                let mut next = [[0.0f32; 12]; 32];
+                for (band, n) in next.iter_mut().enumerate() {
+                    n.copy_from_slice(&sub[gr][band][..12]);
                 }
-                // Zero-line bridges: a stop (3) before the short run drives
-                // the decoder's overlap state to exactly zero (its overlap
-                // output is a pure function of the lines), and a zero-line
-                // short granule (4) after the run does the same on the way
-                // back — both are agreement-safe in every decoder, unlike
-                // content-bearing start/stop granules whose window tables
-                // this crate's decoder has never had validated against
-                // FFmpeg's.
-                1 | 3 | 4 => {
-                    spec.fill(0.0);
-                    continue;
-                }
-                _ => {}
+                Self::solve_short_granule(prev_rows, &next, spec, &self.short_layout);
+                continue;
             }
-            let history = &self.channel_state[ch].history;
             for band in 0..32 {
                 let mut x = [0.0f32; 36];
-                x[..18].copy_from_slice(&history[band]);
+                x[..18].copy_from_slice(&prev_rows[band]);
                 x[18..].copy_from_slice(&sub[gr][band]);
-                let lines = forward_mdct36(&x);
+                let lines = forward_mdct36(&x, block);
                 spec[band * 18..band * 18 + 18].copy_from_slice(&lines);
             }
 
@@ -2820,6 +2795,86 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             // rotation here so the decoder's forward rotation restores it.
             Self::antialias_precomp(spec);
         }
+    }
+
+    /// Chooses the window type of every granule of the coming frame (all
+    /// channels share it, so joint stereo sees matched block families).
+    ///
+    /// Attacks are detected on the raw PCM -- the polyphase filter smears
+    /// them across subband rows -- as a jump of one detector block's energy
+    /// over the two blocks before it. An attack in granule `k` asks for
+    /// short blocks at `k` and `k + 1` (a short block owns rows `[prev 6..18,
+    /// cur 0..12]`, so the pair covers the whole granule and its filter
+    /// spread). The ISO sequence rules then insert a *start* block before a
+    /// short run and a *stop* block after it (`0|3 -> 0|1 -> 2 -> 2|3`), and
+    /// a lone long block between two short runs is absorbed into the run.
+    /// One granule of PCM look-ahead beyond the frame decides whether the
+    /// frame's last block must be a start block; the choice is a pure
+    /// function of the PCM, so the next frame reproduces it exactly.
+    #[allow(clippy::needless_range_loop)] // `k` also derives buffer offsets
+    fn compute_block_schedule(&mut self) {
+        /// PCM frames per detector block (a quarter granule).
+        const DETECT_FRAMES: usize = GRANULE_SAMPLES / 4;
+        let channels = self.channels as usize;
+        let n = self.n_granules();
+        let block_len = DETECT_FRAMES * channels;
+        let energy = |from: usize| -> f64 {
+            (from..from + block_len)
+                .map(|i| {
+                    let v = self.pending.get(i).map_or(0.0, |&s| f64::from(s));
+                    v * v
+                })
+                .sum()
+        };
+        // Ignore rises out of (near) digital silence: 1e-3 RMS.
+        let floor = block_len as f64 * 1e-6;
+        let mut prev_q = self.sw.prev_q;
+        let mut end_q = prev_q;
+        let mut attack = [false; 3];
+        for k in 0..=n {
+            let base = k * GRANULE_SAMPLES * channels;
+            let mut e = [prev_q[0], prev_q[1], 0.0, 0.0, 0.0, 0.0];
+            for q in 0..4 {
+                e[2 + q] = energy(base + q * block_len);
+                if e[2 + q] > floor && e[2 + q] > 25.0 * e[1 + q].max(e[q]) {
+                    attack[k] = true;
+                }
+            }
+            prev_q = [e[4], e[5]];
+            if k + 1 == n {
+                end_q = prev_q;
+            }
+        }
+        let want = |k: usize| -> bool {
+            attack[k]
+                || if k == 0 {
+                    self.sw.prev_attack
+                } else {
+                    attack[k - 1]
+                }
+        };
+        let mut prev_t = self.sw.prev_type;
+        for g in 0..n {
+            let short = want(g) || (prev_t == 2 && want(g + 1));
+            let t = if short {
+                2u8
+            } else if want(g + 1) {
+                1
+            } else if prev_t == 2 {
+                3
+            } else {
+                0
+            };
+            for ch in 0..channels {
+                self.slot_block[g * channels + ch] = t;
+            }
+            prev_t = t;
+        }
+        self.sw = SwitchState {
+            prev_type: prev_t,
+            prev_attack: attack[n - 1],
+            prev_q: end_q,
+        };
     }
 
     /// Applies the inverse of the decoder's spectral antialias rotation
@@ -2836,43 +2891,6 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 spec[base + 17 - i] = -up * aa1 + dp * aa0;
             }
         }
-    }
-
-    /// The next frame's first granule, subband rows 0..11, for this
-    /// channel — the short-block solver's cross-granule targets. Runs the
-    /// polyphase on a cloned state so the persistent filter history is not
-    /// disturbed; rows past the buffered input read as silence (the last
-    /// frame's lookahead decays to zero, matching the decoder's own
-    /// zero-padding at end of stream).
-    fn lookahead_rows(&self, ch: usize) -> [[f32; 12]; 32] {
-        let channels = self.channels as usize;
-        let base = self.samples_per_frame() * channels;
-        let mut hist = self.channel_state[ch].analysis_hist;
-        let mut off = self.channel_state[ch].analysis_off;
-        let mut rows = [[0.0f32; 12]; 32];
-        #[allow(clippy::needless_range_loop)]
-        for t in 0..12 {
-            let mut new_samples = [0.0f32; 32];
-            for n in 0..32 {
-                let idx = base + (t * 32 + n) * channels + ch;
-                new_samples[n] = if idx < self.pending.len() {
-                    self.pending[idx] * 0.5
-                } else {
-                    0.0
-                };
-            }
-            let mut out = [0.0f32; 32];
-            analyze_block_polyphase(&mut hist, &mut off, &new_samples, &mut out);
-            for band in 0..32 {
-                let sign = if band % 2 == 1 && t % 2 == 1 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                rows[band][t] = out[band] * sign;
-            }
-        }
-        rows
     }
 
     /// Short-block analysis: solves each 18-line chunk's three 12-point
@@ -2937,12 +2955,13 @@ impl<W: Write + Seek> Mp3Encoder<W> {
     }
 
     /// Rewrites both granules' spectra from L/R to mid/side coding values:
-    /// `M = (L+R)·2^-3/2`, `S = (L−R)·2^-3/2`. That factor combined with the
-    /// decoder's ms_stereo requant gain (×√2 on both channels) and its final
-    /// `m+s` / `m−s` reconstruction yields exactly `L` and `R`.
+    /// `M = (L+R)/2`, `S = (L−R)/2`. The decoder's ms_stereo global-gain
+    /// shift (−2 quarter steps, the ISO 1/√2) only moves the quantizer step:
+    /// this encoder quantizes with the same shifted gain, so the decoded
+    /// lines equal these targets, and the decoder's final `m+s` / `m−s`
+    /// reconstruction then yields exactly `L` and `R`.
     fn transform_to_ms(&mut self) {
-        // 2^-3/2 = √2/4; split as 2^-1/2 / 2 because powf isn't const.
-        const K: f32 = std::f32::consts::FRAC_1_SQRT_2 / 2.0;
+        const K: f32 = 0.5;
         let n_granules = self.n_granules();
         let (mid, side) = self.spec_scratch.split_at_mut(2);
         for gr in 0..n_granules {
@@ -2994,21 +3013,13 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 fair.min(remaining)
             }
             .min(4095);
-            let layout = if self.slot_block[slot] == 2 || self.slot_block[slot] == 4 {
+            let layout = if self.slot_block[slot] == 2 {
                 &self.short_layout
             } else {
                 &self.layout
             };
             let thresholds = psy_thresholds(&spec, layout, self.sample_rate);
-            // Zero-line bridges (3/4) plan as their window family (long /
-            // short) but always emit block_type 2 for the short bridge so
-            // the decoder runs the short kernel the bridge's empty chain
-            // was computed for.
-            let block = if self.slot_block[slot] == 4 {
-                2
-            } else {
-                self.slot_block[slot]
-            };
+            let block = self.slot_block[slot];
             let cost = plan_granule(
                 &spec,
                 layout,
@@ -3054,7 +3065,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                     } else {
                         plan.big_values -= 1;
                     }
-                    let layout = if self.slot_block[slot] == 2 || self.slot_block[slot] == 4 {
+                    let layout = if self.slot_block[slot] == 2 {
                         &self.short_layout
                     } else {
                         &self.layout
@@ -3081,6 +3092,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         let n_granules = self.n_granules();
         let lsf = self.lsf;
 
+        self.compute_block_schedule();
         for ch in 0..channels {
             self.analyze_channel(ch);
         }
@@ -3103,10 +3115,10 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         let base_spec = self.spec_scratch.clone();
         let mut is_info: Option<IsInfo> = None;
 
-        let gr_is_short = |gr: usize| matches!(self.slot_block[gr * 2], 2 | 4);
+        let gr_is_short = |gr: usize| self.slot_block[gr * 2] == 2;
         if self.intensity && channels == 2 {
-            let families_match = (0..n_granules)
-                .all(|gr| gr_is_short(gr) == matches!(self.slot_block[gr * 2 + 1], 2 | 4));
+            let families_match =
+                (0..n_granules).all(|gr| gr_is_short(gr) == (self.slot_block[gr * 2 + 1] == 2));
             if families_match {
                 let mut info = IsInfo {
                     from: [[0; 3]; 2],
@@ -3582,7 +3594,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         // `ENCODER_DELAY` samples into the decoded stream, and everything
         // past `src + delay` up to the last frame's end is flush padding.
         // The tag frame itself is skipped by decoders, hence frames - 1.
-        const ENCODER_DELAY: u32 = 574; // measured impulse alignment
+        const ENCODER_DELAY: u32 = 528; // measured alignment (see delay test)
         let spf = self.samples_per_frame() as u64;
         let audio_pairs = frames.saturating_sub(1) as u64 * spf;
         let padding = audio_pairs
@@ -3591,7 +3603,10 @@ impl<W: Write + Seek> Mp3Encoder<W> {
 
         let end = self.sink.stream_position()?;
         self.sink.seek(SeekFrom::Start(meta.frames_field_off))?;
-        self.sink.write_all(&frames.to_be_bytes())?;
+        // The tag counts audio frames only (LAME/FFmpeg convention), not
+        // the tag frame itself.
+        self.sink
+            .write_all(&frames.saturating_sub(1).to_be_bytes())?;
         self.sink.write_all(&(total_bytes as u32).to_be_bytes())?;
         self.sink.write_all(&toc)?;
         self.sink.seek(SeekFrom::Start(meta.delay_field_off))?;
@@ -3636,10 +3651,10 @@ impl<W: Write + Seek + Send> Encoder for Mp3Encoder<W> {
             )));
         }
         let frame_samples = self.samples_per_frame();
-        // 384 extra buffered samples feed the short-block solver's
-        // cross-granule lookahead (the next granule's first twelve
-        // subband rows); at finish the lookahead decays to zero.
-        let emit_threshold = (frame_samples + 384) * channels;
+        // One granule of extra buffered PCM feeds the window-switching
+        // decision (whether an attack sits in the next granule); at finish
+        // the lookahead reads as silence.
+        let emit_threshold = (frame_samples + GRANULE_SAMPLES) * channels;
         self.source_pairs += (samples.len() / channels) as u64;
         self.pending.extend_from_slice(samples);
         while self.pending.len() >= emit_threshold {
@@ -3650,46 +3665,7 @@ impl<W: Write + Seek + Send> Encoder for Mp3Encoder<W> {
     }
 
     fn finish(&mut self) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        let channels = self.channels as usize;
-        if !self.pending.is_empty() {
-            // Pad the final partial frame with silence so it can still be
-            // encoded as a full MPEG-1 frame; the extra tail samples are
-            // inaudible padding, matching how CBR MP3 streams routinely
-            // carry a few silent trailing samples. When the stream ends
-            // inside a short run, one extra zero frame is appended so the
-            // final content granule is followed by the zero-line bridge
-            // instead of truncating real content into the un-coded
-            // post-bridge rows.
-            let frame_samples = self.samples_per_frame();
-            let ending_in_run = self.channel_state.iter().any(|st| st.last_short);
-            let frames_to_emit = if ending_in_run { 2 } else { 1 };
-            self.pending
-                .resize(frames_to_emit * frame_samples * channels, 0.0);
-            while !self.pending.is_empty() {
-                self.emit_frame()?;
-                self.pending.drain(..frame_samples * channels);
-            }
-        }
-        if self.meta.is_some() {
-            // Gapless flush: one extra silent frame lets a decoder's
-            // synthesis pipeline emit its final tail samples, so the
-            // LAME delay/padding trim recovers the exact source length.
-            let frame_samples = self.samples_per_frame();
-            let channels = self.channels as usize;
-            self.pending.resize(frame_samples * channels, 0.0);
-            self.emit_frame()?;
-            self.pending.clear();
-        }
-        self.flush_bank()?;
-        if self.meta.is_some() {
-            self.patch_metadata_tag()?;
-        }
-        self.sink.flush()?;
-        Ok(())
+        self.finish_inner()
     }
 }
 
@@ -3708,18 +3684,56 @@ impl<W: Write + Seek> Mp3Encoder<W> {
     /// `Drop`-safe finish: same as [`Encoder::finish`] but callable without
     /// the trait in scope (`Drop::drop` only has `&mut self`).
     fn finish_infallible(&mut self) -> Result<()> {
+        self.finish_inner()
+    }
+
+    /// Flushes the tail, closes any open window run, appends the gapless
+    /// flush frame and patches the metadata tag. Idempotent.
+    fn finish_inner(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
         }
         self.finished = true;
         let channels = self.channels as usize;
         if !self.pending.is_empty() {
+            // Pad the final partial frame with silence so it can still be
+            // encoded as a full frame; the extra tail samples are inaudible
+            // padding, matching how CBR MP3 streams routinely carry a few
+            // silent trailing samples. (Every buffered sample belongs in a
+            // frame: up to one look-ahead granule may still be pending.)
             let frame_samples = self.samples_per_frame();
+            let frames_to_emit = (self.pending.len() / channels)
+                .div_ceil(frame_samples)
+                .max(1);
+            self.pending
+                .resize(frames_to_emit * frame_samples * channels, 0.0);
+            while !self.pending.is_empty() {
+                self.emit_frame()?;
+                self.pending.drain(..frame_samples * channels);
+            }
+            // A window run still open at the end of the input is closed
+            // with silent frames, so the final content granules are
+            // followed by real blocks rather than cut off.
+            while self.sw.prev_type != 0 {
+                self.pending.resize(frame_samples * channels, 0.0);
+                self.emit_frame()?;
+                self.pending.clear();
+            }
+        }
+        if self.meta.is_some() {
+            // Gapless flush: one extra silent frame lets a decoder's
+            // synthesis pipeline emit its final tail samples, so the
+            // LAME delay/padding trim recovers the exact source length.
+            let frame_samples = self.samples_per_frame();
+            let channels = self.channels as usize;
             self.pending.resize(frame_samples * channels, 0.0);
             self.emit_frame()?;
             self.pending.clear();
         }
         self.flush_bank()?;
+        if self.meta.is_some() {
+            self.patch_metadata_tag()?;
+        }
         self.sink.flush()?;
         Ok(())
     }
@@ -4059,7 +4073,7 @@ mod tests {
                 let mut x = [0.0f32; 36];
                 x[..18].copy_from_slice(&history);
                 x[18..].copy_from_slice(&new);
-                let lines = forward_mdct36(&x);
+                let lines = forward_mdct36(&x, 0);
 
                 let mut grbuf = [0.0f32; 576];
                 grbuf[..18].copy_from_slice(&lines);
@@ -4786,7 +4800,7 @@ mod tests {
                     };
                     *value = granule[band][sample] * sign;
                 }
-                let lines = forward_mdct36(&x);
+                let lines = forward_mdct36(&x, 0);
                 spec[band * 18..band * 18 + 18].copy_from_slice(&lines);
                 band_history[band].copy_from_slice(&x[18..]);
             }
