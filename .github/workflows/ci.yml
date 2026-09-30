@@ -191,7 +191,11 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # The counting-allocator RT-safety tests are skipped here: llvm-cov's
+        # profile runtime itself allocates on first execution of new code
+        # paths, which they would misattribute to the decoder. They still run
+        # in the build-and-test job.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --skip allocation_free
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4

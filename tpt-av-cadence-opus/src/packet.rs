@@ -398,7 +398,7 @@ mod tests {
 
         // Two-byte length: 252 + second byte 4 => 4*4 + 252 = 268.
         let mut payload = vec![0x02, 252, 4];
-        payload.extend(std::iter::repeat_n(0u8, 268 + 2));
+        payload.extend(std::iter::repeat(0u8).take(268 + 2));
         let packet = parse_packet(&payload).unwrap();
         assert_eq!(packet.frame_range(0), Some((3, 271)));
         assert_eq!(packet.frame_range(1), Some((271, 273)));
@@ -445,7 +445,7 @@ mod tests {
         // Padding length 255 -> 254 + next value (1) = 255 bytes.
         let mut payload = vec![0x03, 0x40 | 1, 255, 1];
         payload.push(0xAA); // one frame byte
-        payload.extend(std::iter::repeat_n(0u8, 255));
+        payload.extend(std::iter::repeat(0u8).take(255));
         let packet = parse_packet(&payload).unwrap();
         assert_eq!(packet.padding_bytes, 255);
         assert_eq!(packet.frame_count(), 1);
