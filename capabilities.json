@@ -52,11 +52,11 @@
       "formats": ["flac"],
       "role": "Lossless, LPC + Rice coding",
       "decode": "stable",
-      "encode": "partial",
+      "encode": "stable",
       "conformance": "bit-exact",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "Encoder supports fixed predictors only (no full LPC search on the encode side yet)"
+      "notes": "Encoder: LPC search (orders up to 12, Tukey-windowed Levinson-Durbin, priced by coded size), stereo decorrelation (L/S, S/R, M/S), wasted bits, real STREAMINFO MD5. Fixed block size only"
     },
     {
       "crate": "tpt-av-cadence-ogg",
@@ -96,22 +96,22 @@
       "formats": ["mp3"],
       "role": "MP3 decoder and encoder",
       "decode": "conformance-tested",
-      "encode": "gated (FFmpeg-accepted, 102-124 dB inter-decoder fidelity)",
+      "encode": "source-gated (tone purity 55-80 dB in every version family, aligned, SNR on par with libmp3lame; FFmpeg-decodable at 90-120 dB inter-decoder)",
       "conformance": ">100 dB SNR vs FFmpeg on ten bundled decode fixtures; official ISO/IEC 11172-4 vectors not obtainable, so decode correctness rests on the FFmpeg oracle alone",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "Mp3Encoder: full CBR and loudness/quality-targeting VBR across MPEG-1/2/2.5 with bit-reservoir borrowing, short-block switching, mid/side + opt-in intensity stereo (MPEG-1 PAN table and the ISO 13818-3 LSF ladder), Info/Xing + LAME gapless tags. The repeated-transient LSF short-block divergence is fixed (the window-sequence cross-frame lookahead now measures exactly what the granule-0 detector it predicts measures, so the mandatory zero-line stop is never dropped); psycho-loop quality tuning remains open"
+      "notes": "Mp3Encoder: full CBR and loudness/quality-targeting VBR across MPEG-1/2/2.5 with bit-reservoir borrowing, ISO start/short/stop window switching (true TDAC), mid/side + opt-in intensity stereo (MPEG-1 PAN table and the ISO 13818-3 LSF ladder), Info/Xing + LAME gapless tags (encoder delay 528). The outer psychoacoustic amplification loop exists but is disabled (rounds = 0): perceptual noise shaping is unvalidated without listening tests"
     },
     {
       "crate": "tpt-av-cadence-vorbis",
       "formats": ["ogg-vorbis"],
       "role": "Vorbis decoder and encoder",
       "decode": "conformance-tested",
-      "encode": "first encoder landed (FFmpeg-gated, 136 dB inter-decoder)",
+      "encode": "gated (FFmpeg 136 dB inter-decoder; block switching + masking floor; source-verified)",
       "conformance": "136-138 dB SNR vs FFmpeg on six bundled fixtures",
       "realtime_safe": true,
       "fuzzed": true,
-      "notes": "VorbisEncoder: floor 1 + coupled residue type 1, quality 0-10, square-polar stereo, exact input length via granule trimming. Remaining: block switching, per-file adaptive Huffman books, psychoacoustic masking, >2 channels, quality-to-bitrate calibration"
+      "notes": "VorbisEncoder: block switching (2048/256), floor 1 driven by a Bark-band masking model (unvalidated by listening tests), coupled residue type 1, quality 0-10, square-polar stereo, exact input length via granule trimming. Remaining: per-file adaptive Huffman books, >2 channels; quality ceiling: ~22 dB SNR on music, ~31 dB on pure tones at q10"
     },
     {
       "crate": "tpt-av-cadence-test-utils",

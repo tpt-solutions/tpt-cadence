@@ -5,19 +5,22 @@
 
 **A pure-Rust, zero-dependency audio codec suite. Memory-safe, real-time capable, and permissively licensed (MIT OR Apache-2.0).**
 
-**Status:** Early-stage / Pre-1.0 — WAV, AIFF, FLAC, and raw PCM are
-implemented and bit-exact conformance-tested (decode and encode). The
-AAC-LC/HE-AAC-SBR, MP3, Opus, and Ogg Vorbis decoders all pass
-FFmpeg-reference conformance (>100 dB SNR); AAC remains decode-only
-pending a licensing decision. Encoders: the MP3 encoder (CBR and VBR,
-bit-reservoir borrowing, short-block switching, mid/side plus opt-in
-intensity stereo, Info/Xing + LAME gapless tags, all of MPEG-1/2/2.5),
-the Vorbis encoder (floor 1 + coupled residue, quality 0-10), and the
-Opus encoder (CELT, SILK, and hybrid SILK/CELT, mono/stereo, CBR/VBR,
-LBRR/FEC, DTX, RFC 7845 pre-skip/granules recovering the exact input
-sample count) produce FFmpeg-decodable streams with passing fidelity
-gates. Remaining encoder work is quality tuning and feature extras —
-see `todo.md`.
+**Status:** Early-stage / Pre-1.0 (0.1.0 packaging prepared for crates.io) —
+WAV, AIFF, FLAC, and raw PCM are implemented and bit-exact
+conformance-tested (decode and encode). The AAC-LC/HE-AAC-SBR, MP3, Opus,
+and Ogg Vorbis decoders all pass FFmpeg-reference conformance (>100 dB
+SNR); AAC remains decode-only pending a licensing decision. Encoders: the
+MP3 encoder (CBR and VBR, bit-reservoir borrowing, ISO start/short/stop
+window switching, mid/side plus opt-in intensity stereo, Info/Xing + LAME
+gapless tags, all of MPEG-1/2/2.5), the Vorbis encoder (block switching,
+psychoacoustic floor, quality 0-10), and the Opus encoder (CELT, SILK, and
+hybrid SILK/CELT, mono/stereo, CBR/VBR, LBRR/FEC, DTX, RFC 7845
+pre-skip/granules recovering the exact input sample count) produce
+FFmpeg-decodable streams. The lossy encoders are gated against the *source
+signal* (tone purity, alignment, level, pre-echo), not only against another
+decoder; on stereo music the MP3 encoder matches libmp3lame's SNR at equal
+bitrate. Noise shaping (MP3's outer loop, Vorbis's masking model) has not
+been validated by listening tests — see `todo.md`.
 **Ecosystem:** [TPT Solutions Open Source](https://opensource.tptsolutions.co.nz/)
 
 `tpt-cadence` is the **audio codec layer** of the TPT AV Stack. It provides pure-Rust,
@@ -54,12 +57,12 @@ See [DESIGN.md](DESIGN.md) for the full design rationale.
 | [`tpt-av-cadence-pcm`](tpt-av-cadence-pcm) | Headerless raw PCM — int 8/16/24/32 + float 32/64, both byte orders | ✅ Stable — decode + encode, bit-exact |
 | [`tpt-av-cadence-wav`](tpt-av-cadence-wav) | RIFF/WAVE — 8/16/24/32-bit int + 32/64-bit float | ✅ Stable — decode + encode, bit-exact |
 | [`tpt-av-cadence-aiff`](tpt-av-cadence-aiff) | AIFF / AIFC (big-endian IFF) | ✅ Stable — decode + encode, bit-exact |
-| [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable — decode + encode (fixed predictors only), bit-exact |
+| [`tpt-av-cadence-flac`](tpt-av-cadence-flac) | FLAC (lossless, LPC + Rice coding) | ✅ Stable — decode + encode (LPC search to order 12, stereo decorrelation, wasted bits, real STREAMINFO MD5), bit-exact |
 | [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | Opus (RFC 6716) + Ogg Opus container (RFC 7845) | ✅ Decode conformance-tested — 100% `final_range` on all 12 official RFC 6716 vectors; SILK-only vectors bit-exact. ✅ Encoder scope complete: CELT encoder (mono/stereo, fullband, CBR/VBR, all 4 frame sizes, transient/TF handling, M/S + intensity stereo, dynalloc steering), a complete SILK encoder (`SilkEncoder`: reference noise-shaping NSQ + delayed-decision NSQ behind `set_complexity`, per-frame rate control onto the caller's budget, mono + stereo adaptive mid/side, VAD, Burg LPC, NLSF interpolation, LBRR/FEC via `set_packet_loss_perc`, DTX, CBR payload sizing), SILK-mode `.opus` writing (`new_silk`/`new_silk_cbr`), and hybrid SILK+CELT writing (`new_hybrid`, TOC configs 12–15, mono or stereo on a shared range coder) — all decoder-bit-exact, with RFC 7845 pre-skip/granules recovering the exact input sample count |
 | [`tpt-av-cadence-ogg`](tpt-av-cadence-ogg) | Ogg page/packet container (RFC 3533) shared by Vorbis and Opus | ✅ In use |
 | [`tpt-av-cadence-aac`](tpt-av-cadence-aac) | AAC-LC (ISO/IEC 14496-3) | ✅ Conformance-tested (>100 dB SNR vs FFmpeg), decode-only |
-| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg) on ten bundled streams plus a generated 23-stream LAME oracle matrix (MPEG-1/2/2.5, 8–320 kbps ladder, all channel modes, feature-coverage-asserted) standing in for the unobtainable ISO/IEC 11172-4 vectors. ✅ Encoder: full CBR and loudness/quality-targeting VBR across MPEG-1/2/2.5 with bit-reservoir borrowing, short-block switching, mid/side + opt-in intensity stereo, and Info/Xing + LAME gapless tags — FFmpeg-accepted with passing inter-decoder fidelity gates (102–124 dB); only psycho-loop quality tuning remains open — see `todo.md` |
-| [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Decode conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures). ✅ First encoder landed (`VorbisEncoder`, floor 1 + coupled residue type 1, quality 0–10): FFmpeg-verified round trips at 136 dB; block switching, adaptive Huffman books, and psychoacoustic masking remain future work — see `todo.md` |
+| [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3) | MPEG Layer III | ✅ Decode conformance-tested (>100 dB SNR vs FFmpeg) on ten bundled streams plus a generated 23-stream LAME oracle matrix (MPEG-1/2/2.5, 8–320 kbps ladder, all channel modes, feature-coverage-asserted) standing in for the unobtainable ISO/IEC 11172-4 vectors. ✅ Encoder: full CBR and loudness/quality-targeting VBR across MPEG-1/2/2.5 with bit-reservoir borrowing, ISO start/short/stop window switching, mid/side + opt-in intensity stereo, and Info/Xing + LAME gapless tags. Gated against the *source signal* (tone purity 55–80 dB in every version family, sample-exact alignment, mid/side level, click-train pre-echo) and FFmpeg-decodable (90–120 dB inter-decoder); SNR matches libmp3lame at equal bitrate on stereo music. The masking-model outer loop is present but disabled (unvalidated perceptually) — see `todo.md` |
+| [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis) | Ogg Vorbis I | ✅ Decode conformance-tested (136–138 dB SNR vs FFmpeg on six bundled fixtures). ✅ Encoder (`VorbisEncoder`, floor 1 + coupled residue type 1, quality 0–10, exact input length via granule trimming): block switching (2048/256), a Bark-band masking model driving the floor, FFmpeg-verified round trips at 136 dB inter-decoder; per-file adaptive Huffman books remain future work and the masking constants are unvalidated by listening tests — see `todo.md` |
 | [`tpt-av-cadence-test-utils`](tpt-av-cadence-test-utils) | Conformance harness — FFmpeg comparison, fuzz helpers, MD5 | ✅ Internal (dev-only) |
 
 See [`capabilities.json`](capabilities.json) for a machine-readable version of this table
@@ -112,17 +115,14 @@ stderr; most write raw PCM to stdout — redirect it to a file:
 | MP3 | [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3/examples/mp3_decode.rs) | `cargo run -p tpt-av-cadence-mp3 --example mp3_decode -- song.mp3 > out.f32` |
 | AAC-LC (+ SBR/HE-AAC) | [`tpt-av-cadence-aac`](tpt-av-cadence-aac/examples/aac_dump.rs) | `cargo run -p tpt-av-cadence-aac --release --example aac_dump -- song.aac out.f32` |
 | Ogg Vorbis I | [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis/examples/vorbis_decode.rs) | `cargo run -p tpt-av-cadence-vorbis --example vorbis_decode -- file.ogg > out.f32` |
-| Opus (RFC 6716) | [`tpt-av-cadence-opus`](tpt-av-cadence-opus) | no dedicated `--example` yet — decode via [`tpt-av-cadence-cli`](tpt-av-cadence-cli) (`cadence decode song.opus`, see below) or `OggOpusReader` directly per the crate's own `# Example` in its `src/lib.rs` doc comment |
+| Opus (RFC 6716) | [`tpt-av-cadence-opus`](tpt-av-cadence-opus/examples/opus_decode.rs) | `cargo run -p tpt-av-cadence-opus --example opus_decode -- song.opus > out.f32` |
 
 `tpt-av-cadence-pcm`'s example takes the sample format on the command line
 (`s8`, `s16le`/`s16be`, `s24le`/`s24be`, `s32le`/`s32be`, `f32le`/`f32be`,
 `f64le`/`f64be`) since headerless PCM carries no self-describing metadata.
 
-Encoders exist today for the three uncompressed formats (WAV, AIFF, PCM),
-plus FLAC (lossless) and a bitstream-valid but not yet quality-competitive
-MP3 encoder; AAC and Vorbis are decode-only, and Opus has an encoder
-foundation (`CeltEncoder`: mono, fullband, non-transient, CBR, 20 ms frames
-only) that isn't wired up to a full `Encoder` impl yet:
+Encoders exist today for WAV, AIFF, PCM, FLAC (lossless), MP3, Ogg Vorbis,
+and Ogg Opus; AAC is decode-only:
 
 | Format | Crate | Run it |
 | :--- | :--- | :--- |
@@ -131,12 +131,13 @@ only) that isn't wired up to a full `Encoder` impl yet:
 | Raw PCM (headerless) | [`tpt-av-cadence-pcm`](tpt-av-cadence-pcm/examples/pcm_encode.rs) | `cargo run -p tpt-av-cadence-pcm --example pcm_encode -- tone.raw` |
 | FLAC | [`tpt-av-cadence-flac`](tpt-av-cadence-flac/examples/flac_encode.rs) | `cargo run -p tpt-av-cadence-flac --example flac_encode -- tone.flac` |
 | MP3 | [`tpt-av-cadence-mp3`](tpt-av-cadence-mp3/examples/mp3_encode.rs) | `cargo run -p tpt-av-cadence-mp3 --example mp3_encode -- tone.mp3` |
+| Ogg Vorbis | [`tpt-av-cadence-vorbis`](tpt-av-cadence-vorbis/examples/vorbis_encode.rs) | `cargo run -p tpt-av-cadence-vorbis --example vorbis_encode -- tone.ogg 5` (quality 0-10) |
+| Ogg Opus | [`tpt-av-cadence-opus`](tpt-av-cadence-opus/examples/opus_encode.rs) | `cargo run -p tpt-av-cadence-opus --example opus_encode -- tone.opus hybrid` (`celt`, `vbr`, `silk` or `hybrid`) |
 
-MP3's encoder produces valid, independently FFmpeg-decodable bitstreams,
-but its analysis filterbank is a generic approximation rather than the
-matched ISO reference prototype, so decoded audio fidelity is currently
-poor — see `todo.md`'s "MP3 encoder" notes before relying on it for
-anything but bitstream-shape testing.
+The MP3 encoder (CBR and VBR, MPEG-1/2/2.5) produces FFmpeg-decodable
+streams whose decode reproduces the source (see the fidelity gates in
+`tpt-av-cadence-mp3/tests/encoder_fidelity.rs`); what remains open is
+perceptual noise-shaping tuning, which needs listening tests — see `todo.md`.
 
 ### Decode any supported format to PCM
 
@@ -218,12 +219,12 @@ mature and more broadly capable than `tpt-cadence` today.
 
 | | `tpt-cadence` | [`symphonia`](https://github.com/pdeljanov/Symphonia) | [`hound`](https://github.com/ruuda/hound) | [`minimp3-rs`](https://github.com/germangb/minimp3-rs) |
 | :--- | :--- | :--- | :--- | :--- |
-| Scope | WAV/AIFF/PCM/FLAC decode+encode; MP3/AAC-LC+SBR/Opus/Vorbis decode-only | Very broad: demuxing (MP4/MKV/OGG/...) plus WAV, FLAC, MP3, AAC, Vorbis, Opus, ALAC, ADPCM decoders | WAV read + write only | MP3 decode only |
+| Scope | WAV/AIFF/PCM/FLAC/MP3/Opus/Vorbis decode+encode; AAC-LC+SBR decode-only | Very broad: demuxing (MP4/MKV/OGG/...) plus WAV, FLAC, MP3, AAC, Vorbis, Opus, ALAC, ADPCM decoders | WAV read + write only | MP3 decode only |
 | Implementation | Pure Rust, zero external audio dependencies, no `unsafe` in the decode/encode path (verified: no `unsafe` blocks, no `-sys` crates in the workspace) | Pure Rust | Pure Rust | Wraps the C `minimp3` library by default via FFI (`unsafe`); has an optional pure-Rust backend |
 | Conformance | Every decoder is validated against official reference vectors (e.g. bit-exact on all 12 RFC 6716 Opus test vectors, IETF FLAC testbench MD5s) and/or cross-checked against FFmpeg output at >100 dB SNR | Broad real-world use and testing; no published bit-exactness claims of this kind | Simple round-trip tests (WAV has no lossy path to conform against) | Relies on the underlying `minimp3` C decoder's own correctness |
 | Real-time safety | Explicit contract: all allocation happens at `open()`/`init()`; `decode()`/`encode()` are allocation-free, lock-free, and panic-free | Not a documented contract | N/A (simple I/O) | Not a documented contract |
 | Licensing | MIT OR Apache-2.0; whole dependency tree enforced permissive-only in CI via `cargo-deny` (no GPL/LGPL/MPL) | MPL-2.0 (copyleft on the crate itself) | MIT OR Apache-2.0 | MIT (bindings); links a C library at build time |
-| Maturity | Pre-1.0, very young (started Sept 2026), not yet published to crates.io | Mature, widely deployed, large contributor base | Mature, narrow scope, widely used | Mature, narrow scope |
+| Maturity | Pre-1.0, very young (started Sept 2026), 0.1.0 packaging prepared but not yet published to crates.io | Mature, widely deployed, large contributor base | Mature, narrow scope, widely used | Mature, narrow scope |
 
 Format-specific incumbents worth knowing about too:
 
@@ -238,9 +239,11 @@ against official references rather than only exercised in aggregate.
 
 **Why you might not (yet):** it's a young, pre-1.0 project — smaller
 ecosystem and less battle-tested in production than `symphonia`; compressed
-encoders are incomplete (FLAC is limited to fixed predictors and MP3 has
-poor fidelity; Opus is CELT-only without psychoacoustic tuning or hybrid
-SILK/CELT support); no container demuxing (that's `tpt-kinetix`'s job, not this
+encoders are functional and source-verified but their perceptual noise
+shaping is unvalidated (the MP3 outer psychoacoustic loop is disabled and
+Vorbis's masking model has had no listening tests; Vorbis also lacks
+adaptive Huffman books and its quality ceiling is about 22 dB SNR on music, 31 dB on pure tones, at q10); AAC has no
+encoder; no container demuxing (that's `tpt-kinetix`'s job, not this
 crate's); not yet
 published to crates.io; and there's no published benchmark suite yet, so no
 performance claims are made here one way or the other. Development so far has been on Windows/MSVC, though CI

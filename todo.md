@@ -3820,3 +3820,73 @@ frame's back half, not the previous frame's stored value) reproduces the
 defect on the dual-mono click train; the measurement-domain and shared
 per-channel-verdict fixes are hardening for asymmetric stereo, not what
 cured this repro.
+
+
+### Session log (2026-09-30, fifth): pre-release capability pass — MP3 fidelity rescue, FLAC LPC, Vorbis block switching
+
+**Headline finding: the MP3 encoder did not reproduce its source.** Every
+prior gate compared this crate's decoder against FFmpeg's, which only proves
+both read the bitstream the same way. Benchmarking against libmp3lame
+(`ffmpeg -c:a libmp3lame`, same bitrate, SNR and Bark-band SNR against the
+source) showed a 1 kHz tone at 320 kbps coming back at ~10 dB
+tone-to-noise and stereo music at ~1 dB SNR. Three independent causes, all
+fixed and now pinned by `tpt-av-cadence-mp3/tests/encoder_fidelity.rs`:
+
+1. `analyze_channel` fed every granule's MDCT the *last granule of the
+   frame* as its overlap half (history is advanced by the polyphase loop
+   before the MDCT loop runs) — TDAC broken, ±25 % amplitude ripple.
+2. Mid/side used `K = 2^-3/2`; the decoder's ms gain shift only moves the
+   quantizer step (the encoder quantizes with the same shifted gain), so
+   the right factor is `1/2`. Every M/S frame decoded 3 dB quiet. The
+   intensity-stereo source scale had been tuned to the wrong M/S scale and
+   was re-derived (`1/sqrt(2)` in M/S mode).
+3. The short-block solver targeted one granule too early (block g covers
+   rows `[R[g-1], R[g]]`, the solver used `[R[g], R[g+1]]`): clicks decoded
+   576 samples ahead. Replaced by proper ISO window switching
+   (`long -> start -> short -> stop`): forward bases for start/stop derived
+   by probing the decoder's window kernels (`Mdct36Basis::new(cur, next)`
+   with `MDCT_WINDOW[0/1]`), the short solver now takes `[prev rows,
+   cur rows 0..12]`, one granule of PCM look-ahead decides the start block,
+   detector runs on quarter-granule energies. The zero-line stop/bridge
+   scheme (which faded every granule next to an attack) is gone.
+
+Also: `ENCODER_DELAY` 574 -> 528 (it had been measured on the broken
+encoder); the MP3 *decoder's* gapless trim now removes the decoder's own
+528 + 1 delay too (FFmpeg's convention; tagged streams were 529 samples late
+in this crate's decoder while length stayed exact). Inter-decoder gates on
+transient material relaxed 100 -> 90 dB (real content in the transition
+granules; FFmpeg's integer escape requantization differs in the last bits).
+
+Result vs libmp3lame on stereo music (SNR / band-SNR, dB): 96 kbps 16.3/15.3
+vs 15.7/16.6; 128 kbps 20.8/20.2 vs 20.4/19.7; 192 kbps 25.7/26.2 vs
+27.9/26.7. Tone purity 55-80 dB in all nine sample rates, mono and stereo.
+
+`PSY_AMPLIFICATION_ROUNDS` is still 0 (the outer psychoacoustic loop is
+disabled, so the encoder is a flat-quantizer MSE coder). Enabling it trades
+SNR for masking-model shaping; that needs listening tests, which this
+environment cannot run. Left off deliberately.
+
+**FLAC encoder**: full LPC search (Tukey window, Levinson-Durbin to order 12,
+each order priced by its real coded size), stereo decorrelation, wasted bits,
+real STREAMINFO MD5 and frame-size fields. ~13 % smaller than FFmpeg's
+`-compression_level 8` on the sample music, bit-exact round trips.
+
+**Vorbis encoder**: block switching (2048/256; second floor/residue/mapping/
+mode; detector over a 1088-sample look-ahead; short runs walk up to the
+attack) and a masking model (`psy.rs`: Bark bands, Schroeder spreading,
+tonality offsets, ATH) replacing the envelope-tracking floor rule. Honest
+status: the block switching is verified (pre-echo confined to the short
+block, FFmpeg agreement at 136 dB); the masking model is a standard model
+with unvalidated constants — on an objective band-SNR proxy it is level with
+the rule it replaced (which the proxy favours), so it is a principled basis,
+not a demonstrated perceptual gain. Quality ceiling: music ~22 dB SNR at q10 (~185 kbps), pure tones reach ~31 dB
+SNR at q10 (clamp of the quantized residue at +-250 and static books).
+
+**Examples**: `opus_encode` (celt/vbr/silk/hybrid), `opus_decode`,
+`vorbis_encode`.
+
+Open work after this session:
+1. Release prep (commit, `tools/release_prep.py --prepare 0.1.0`, tag, push).
+2. Listening-test validation of noise shaping (MP3 outer loop, Vorbis
+   masking model); Vorbis adaptive Huffman books and a higher residue range.
+3. FLAC: variable block size / block-size search, more LPC windows.

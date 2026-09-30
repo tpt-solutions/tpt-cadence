@@ -7,6 +7,33 @@ version; 0.1.0 is the first crates.io release. Format loosely follows [Keep a Ch
 ## [Unreleased]
 
 ### Added
+- `tpt-av-cadence-mp3` window switching rebuilt on the ISO sequence
+  `long -> start -> short -> stop`: start and stop blocks now carry real
+  content (the forward bases are derived by probing the decoder's own
+  window kernels), a short run owns rows `[prev 6..18, cur 0..12]` of its
+  frame, and one granule of PCM look-ahead decides whether a frame's last
+  block must be a start block. Replaces the zero-line stop/bridge scheme,
+  which faded the granules around every attack and (see Fixed) placed
+  short-block content one granule early.
+- `tests/encoder_fidelity.rs` (MP3): source-referenced gates — tone
+  amplitude and purity in every version family (55-80 dB), tone purity
+  across the spectrum, mid/side level, independent channels, VBR,
+  intensity-stereo level, sample-exact alignment of broadband material, and
+  click-train pre-echo confinement. Measured against libmp3lame on stereo
+  music the encoder now matches its SNR at 96/128/192 kbps.
+- `tpt-av-cadence-flac` encoder: full LPC search (orders up to 12 from one
+  windowed Levinson-Durbin pass, priced by real coded size), stereo
+  decorrelation (left/side, side/right, mid/side chosen per frame), wasted-bit
+  detection, real STREAMINFO MD5 and min/max frame sizes. Output is about
+  13 % smaller than FFmpeg's `-compression_level 8` on the sample music and
+  still decodes bit-exact.
+- `tpt-av-cadence-vorbis` encoder: block switching (2048/256 blocks, second
+  mode/mapping/floor/residue set, transient detector, pre-echo test) and a
+  psychoacoustic masking model (Bark bands, Schroeder spreading,
+  tonality-dependent offsets, absolute threshold of hearing) driving the
+  floor. The model is standard but unvalidated by listening tests.
+- Examples: `opus_encode` (`celt|vbr|silk|hybrid`), `opus_decode`,
+  `vorbis_encode`.
 - Ogg Vorbis encoder (`tpt-av-cadence-vorbis`): `VorbisEncoder::new(sink,
   rate, 1|2 channels, quality 0..=10)` — single 2048-sample block
   size/mode, floor 1 (34 posts fitted and then decoded back through the
@@ -450,6 +477,26 @@ version; 0.1.0 is the first crates.io release. Format loosely follows [Keep a Ch
   scope.
 
 ### Fixed
+- **MP3 encoder fidelity (release blocker).** Every previous gate compared
+  this crate's decoder with FFmpeg's, which only proves both read the
+  bitstream identically; benchmarking against libmp3lame showed the encoder
+  coded the wrong signal (a 1 kHz tone at 320 kbps came back at 10 dB
+  tone-to-noise, stereo music at 1 dB SNR). Three independent defects:
+  1. the MDCT's overlap half used the *last granule of the frame* for every
+     granule instead of the previous granule, breaking TDAC;
+  2. mid/side coding used `2^-3/2` where `1/2` is correct, so every M/S frame
+     decoded 3 dB quiet (the decoder's ms gain shift only moves the step
+     size);
+  3. the short-block solver targeted one granule too early, placing clicks
+     576 samples ahead of where they belong.
+  Also the Info-tag encoder delay was 574 (measured on the broken encoder);
+  it is 528. The MP3 decoder's gapless trim now also removes the decoder's
+  own 528 + 1 sample synthesis delay (as FFmpeg does), so a tagged stream
+  decodes aligned with its source instead of 529 samples late; the encoder's
+  intensity source scale was re-derived for the corrected mid/side scale.
+  Inter-decoder gates on transient material are 90 dB rather than 100 dB:
+  the granules now carry real content, and FFmpeg's integer escape
+  requantization differs from the float path in the last bits.
 - `tpt-av-cadence-mp3`'s decoder applied minimp3's non-standard LSF
   intensity-stereo position ladder (integer power-of-two ratios with a 64
   position ceiling) instead of the ISO/IEC 13818-3 semantics FFmpeg
