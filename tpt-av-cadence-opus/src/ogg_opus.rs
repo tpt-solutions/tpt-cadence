@@ -278,7 +278,8 @@ impl OggOpusDecoder {
             // mirroring opusfile: an EOS page that carries no packets
             // cannot trim audio that has already been emitted.)
             let out_start = start.max(self.head.pre_skip as u64);
-            let skip = (out_start - start) as usize;
+            // A packet shorter than the remaining pre-skip is skipped whole.
+            let skip = ((out_start - start) as usize).min(n);
             let mut out_frames = n - skip;
             if let Some(end) = self.stream_end {
                 out_frames = out_frames.min(end.saturating_sub(out_start) as usize);

@@ -839,3 +839,29 @@ fn ogg_opus_encoder_vbr_round_trips_and_varies_packet_sizes() {
         "VBR audio packets should vary in size: {vbr_audio:?}"
     )
 }
+
+/// Fuzzer-found stream (libFuzzer timeout/OOM): must terminate promptly.
+#[test]
+fn fuzz_regression_stall() {
+    use tpt_av_cadence_core::FormatReader;
+    let data = include_bytes!("data/fuzz_ogg_stall.bin").to_vec();
+    let Ok(mut reader) =
+        tpt_av_cadence_opus::OggOpusReader::from_source(Box::new(std::io::Cursor::new(data)))
+    else {
+        return;
+    };
+    let dec = reader.decoder();
+    let ch = dec.info().channels.max(1) as usize;
+    let mut buf = vec![0.0f32; 4096 * ch];
+    let mut total = 0usize;
+    loop {
+        match dec.decode(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                total += n;
+                assert!(total < 100_000_000, "unbounded output");
+            }
+        }
+    }
+    let _ = dec.seek(0);
+}
