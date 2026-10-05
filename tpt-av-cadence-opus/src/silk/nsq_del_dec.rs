@@ -71,7 +71,7 @@ struct DelDecState {
     /// Short-term prediction state (Q14, scaled domain): the history in
     /// `[..NSQ_LPC_BUF_LENGTH]`, the current subframe's committed `xq`
     /// samples from `[NSQ_LPC_BUF_LENGTH..]`.
-    s_lpc_q14: Vec<i32>,
+    s_lpc_q14: [i32; MAX_SUB_FRAME_LENGTH + NSQ_LPC_BUF_LENGTH],
     /// Dither-seed history ring, used to spot paths whose committed
     /// decisions `decisionDelay` back differ from the winner's
     /// ("expired" paths).
@@ -101,7 +101,7 @@ impl DelDecState {
     /// start from the shared NSQ state; only the seeds differ).
     fn new(nsq: &NsqState, ltp_mem_length: usize, seed: i32) -> Self {
         let mut s = DelDecState {
-            s_lpc_q14: vec![0; MAX_SUB_FRAME_LENGTH + NSQ_LPC_BUF_LENGTH],
+            s_lpc_q14: [0; MAX_SUB_FRAME_LENGTH + NSQ_LPC_BUF_LENGTH],
             rand_state: [0; DECISION_DELAY],
             q_q10: [0; DECISION_DELAY],
             xq_q14: [0; DECISION_DELAY],
@@ -181,15 +181,17 @@ pub(crate) fn nsq_del_dec(
     let mut lag = nsq.lag_prev.max(0) as i64;
 
     // Initialize delayed decision states.
-    let mut del_dec: Vec<DelDecState> = (0..n_states_delayed_decision)
-        .map(|k| {
-            DelDecState::new(
-                nsq,
-                ltp_mem_length,
-                (k as i32 + i32::from(indices.seed)) & 3,
-            )
-        })
-        .collect();
+    // Fixed array of paths, sliced to the active count — no per-frame heap
+    // allocation for the delayed-decision tree.
+    debug_assert!(n_states_delayed_decision <= MAX_DEL_DEC_STATES);
+    let mut del_dec: [DelDecState; MAX_DEL_DEC_STATES] = std::array::from_fn(|k| {
+        DelDecState::new(
+            nsq,
+            ltp_mem_length,
+            (k as i32 + i32::from(indices.seed)) & 3,
+        )
+    });
+    let n_states = n_states_delayed_decision;
 
     let offset_q10 = QUANTIZATION_OFFSETS_Q10[(indices.signal_type >> 1) as usize]
         [indices.quant_offset_type as usize] as i32;
@@ -244,13 +246,13 @@ pub(crate) fn nsq_del_dec(
                     // rate/distortion is penalized out of reach.
                     let mut winner = 0usize;
                     let mut rd_min = del_dec[0].rd_q10;
-                    for (i, s) in del_dec.iter().enumerate().skip(1) {
+                    for (i, s) in del_dec[..n_states].iter().enumerate().skip(1) {
                         if s.rd_q10 < rd_min {
                             rd_min = s.rd_q10;
                             winner = i;
                         }
                     }
-                    for (i, s) in del_dec.iter_mut().enumerate() {
+                    for (i, s) in del_dec[..n_states].iter_mut().enumerate() {
                         if i != winner {
                             s.rd_q10 = s.rd_q10.saturating_add(i32::MAX >> 4);
                         }
@@ -316,7 +318,7 @@ pub(crate) fn nsq_del_dec(
 
         scale_states_del_dec(
             nsq,
-            &mut del_dec,
+            &mut del_dec[..n_states],
             &x16[k * subfr_length..],
             &mut x_sc_q10,
             &s_ltp,
@@ -333,7 +335,7 @@ pub(crate) fn nsq_del_dec(
 
         noise_shape_quantizer_del_dec(
             nsq,
-            &mut del_dec,
+            &mut del_dec[..n_states],
             indices.signal_type,
             &x_sc_q10,
             &mut pulses,
@@ -367,7 +369,7 @@ pub(crate) fn nsq_del_dec(
     // Find the frame's winner and copy its pending tail (the last
     // `decisionDelay` samples of the frame) to the output and states.
     let mut winner = 0usize;
-    for (i, s) in del_dec.iter().enumerate().skip(1) {
+    for (i, s) in del_dec[..n_states].iter().enumerate().skip(1) {
         if s.rd_q10 < del_dec[winner].rd_q10 {
             winner = i;
         }
@@ -448,7 +450,7 @@ fn noise_shape_quantizer_del_dec(
     let mut pred_lag_ptr = nsq.s_ltp_buf_idx as i64 - lag + LTP_ORDER as i64 / 2;
     let gain_q10 = gain_q16 >> 6;
 
-    let mut ps_sample_state = vec![[NsqSample::ZERO; 2]; n_states_delayed_decision];
+    let mut ps_sample_state = [[NsqSample::ZERO; 2]; MAX_DEL_DEC_STATES];
 
     for (i, &x) in x_q10.iter().enumerate().take(length) {
         /* Perform common calculations used in all states */

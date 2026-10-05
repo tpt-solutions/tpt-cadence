@@ -340,6 +340,9 @@ struct Transform {
     fft: Fft,
     pre: Vec<C>,
     post: Vec<C>,
+    /// Reused FFT scratch (input and output sides of `Fft::run`).
+    g: Vec<C>,
+    o: Vec<C>,
 }
 
 impl Transform {
@@ -363,6 +366,8 @@ impl Transform {
             fft: Fft::new(n, true),
             pre,
             post,
+            g: vec![C::default(); n],
+            o: vec![C::default(); n],
         }
     }
 
@@ -370,14 +375,12 @@ impl Transform {
     fn forward(&mut self, x: &[f32], out: &mut [f32]) {
         let n = self.n;
         let scale = 4.0 / n as f32;
-        let mut g = vec![C::default(); n];
-        for k in 0..n {
-            g[k] = C::new(x[k] * self.pre[k].re, x[k] * self.pre[k].im);
+        for (g, (&x, pre)) in self.g.iter_mut().zip(x.iter().zip(&self.pre)) {
+            *g = C::new(x * pre.re, x * pre.im);
         }
-        let mut o = vec![C::default(); n];
-        self.fft.run(&g, &mut o);
-        for k in 0..n / 2 {
-            out[k] = scale * (o[k].re * self.post[k].re - o[k].im * self.post[k].im);
+        self.fft.run(&self.g, &mut self.o);
+        for (o, (&v, post)) in out.iter_mut().zip(self.o.iter().zip(&self.post)) {
+            *o = scale * (v.re * post.re - v.im * post.im);
         }
     }
 }
@@ -430,6 +433,9 @@ pub struct VorbisEncoder<W: Write + Send> {
     b3: VqBook,
     /// `[short, long]` transforms and window slopes.
     transforms: [Transform; 2],
+    /// Cached windows per (long, prev_long, next_long) combination — at
+    /// most eight distinct shapes, each depending only on the slopes.
+    windows: [Option<Vec<f32>>; 8],
     slopes: [Vec<f32>; 2],
     /// Masking model deriving per-bin noise thresholds from each spectrum.
     psy: Psy,
@@ -628,6 +634,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
             b2,
             b3,
             transforms,
+            windows: [const { None }; 8],
             slopes,
             psy,
             floor_gain: 10f64.powf(gain_db / 20.0) as f32,
@@ -651,8 +658,15 @@ impl<W: Write + Send> VorbisEncoder<W> {
         self.short_blocks
     }
 
+    /// Cache slot index for a block spec.
+    fn window_slot(spec: BlockSpec) -> usize {
+        (usize::from(spec.long) << 2)
+            | (usize::from(spec.prev_long) << 1)
+            | usize::from(spec.next_long)
+    }
+
     /// The Vorbis window for a block of the given size and neighbors.
-    fn window(&self, spec: BlockSpec) -> Vec<f32> {
+    fn build_window(&self, spec: BlockSpec) -> Vec<f32> {
         let n = if spec.long { N } else { SN };
         let half = n / 2;
         let mut w = vec![0.0f32; n];
@@ -801,7 +815,14 @@ impl<W: Write + Send> VorbisEncoder<W> {
             pkt.write(u32::from(spec.next_long), 1);
         }
 
-        let window = self.window(spec);
+        let wslot = Self::window_slot(spec);
+        if self.windows[wslot].is_none() {
+            let w = self.build_window(spec);
+            self.windows[wslot] = Some(w);
+        }
+        let window = self.windows[wslot]
+            .as_deref()
+            .expect("window cache filled above");
         let start = self.center - n / 2 - self.buf_start;
 
         // Analysis + floors.
@@ -809,7 +830,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
         for c in 0..ch {
             let windowed: Vec<f32> = self.inbuf[c][start..start + n]
                 .iter()
-                .zip(&window)
+                .zip(window.iter())
                 .map(|(x, w)| x * w)
                 .collect();
             let mut coefs = vec![0.0f32; m];

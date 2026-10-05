@@ -219,10 +219,13 @@ struct PartitionPlan {
     raw_bits: Option<u32>,
 }
 
-/// Picks the cheaper of a Rice-coded or raw/escaped partition.
-fn plan_partition(vals: &[i32]) -> (PartitionPlan, u64) {
-    let zz: Vec<u32> = vals.iter().map(|&v| zigzag(v)).collect();
-    let (k, rice_cost) = best_rice_param(&zz);
+/// Picks the cheaper of a Rice-coded or raw/escaped partition. `vals` are
+/// the raw residual samples and `zz` their zigzag map (same positions), so
+/// callers that price many partitions over the same residual can build `zz`
+/// once instead of per partition.
+fn plan_partition(vals: &[i32], zz: &[u32]) -> (PartitionPlan, u64) {
+    debug_assert_eq!(vals.len(), zz.len());
+    let (k, rice_cost) = best_rice_param(zz);
     let rice_total = 5 + rice_cost; // 5-bit parameter field (Rice2) + payload
 
     if let Some(raw_bits) = signed_bits_needed(vals) {
@@ -264,6 +267,10 @@ fn plan_residual(vals: &[i32], block_size: usize, order: usize) -> (u32, Vec<Par
         max_po = next;
     }
 
+    // Zigzag once: every candidate order's partitions are contiguous slices
+    // of the same mapped residual, and `best_rice_param` sees the identical
+    // values in the identical order either way.
+    let zz: Vec<u32> = vals.iter().map(|&v| zigzag(v)).collect();
     let mut best: Option<(u32, Vec<PartitionPlan>, u64)> = None;
     for po in 0..=max_po {
         let part_count = 1usize << po;
@@ -278,7 +285,7 @@ fn plan_residual(vals: &[i32], block_size: usize, order: usize) -> (u32, Vec<Par
             } else {
                 block_size >> po
             };
-            let (plan, cost) = plan_partition(&vals[pos..pos + count]);
+            let (plan, cost) = plan_partition(&vals[pos..pos + count], &zz[pos..pos + count]);
             total += cost;
             plans.push(plan);
             pos += count;
@@ -417,7 +424,6 @@ struct Candidate {
     order: usize,
     /// `Some((coefs, shift, precision))` for LPC, `None` for FIXED.
     lpc: Option<(Vec<i64>, u32, u32)>,
-    residual: Vec<i32>,
     po: u32,
     plans: Vec<PartitionPlan>,
 }
@@ -464,7 +470,11 @@ fn encode_subframe(samples: &[i32], bps: u32) -> BitWriter {
     let n = samples.len();
     let verbatim_cost = n as u64 * bps as u64;
     let mut best: Option<Candidate> = None;
+    // The winning candidate's residual lives in its own buffer: when a new
+    // best appears, scratch and best_residual swap (both are fully refilled
+    // by the next compute pass), so no residual is ever cloned.
     let mut scratch: Vec<i32> = Vec::with_capacity(n);
+    let mut best_residual: Vec<i32> = Vec::with_capacity(n);
 
     // FIXED predictors, orders 0..=4.
     for order in 0..=4usize.min(n) {
@@ -472,11 +482,11 @@ fn encode_subframe(samples: &[i32], bps: u32) -> BitWriter {
         let (po, plans, rc) = plan_residual(&scratch[order..], n, order);
         let cost = order as u64 * bps as u64 + 2 + rc;
         if best.as_ref().map_or(true, |b| cost < b.cost) {
+            std::mem::swap(&mut scratch, &mut best_residual);
             best = Some(Candidate {
                 cost,
                 order,
                 lpc: None,
-                residual: scratch.clone(),
                 po,
                 plans,
             });
@@ -508,11 +518,11 @@ fn encode_subframe(samples: &[i32], bps: u32) -> BitWriter {
             let (po, plans, rc) = plan_residual(&scratch[order..], n, order);
             let cost = order as u64 * (bps as u64 + precision as u64) + 4 + 5 + 2 + rc;
             if best.as_ref().map_or(true, |b| cost < b.cost) {
+                std::mem::swap(&mut scratch, &mut best_residual);
                 best = Some(Candidate {
                     cost,
                     order,
                     lpc: Some((coefs, shift, precision)),
-                    residual: scratch.clone(),
                     po,
                     plans,
                 });
@@ -554,7 +564,7 @@ fn encode_subframe(samples: &[i32], bps: u32) -> BitWriter {
     }
     write_residual(
         &mut bw,
-        &best.residual[order..],
+        &best_residual[order..],
         n,
         order,
         best.po,
@@ -593,6 +603,8 @@ pub struct FlacEncoder<W: Write + Seek> {
     finished: bool,
 
     md5: Md5,
+    /// Reused interleave buffer for the MD5 feed (see `emit_frame`).
+    md5_buf: Vec<u8>,
     min_frame_bytes: usize,
     max_frame_bytes: usize,
 }
@@ -636,6 +648,7 @@ impl<W: Write + Seek> FlacEncoder<W> {
             max_block_used: 0,
             finished: false,
             md5: Md5::new(),
+            md5_buf: Vec::new(),
             min_frame_bytes: usize::MAX,
             max_frame_bytes: 0,
         })
@@ -707,15 +720,41 @@ impl<W: Write + Seek> FlacEncoder<W> {
         self.sink.write_all(&bw.bytes)?;
 
         // Feed the STREAMINFO signature: unencoded samples, interleaved,
-        // little-endian, ceil(bps/8) bytes each.
+        // little-endian, ceil(bps/8) bytes each. The interleave buffer is
+        // reused across frames, with byte-level fast paths for the common
+        // 16- and 24-bit depths.
         let width = (self.bits_per_sample as usize).div_ceil(8);
-        let mut raw = Vec::with_capacity(count * self.channels as usize * width);
-        for i in 0..count {
-            for c in 0..self.channels as usize {
-                raw.extend_from_slice(&self.channel_buf[c][i].to_le_bytes()[..width]);
+        let channels = self.channels as usize;
+        self.md5_buf.clear();
+        self.md5_buf.reserve(count * channels * width);
+        let buf = &mut self.md5_buf;
+        match width {
+            2 => {
+                for i in 0..count {
+                    for c in 0..channels {
+                        buf.extend_from_slice(&(self.channel_buf[c][i] as u16).to_le_bytes());
+                    }
+                }
+            }
+            3 => {
+                for i in 0..count {
+                    for c in 0..channels {
+                        let b = self.channel_buf[c][i].to_le_bytes();
+                        buf.push(b[0]);
+                        buf.push(b[1]);
+                        buf.push(b[2]);
+                    }
+                }
+            }
+            _ => {
+                for i in 0..count {
+                    for c in 0..channels {
+                        buf.extend_from_slice(&self.channel_buf[c][i].to_le_bytes()[..width]);
+                    }
+                }
             }
         }
-        self.md5.update(&raw);
+        self.md5.update(&self.md5_buf);
         self.min_frame_bytes = self.min_frame_bytes.min(bw.bytes.len());
         self.max_frame_bytes = self.max_frame_bytes.max(bw.bytes.len());
 

@@ -34,15 +34,16 @@ pub struct AiffDecoder {
     total_frames: u64,
     frames_decoded: u64,
     block_align: usize,
-    /// One sample frame of raw bytes; allocated once at open time.
-    frame: Box<[u8]>,
+    /// Bulk-read slab for [`Decoder::decode`] (a whole number of frames);
+    /// allocated once at open time.
+    slab: Box<[u8]>,
 }
 
 impl AiffDecoder {
     /// Opens an AIFF/AIFC file over a byte source. Seekable sources
     /// (`Read + Seek + Send`) get working `seek()`.
     pub fn from_source(source: Box<dyn ByteSource>) -> Result<Self, CadenceError> {
-        let mut source = BufferedSource::new(source, 8192);
+        let mut source = BufferedSource::new(source, 64 * 1024);
         reader::parse_form_header(&mut source)?;
 
         let mut comm = None;
@@ -142,7 +143,12 @@ impl AiffDecoder {
             total_frames,
             frames_decoded: 0,
             block_align,
-            frame: vec![0u8; block_align].into_boxed_slice(),
+            // ~4096 frames per bulk read, capped so wide/high-depth formats
+            // don't push the slab past 256 KiB.
+            slab: {
+                let slab_frames = (256 * 1024 / block_align).clamp(1, 4096);
+                vec![0u8; block_align * slab_frames].into_boxed_slice()
+            },
         })
     }
 
@@ -151,56 +157,71 @@ impl AiffDecoder {
         Self::from_source(Box::new(Unseekable(source)))
     }
 
-    /// Converts one raw sample into `f32` according to the resolved encoding.
-    fn convert_sample(&self, bytes: &[u8]) -> f32 {
+    /// Converts a whole slab of interleaved samples into `out` (also
+    /// interleaved, `slab.len() / bytes_per_sample` samples). The format and
+    /// endianness match is hoisted out of the per-sample loop; the arithmetic
+    /// is unchanged from the old per-sample `convert_sample`, so output is
+    /// bit-identical.
+    fn convert_slab(&self, slab: &[u8], out: &mut [f32]) {
         let be = self.endian == Endian::Big;
         match self.sample_format {
             // AIFF stores 8-bit PCM *signed* (unlike WAV's unsigned form).
-            SampleFormat::Int8 => int_to_f32(bytes[0] as i8 as i64, 8),
+            SampleFormat::Int8 => {
+                for (o, b) in out.iter_mut().zip(slab) {
+                    *o = int_to_f32(*b as i8 as i64, 8);
+                }
+            }
             SampleFormat::Int16 => {
-                let v = if be {
-                    i16::from_be_bytes([bytes[0], bytes[1]])
-                } else {
-                    i16::from_le_bytes([bytes[0], bytes[1]])
-                };
-                int_to_f32(v as i64, 16)
+                for (o, b) in out.iter_mut().zip(slab.chunks_exact(2)) {
+                    let v = if be {
+                        i16::from_be_bytes([b[0], b[1]])
+                    } else {
+                        i16::from_le_bytes([b[0], b[1]])
+                    };
+                    *o = int_to_f32(v as i64, 16);
+                }
             }
             SampleFormat::Int24 => {
-                let (hi, mid, lo) = if be {
-                    (bytes[0], bytes[1], bytes[2])
-                } else {
-                    (bytes[2], bytes[1], bytes[0])
-                };
-                let mut v = (lo as i32) | ((mid as i32) << 8) | ((hi as i32) << 16);
-                if v >= 1 << 23 {
-                    v -= 1 << 24;
+                for (o, b) in out.iter_mut().zip(slab.chunks_exact(3)) {
+                    let (hi, mid, lo) = if be {
+                        (b[0], b[1], b[2])
+                    } else {
+                        (b[2], b[1], b[0])
+                    };
+                    let mut v = (lo as i32) | ((mid as i32) << 8) | ((hi as i32) << 16);
+                    if v >= 1 << 23 {
+                        v -= 1 << 24;
+                    }
+                    *o = int_to_f32(v as i64, 24);
                 }
-                int_to_f32(v as i64, 24)
             }
             SampleFormat::Int32 => {
-                let b = [bytes[0], bytes[1], bytes[2], bytes[3]];
-                let v = if be {
-                    i32::from_be_bytes(b)
-                } else {
-                    i32::from_le_bytes(b)
-                };
-                int_to_f32(v as i64, 32)
+                for (o, b) in out.iter_mut().zip(slab.chunks_exact(4)) {
+                    let v = if be {
+                        i32::from_be_bytes([b[0], b[1], b[2], b[3]])
+                    } else {
+                        i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    };
+                    *o = int_to_f32(v as i64, 32);
+                }
             }
             SampleFormat::Float32 => {
-                let b = [bytes[0], bytes[1], bytes[2], bytes[3]];
-                if be {
-                    f32::from_be_bytes(b)
-                } else {
-                    f32::from_le_bytes(b)
+                for (o, b) in out.iter_mut().zip(slab.chunks_exact(4)) {
+                    *o = if be {
+                        f32::from_be_bytes([b[0], b[1], b[2], b[3]])
+                    } else {
+                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    };
                 }
             }
             SampleFormat::Float64 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&bytes[..8]);
-                if be {
-                    f64::from_be_bytes(b) as f32
-                } else {
-                    f64::from_le_bytes(b) as f32
+                for (o, b) in out.iter_mut().zip(slab.chunks_exact(8)) {
+                    let bytes = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+                    *o = if be {
+                        f64::from_be_bytes(bytes) as f32
+                    } else {
+                        f64::from_le_bytes(bytes) as f32
+                    };
                 }
             }
         }
@@ -282,21 +303,21 @@ impl Decoder for AiffDecoder {
         let want_frames =
             (buffer.len() / channels).min((self.total_frames - self.frames_decoded) as usize);
         let mut frames = 0;
+        // Bulk-read whole frames into the slab, then convert in one pass —
+        // the format dispatch happens once per call, not once per sample.
+        // Truncated sound data (a trailing partial frame) ends the stream.
         while frames < want_frames {
-            match self.source.take_exact(&mut self.frame) {
-                Ok(()) => {
-                    let bps = self.sample_format.bytes_per_sample() as usize;
-                    let out = &mut buffer[frames * channels..(frames + 1) * channels];
-                    for (ch, slot) in out.iter_mut().enumerate() {
-                        *slot = self.convert_sample(&self.frame[ch * bps..(ch + 1) * bps]);
-                    }
-                    frames += 1;
-                    self.frames_decoded += 1;
-                }
-                // Truncated sound data ends the stream.
-                Err(CadenceError::EndOfStream) => break,
-                Err(e) => return Err(e),
+            let want_bytes = ((want_frames - frames) * self.block_align).min(self.slab.len());
+            let got = self.source.take_up_to(&mut self.slab[..want_bytes])?;
+            let whole = got - got % self.block_align;
+            if whole == 0 {
+                break;
             }
+            let got_frames = whole / self.block_align;
+            let out = &mut buffer[frames * channels..(frames + got_frames) * channels];
+            self.convert_slab(&self.slab[..whole], out);
+            frames += got_frames;
+            self.frames_decoded += got_frames as u64;
         }
         Ok(frames)
     }

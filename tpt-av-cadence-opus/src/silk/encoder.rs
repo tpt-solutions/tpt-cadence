@@ -108,6 +108,13 @@ use crate::silk::tables::{
 use crate::{CadenceError, Result};
 
 /// `FIND_PITCH_WHITE_NOISE_FRACTION` (`silk/tuning_parameters.h`).
+/// `x_buf` capacity: LTP memory (20 ms) + one frame + shaping look-ahead,
+/// all at the 16 kHz internal-rate cap.
+const X_BUF_MAX: usize = 20 * 16 + MAX_FRAME_LENGTH + LA_SHAPE_MAX;
+
+/// `last_xq_buf` capacity: every SILK frame of one packet (3 x 20 ms).
+const LAST_XQ_MAX: usize = MAX_FRAMES_PER_PACKET * MAX_FRAME_LENGTH;
+
 const FIND_PITCH_WHITE_NOISE_FRACTION: f32 = 1e-3;
 /// `FIND_PITCH_BANDWIDTH_EXPANSION`.
 const FIND_PITCH_BANDWIDTH_EXPANSION: f32 = 0.99;
@@ -234,7 +241,10 @@ struct ChannelState {
     /// `[ltp_mem history | current frame | la_shape look-ahead]` at the
     /// internal rate. The trailing look-ahead is zero-filled (see
     /// [`crate::silk::noise_shape`]).
-    x_buf: Vec<f32>,
+    /// Analysis buffer (LTP memory + current frame + shaping look-ahead),
+    /// fixed capacity (`X_BUF_MAX`): every frame's CBR snapshot/restore
+    /// clones it, which used to mean a heap Vec per channel per frame.
+    x_buf: [f32; X_BUF_MAX],
     vad_flags: [bool; MAX_FRAMES_PER_PACKET],
     nsq: crate::silk::nsq_ref::NsqState,
 
@@ -249,7 +259,11 @@ struct ChannelState {
     speech_activity_q8: i32,
 
     /* Analysis output retained for the caller/tests */
-    last_xq: Vec<i16>,
+    /// Reconstruction history for `last_reconstructed_frame` (the
+    /// packet's frames so far, internal rate) — fixed capacity, logical
+    /// length in `last_xq_len`.
+    last_xq_buf: [i16; LAST_XQ_MAX],
+    last_xq_len: usize,
 }
 
 impl ChannelState {
@@ -294,11 +308,12 @@ impl ChannelState {
             first_frame_after_reset: true,
             indices: SideInfoIndices::default(),
             resampler,
-            x_buf: vec![0.0; ltp_mem_length + frame_length + LA_SHAPE_MAX],
+            x_buf: [0.0; X_BUF_MAX],
             vad_flags: [false; MAX_FRAMES_PER_PACKET],
             shape: ShapeState::default(),
             speech_activity_q8: 0,
-            last_xq: Vec::new(),
+            last_xq_buf: [0; LAST_XQ_MAX],
+            last_xq_len: 0,
         })
     }
 
@@ -332,11 +347,12 @@ impl ChannelState {
             first_frame_after_reset: true,
             indices: SideInfoIndices::default(),
             resampler: Resampler::new(8_000, 8_000, true).unwrap(),
-            x_buf: vec![0.0; 160 + MAX_FRAME_LENGTH + LA_SHAPE_MAX],
+            x_buf: [0.0; X_BUF_MAX],
             vad_flags: [false; MAX_FRAMES_PER_PACKET],
             shape: ShapeState::default(),
             speech_activity_q8: 0,
-            last_xq: Vec::new(),
+            last_xq_buf: [0; LAST_XQ_MAX],
+            last_xq_len: 0,
         }
     }
 
@@ -470,9 +486,16 @@ struct ChannelSnapshot {
     sum_log_gain_q7: i32,
     first_frame_after_reset: bool,
     indices: SideInfoIndices,
-    x_buf: Vec<f32>,
+    /// Analysis buffer (LTP memory + current frame + shaping look-ahead),
+    /// fixed capacity (`X_BUF_MAX`): every frame's CBR snapshot/restore
+    /// clones it, which used to mean a heap Vec per channel per frame.
+    x_buf: [f32; X_BUF_MAX],
     vad_flags: [bool; MAX_FRAMES_PER_PACKET],
-    last_xq: Vec<i16>,
+    /// Reconstruction history for `last_reconstructed_frame` (the
+    /// packet's frames so far, internal rate) — fixed capacity, logical
+    /// length in `last_xq_len`.
+    last_xq_buf: [i16; LAST_XQ_MAX],
+    last_xq_len: usize,
     /// The resampler retains the previous call's tail between calls, so
     /// re-sampling the same chunk a second time (a CBR retry) starting
     /// from the post-call state would corrupt the internal-rate signal.
@@ -501,9 +524,10 @@ impl ChannelState {
             sum_log_gain_q7: self.sum_log_gain_q7,
             first_frame_after_reset: self.first_frame_after_reset,
             indices: self.indices,
-            x_buf: self.x_buf.clone(),
+            x_buf: self.x_buf,
             vad_flags: self.vad_flags,
-            last_xq: self.last_xq.clone(),
+            last_xq_buf: self.last_xq_buf,
+            last_xq_len: self.last_xq_len,
             resampler: self.resampler.clone(),
             shape: self.shape,
 
@@ -523,9 +547,10 @@ impl ChannelState {
         self.sum_log_gain_q7 = s.sum_log_gain_q7;
         self.first_frame_after_reset = s.first_frame_after_reset;
         self.indices = s.indices;
-        self.x_buf = s.x_buf.clone();
+        self.x_buf = s.x_buf;
         self.vad_flags = s.vad_flags;
-        self.last_xq = s.last_xq.clone();
+        self.last_xq_buf = s.last_xq_buf;
+        self.last_xq_len = s.last_xq_len;
         self.resampler = s.resampler.clone();
         self.shape = s.shape;
         self.speech_activity_q8 = s.speech_activity_q8;
@@ -839,13 +864,13 @@ impl SilkEncoder {
     /// decoder's own arithmetic, this is bit-identical to the decoder's
     /// output — the property the round-trip tests pin.
     pub fn last_reconstructed_frame(&self) -> &[i16] {
-        &self.ch[0].last_xq
+        &self.ch[0].last_xq_buf[..self.ch[0].last_xq_len]
     }
 
     /// The side channel's reconstruction (stereo only; empty when the
     /// last packet's side frames were all skipped).
     pub fn last_reconstructed_side(&self) -> &[i16] {
-        &self.ch[1].last_xq
+        &self.ch[1].last_xq_buf[..self.ch[1].last_xq_len]
     }
 
     /// Encodes one payload; `input` must be [`Self::packet_length_api`]
@@ -911,7 +936,7 @@ impl SilkEncoder {
             /*--------------------------------------------------------*/
             for ch in self.ch.iter_mut().take(channels) {
                 ch.vad_flags = [false; MAX_FRAMES_PER_PACKET];
-                ch.last_xq.clear();
+                ch.last_xq_len = 0;
             }
             self.mid_only = [false; MAX_FRAMES_PER_PACKET];
             let mut mid_buf = [0i16; MAX_FRAME_LENGTH + 2];
@@ -1309,7 +1334,7 @@ impl SilkEncoder {
 
             let fits = match self.cbr {
                 None => true,
-                Some(CbrMode::ExactBytes(n)) => enc.clone().done().len() <= n,
+                Some(CbrMode::ExactBytes(n)) => enc.done_len() <= n,
                 Some(CbrMode::MaxBytes(n)) => i64::from(enc.tell()) + 37 <= (8 * n) as i64,
             };
             if fits {
@@ -1344,7 +1369,7 @@ impl SilkEncoder {
             // overshoot (a fixed multiplicative cut degrades quality far
             // more than needed when the payload is only slightly over).
             let actual_bytes = match self.cbr {
-                Some(CbrMode::ExactBytes(_)) => enc.clone().done().len().max(1) as f64,
+                Some(CbrMode::ExactBytes(_)) => enc.done_len().max(1) as f64,
                 // MaxBytes works in bits with a 37-bit headroom; convert
                 // to the equivalent byte count.
                 Some(CbrMode::MaxBytes(n)) => (((i64::from(enc.tell()) + 37) as f64) / 8.0)
@@ -1650,7 +1675,9 @@ impl ChannelState {
 
         self.synth
             .update_out_buf(&xq[..self.frame_length], self.ltp_mem_length);
-        self.last_xq.extend_from_slice(&xq[..self.frame_length]);
+        self.last_xq_buf[self.last_xq_len..self.last_xq_len + self.frame_length]
+            .copy_from_slice(&xq[..self.frame_length]);
+        self.last_xq_len += self.frame_length;
         self.lag_prev = ctrl.pitch_l[self.nb_subfr - 1];
         self.prev_signal_type = indices.signal_type;
         self.first_frame_after_reset = false;

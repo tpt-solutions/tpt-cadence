@@ -22,6 +22,11 @@ use super::cwrs::{decode_pulses, encode_pulses};
 use super::math::{celt_cos_norm, celt_div, celt_udiv, EPSILON};
 use crate::range::{RangeDecoder, RangeEncoder};
 
+/// Upper bound on one band's dimension count for the PVQ search scratch:
+/// the largest MDCT frame is 960 samples (20 ms at 48 kHz), and a band is
+/// never wider than that.
+const ALG_N_MAX: usize = 960;
+
 /// `SPREAD_NONE` (from bands.h).
 pub(crate) const SPREAD_NONE: i32 = 0;
 /// `SPREAD_LIGHT`.
@@ -174,12 +179,16 @@ pub(crate) fn alg_quant(
     resynth: bool,
 ) -> u32 {
     debug_assert!(k > 0 && x.len() > 1);
+    // A band can never exceed the frame's MDCT length (960 at 20 ms), so
+    // the search scratch lives on the stack — this runs once per band per
+    // frame, and the old heap `vec!`s showed up as encode-path churn.
+    debug_assert!(x.len() <= ALG_N_MAX);
     let n = x.len();
     exp_rotation(x, 1, b, k, spread);
 
     // Strip the sign (PVQ search works on magnitudes; the sign is folded
     // back in once the pulse counts are chosen).
-    let mut sign = vec![false; n];
+    let mut sign = [false; ALG_N_MAX];
     for (j, xj) in x.iter_mut().enumerate() {
         if *xj < 0.0 {
             sign[j] = true;
@@ -188,7 +197,7 @@ pub(crate) fn alg_quant(
         iy[j] = 0;
     }
 
-    let mut y = vec![0.0f32; n];
+    let mut y = [0.0f32; ALG_N_MAX];
     let mut xy = 0.0f32;
     let mut yy = 0.0f32;
     let mut pulses_left = k;

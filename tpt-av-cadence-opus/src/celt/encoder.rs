@@ -646,7 +646,7 @@ pub(crate) fn finalize_sized(mut enc: RangeEncoder, frame_bytes: usize) -> Vec<u
     while enc.tell() < target_bits {
         enc.write_raw_bits(0, 1);
     }
-    while enc.clone().done().len() < frame_bytes {
+    while enc.done_len() < frame_bytes {
         enc.write_raw_bits(0, 8);
     }
 

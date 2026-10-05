@@ -3898,43 +3898,114 @@ Static audit, nothing profiled yet. Every step must keep the conformance gates g
 Plan file: `~/.claude/plans/review-the-platform-can-glimmering-beacon.md`.
 
 ### Step 0 — Baseline
-- [ ] Record `cargo bench` numbers for wav / flac / mp3 / vorbis decode and opus `celt_round_trip`
-- [ ] Add benches: AIFF + PCM decode, FLAC encode, MP3 encode (CBR + VBR), Vorbis encode, Opus SILK decode
-- [ ] Register new benches in the `bench` job list in `.github/workflows/ci.yml`
+- [x] Record `cargo bench` numbers for wav / flac / mp3 / vorbis decode and opus `celt_round_trip` (recorded 2026-10-06 pre/post per change; full-suite `--output-format bencher` runs are what CI's bench job archives per master push)
+- [x] Add benches: AIFF + PCM decode, FLAC encode, MP3 encode (CBR + VBR), Vorbis encode, Opus SILK decode (`aiff/benches/decode.rs`, `pcm/benches/decode.rs`, `flac/benches/encode.rs`, `mp3/benches/encode.rs` (CBR 128k + VBR q4), `vorbis/benches/encode.rs`, `opus/benches/silk_round_trip.rs`)
+- [x] Register new benches in the `bench` job list in `.github/workflows/ci.yml`
 
 ### Step 1 — Zero-risk config
 - [x] Release profile: `lto = "fat"`, `codegen-units = 1`; wasm-demo `opt-level = "s"`; `[profile.bench]` (inherits release, debug symbols). `panic = "abort"` deliberately skipped (library consumers own their profile; keeps panic-free contract testable)
 - [x] Remove unused `byteorder` dependency (core, wav, workspace)
-- [ ] CI: `Swatinem/rust-cache` on all jobs
-- [ ] CI: install `cargo-fuzz` / `wasm-bindgen-cli` via `taiki-e/install-action` instead of `cargo install`
-- [ ] CI: drop redundant `cargo build --workspace --all-targets` before tests; factor duplicated sibling-checkout step
-- [ ] `wasm-opt -Oz` step in the wasm job; compare wasm size before/after
+- [x] CI: `Swatinem/rust-cache` on all jobs (composite `.github/actions/setup-build` used by every non-fuzz job; fuzz excluded — nightly cargo-fuzz builds in `fuzz/target` would churn the cache)
+- [x] CI: install `cargo-fuzz` / `wasm-bindgen-cli` via `taiki-e/install-action` instead of `cargo install`. The historical silent-missing-binary failure mode (see the old fuzz-job comment) is answered with a hard `cargo fuzz --version` verification step; wasm-bindgen-cli stays pinned to the Cargo.lock-resolved wasm-bindgen version via a `GITHUB_OUTPUT` step (install-action's `tool:` input is not shell-expanded)
+- [x] CI: drop redundant `cargo build --workspace --all-targets` before tests; factor duplicated sibling-checkout step (bench targets are compile-checked by the `bench` job; the sibling tpt-av-test checkout + toolchain + cache now live in the composite action)
+- [x] `wasm-opt -Oz` step in the wasm job; compare wasm size before/after (step prints the before/after byte counts and the percentage saved; the Node smoke test runs against the optimized module)
 
 ### Step 2 — Bit-identical decoder wins
-- [ ] WAV / AIFF / PCM: hoist the per-sample format `match`, precompute scale, bulk-convert from a byte slab (`BufferedSource` partial-read helper in core; keep decode allocation-free; output bit-identical)
-- [ ] Vorbis `codebook.rs`: 8–10 bit lookup table for `read_scalar`, `#[inline]` bit reads
-- [ ] Vorbis `floor.rs` floor0: reuse `lsp`/`vec_buf` scratch, precompute cos terms
-- [ ] Vorbis seek scan (`lib.rs` ~619): reuse one packet `Vec` instead of per-segment alloc
-- [ ] Ogg `lib.rs` ~151: segment queue head index instead of `copy_within`
-- [ ] BufferedSource default capacity 8 KiB → 64 KiB for file-backed readers
-- [ ] CLI `main.rs` ~260–317: `BufWriter` + per-block byte buffer for stdout and WAV output; `.round()` for i16 (intentional 1-LSB change)
-- [ ] wasm-demo: `*_sample_rate` exports return after `info()`; pre-size output `Vec`
+- [x] WAV / AIFF / PCM: hoist the per-sample format `match`, precompute scale, bulk-convert from a byte slab (`BufferedSource::take_up_to` partial-read helper in core; decode stays allocation-free; output bit-identical). Measured on 5 s stereo 48 kHz i16: WAV 1.23 ms → 112 µs, AIFF 2.07 ms → 150 µs, PCM 1.32 ms → 101 µs per full decode (11–14x)
+- [x] Vorbis `codebook.rs`: 9-bit lookup table for `read_scalar` (peek + consume through `read_bits` so bounds/overread behavior is byte-identical; codewords longer than the table keep the tree walk), `#[inline]` bit reads + a zero-padding `peek_bits`. The del_dec/SILK-style bit-exact gates (FFmpeg-oracle conformance, seek-replay-identity) stay green
+- [x] Vorbis `floor.rs` floor0: reuse `lsp`/`vec_buf` scratch (`&mut self` on `Floor0::decode`), precompute `2*cos(w*m)` per bark index at `build_maps` (same expression the loop evaluated)
+- [x] Vorbis seek scan (`lib.rs` ~619): reuse one packet `Vec` + a stack segment buffer instead of per-segment allocs
+- [x] Ogg `lib.rs` ~151: segment queue head index instead of `copy_within`
+- [x] BufferedSource default capacity 8 KiB → 64 KiB for file-backed readers (WAV/AIFF/PCM decoders' `BufferedSource::new` calls)
+- [x] CLI `main.rs` ~260–317: `BufWriter` + per-block byte buffer for stdout and WAV output; `.round()` for i16 (intentional 1-LSB change, documented at the conversion site)
+- [x] wasm-demo: `*_sample_rate` exports return after `info()` (new `probe_rate`, no full decode); pre-size output `Vec` from `info().total_frames`
 
 ### Step 3 — Bit-identical encoder wins
-- [ ] MP3 `encoder.rs` ~353–392: static cosine table for polyphase analysis, mask instead of `% HAN_SIZE` (likely biggest MP3 encode win)
-- [ ] MP3 `plan_vbr_frame` ~2632: hoist budget-independent `psy_thresholds` out of the bitrate ladder
-- [ ] FLAC `encoder.rs` ~223–296: zigzag once, derive coarser partition sums by merging pairs; swap buffers instead of cloning the residual (~479, 515); output byte-identical
-- [ ] FLAC MD5: reusable interleave buffer with 16/24-bit fast path
-- [ ] Opus: non-consuming length instead of `enc.clone().done().len()` (`celt/encoder.rs` ~649, `silk/encoder.rs` ~1312/1347)
-- [ ] Opus: hoist per-call allocations (`celt/vq.rs` 182/191, `silk/nsq_ref.rs`, `silk/noise_shape.rs` ~418, `silk/nsq_del_dec.rs` 188/451)
-- [ ] Opus SILK rate loop: swap/ring of attempts instead of cloning `RateAttempt`/NSQ state
-- [ ] Vorbis encoder: reuse `Transform::forward` / `window()` scratch, cache window shapes, derive floor curve directly instead of bit round-trip
+- [x] MP3 `encoder.rs` ~353–392: static cosine table for polyphase analysis (32x64 f64 via `OnceLock`, same expression per element — ~2048 `cos` calls per 32-sample block eliminated), mask instead of `% HAN_SIZE`
+- [x] MP3 `plan_vbr_frame` ~2632: hoist budget-independent `psy_thresholds` out of the bitrate ladder (`slot_thresholds`, computed once and threaded through `plan_slots`)
+- [x] FLAC `encoder.rs` ~223–296: zigzag once (all partition orders price slices of one mapped residual; `best_rice_param`'s early-break order is preserved, so output is byte-identical); swap buffers instead of cloning the residual (`best_residual` + `mem::swap`). NOTE the "derive coarser partition sums by merging pairs" half is NOT done and should not be: `best_rice_param`'s early-break makes merged-statistics reproduction impossible, and it prices raw-escape per partition (min/max), which sums can't recover
+- [x] FLAC MD5: reusable interleave buffer with 16/24-bit fast path
+- [x] Opus: non-consuming length — new `RangeEncoder::done_len()` replays `done`'s carry chain on the two-word carry state, counting bytes; the CBR sizing probes (`celt/encoder.rs` `finalize_sized`, `silk/encoder.rs` exact-bytes fit + overshoot measure) no longer clone the coder. `finalize_sized`'s exact-size gate (`try_done_sized` errors on mismatch) pins `done_len`'s correctness
+- [x] Opus: hoist per-call allocations — `celt/vq.rs` `alg_quant` sign/y scratch to fixed stack arrays (band ≤ 960 hard bound); `silk/nsq_ref.rs` s_ltp/s_ltp_q15/x_sc_q10/xq_slice to stack; `silk/noise_shape.rs` x_windowed to stack (`[..shape_win_length]` slices keep autocorrelation bit-identical); `silk/nsq_del_dec.rs` `DelDecState.s_lpc_q14` Vec → array and the per-frame `Vec<DelDecState>`/`ps_sample_state` Vecs → fixed arrays sliced to the active state count (the del_dec bit-exactness test caught and corrected an unbounded winner-scan during development); `silk/encoder.rs` `x_buf`/`last_xq` Vecs → fixed arrays (per-frame CBR snapshot/restore no longer heap-clones)
+- [ ] Opus SILK rate loop: swap/ring of attempts instead of cloning `RateAttempt`/NSQ state — evaluated and SKIPPED: every field is a fixed-size array (no allocator traffic — `snapshot`/`restore` were the real allocators, fixed above), so the win is one redundant ~30 KB memcpy per attempt against a bit-exactness-critical loop
+- [x] Vorbis encoder: reuse `Transform::forward` scratch (persistent FFT in/out buffers), cache window shapes (≤ 8 `(long, prev, next)` combinations, built once). The "derive floor curve directly instead of bit round-trip" sub-item is deferred: the round-trip is the floor curve's correctness proof and costs microseconds per channel
 
 ### Step 4 — Numerics-changing (golden test vs naive path first)
-- [ ] MP3 quantizer: precompute `|x|^0.75`, per-gain and `ix^(4/3)` tables, defer noise calc to final candidate (watch rounding ties; gate on encoder regression suite)
-- [ ] FLAC LPC candidate pruning via Levinson error estimate (changes output bytes — only if no byte-golden tests)
-- [ ] Opus SILK pitch search: incremental energy (arithmetic-identical); coarse-to-fine only if decisions can change
+- [x] MP3 quantizer: `|x|^0.75` precomputed per line (`spec_pow45`, hoisted across the whole gain search in `inner_loop`), per-band `gain^-0.75`, and an `ix^(4/3)` table (bit-identical per element). The `|x|^0.75 * gain^-0.75` vs `( |x| / gain )^0.75` rounding difference is accepted and pinned: a differential test (`fast_quantizer_matches_reference_outside_rounding_ties`) bounds divergence to ±1 step on at most a handful of lines per granule, and the full fidelity gate suite (tone purity, libmp3lame-band SNR, FFmpeg crosschecks, round-trips) stayed green. "Defer noise calc to final candidate" NOT done: the per-band noise feeds the VBR tolerance check on every candidate, so deferring would change behavior
+- [ ] FLAC LPC candidate pruning via Levinson error estimate — evaluated and SKIPPED: the encoder's search prices every candidate order by its real coded size, which is exactly why it lands ~13 % under FFmpeg -compression_level 8; pruning trades that measured property for a speedup nobody has asked for
+- [ ] Opus SILK pitch search: incremental energy — evaluated and SKIPPED: sliding-window f64 sums reassociate, so "arithmetic-identical" incremental energy is impossible and the lag decision feeds the bitstream; coarse-to-fine has the same decision-change problem
 
 ### Deferred
 - MP3 `Mdct36Basis` fast DCT (exactness risk), SIMD / `target-cpu` flags (portability)
 - AAC (paused): IMDCT O(M²)→FFT, SBR `Mdct64`, Huffman `HashMap`→peek table, per-frame allocs in SBR path
+
+### Session log (2026-10-06): the performance pass executed — Steps 0–4
+
+All four steps of the plan above are now executed (AAC stays paused, as
+decided). Every conformance gate held: `cargo test --workspace` (all
+suites, including the FFmpeg-oracle conformance runs — FFmpeg is on PATH
+here), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo
+fmt --check`, and the wasm32 build.
+
+**Headline numbers** (5 s stereo 48 kHz decode, bench profile, this
+Windows machine): WAV 1.23 ms → 112 µs, AIFF 2.07 ms → 150 µs, PCM
+1.32 ms → 101 µs per full decode — 11–14x from the bulk-slab decode +
+hoisted format dispatch alone. The container decoders were dominated by
+per-frame `take_exact` calls and a per-sample format `match`; both are
+gone, and output is bit-identical (the bit-exact conformance suites pin
+this).
+
+What landed per step:
+
+- **Step 0**: six new criterion benches (AIFF/PCM decode, FLAC/MP3
+  (CBR+VBR)/Vorbis encode, Opus SILK round trip), all registered in CI's
+  bench job. Baselines were recorded pre-change per component (git
+  stash A/B for the container decoders) rather than as one stale
+  snapshot.
+- **Step 1**: CI now shares one composite setup action (sibling
+  tpt-av-test checkout + toolchain + `Swatinem/rust-cache`) across
+  every non-fuzz job; the redundant pre-test build is gone;
+  `wasm-bindgen-cli` and `cargo-fuzz` install via `taiki-e/install-action`
+  (with a hard `cargo fuzz --version` verification answering the old
+  silent-missing-binary failure mode); the wasm job gained a `wasm-opt
+  -Oz` pass with before/after sizes printed.
+- **Step 2**: Vorbis `read_scalar` takes a 9-bit prefix table (peek via
+  the new `BitReader::peek_bits`, consume via `read_bits` so the
+  overread error and reader state are byte-identical to the old walk;
+  deep codewords keep the tree walk); floor0 reuses scratch and
+  precomputes `2*cos(w·m)`; the seek scan reuses one packet buffer; the
+  Ogg segment queue uses a head index; the CLI writes stdout/WAV through
+  bulk buffers (with the documented intentional 1-LSB `.round()` for
+  i16); the wasm-demo rate exports stop decoding the whole stream.
+- **Step 3**: MP3's analysis matrix uses a precomputed 32x64 cosine
+  table and ring masks; the VBR ladder computes psy thresholds once per
+  frame; FLAC zigzags once, swaps (never clones) the winning residual,
+  and feeds MD5 from a reusable interleave buffer; Opus gained
+  `RangeEncoder::done_len()` (carry-chain replay, no clone) used by all
+  CBR sizing probes, stack-array scratch in `alg_quant`/NSQ/noise-shaping,
+  array-based del-dec states, and heap-free encoder snapshots (`x_buf`/
+  `last_xq` arrays); the Vorbis transform reuses its FFT buffers and the
+  encoder caches its ≤ 8 window shapes.
+- **Step 4**: the MP3 quantizer splits `( |x|/gain )^0.75` into a
+  per-granule `|x|^0.75` (hoisted across the gain search) and per-band
+  `gain^-0.75`, plus an `ix^(4/3)` table. This is the one deliberate
+  numerics change; a new differential test bounds it to ±1 quantizer
+  step on at most a handful of lines per granule, and every fidelity
+  gate (tone purity, libmp3lame-comparative band SNR, FFmpeg
+  crosschecks) held.
+
+Development caught by the tests, worth recording: the first cut of the
+del-dec array conversion left the subframe "reset delayed decisions"
+winner scan iterating all four array slots instead of the active count —
+an inactive state (rate/distortion 0) could win and garbage the output;
+`del_dec_xq_equals_decode_core` failed immediately and the bound fixed
+it. The suite is doing exactly its job.
+
+Evaluated and rejected, with reasons recorded in the checklists above:
+merged-statistics Rice partitioning (impossible under `best_rice_param`'s
+early break), the SILK rate-loop attempt ring (all-array state — no
+allocator traffic to save), FLAC LPC pruning (trades the measured
+smaller-than-FFmpeg property), SILK incremental pitch energy (f64
+reassociation is not arithmetic-identical), and deriving the Vorbis floor
+curve without the bit round-trip (the round-trip is the correctness
+proof).

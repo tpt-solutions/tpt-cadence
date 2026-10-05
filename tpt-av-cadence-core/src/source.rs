@@ -120,6 +120,23 @@ impl BufferedSource {
         Ok(())
     }
 
+    /// Serves as many bytes as are available, up to `out.len()`; returns the
+    /// number served (`Ok(0)` only at end of the readable region). Lets
+    /// frame-oriented decoders bulk-read into a slab instead of taking one
+    /// frame at a time; trailing partial frames are the caller's business.
+    /// Allocation-free.
+    pub fn take_up_to(&mut self, out: &mut [u8]) -> Result<usize> {
+        let mut done = 0;
+        while done < out.len() {
+            match self.serve(&mut out[done..]) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(e) => return Err(CadenceError::from(e)),
+            }
+        }
+        Ok(done)
+    }
+
     /// Consumes and discards exactly `n` bytes. Allocation-free.
     pub fn skip(&mut self, mut n: u64) -> Result<()> {
         // The scratch buffer lives inside `self`, so lend it out while serving.

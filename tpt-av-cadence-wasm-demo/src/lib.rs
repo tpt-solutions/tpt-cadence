@@ -38,11 +38,13 @@ fn decode_all<R: FormatReader>(bytes: &[u8]) -> (Vec<f32>, u32) {
     let Ok(mut reader) = R::open(Box::new(cursor)) else {
         return (Vec::new(), 0);
     };
-    let (channels, sample_rate) = {
+    let (channels, sample_rate, total_frames) = {
         let info = reader.info();
-        (info.channels as usize, info.sample_rate)
+        (info.channels as usize, info.sample_rate, info.total_frames)
     };
-    let mut out = Vec::new();
+    // Pre-size when the container declared its length; decode appends in
+    // whole-frame blocks either way, so the final length is the same.
+    let mut out = Vec::with_capacity(total_frames.unwrap_or(0) as usize * channels.max(1));
     let mut buf = vec![0.0f32; 4096 * channels.max(1)];
     while let Ok(frames) = reader.decoder().decode(&mut buf) {
         if frames == 0 {
@@ -51,6 +53,17 @@ fn decode_all<R: FormatReader>(bytes: &[u8]) -> (Vec<f32>, u32) {
         out.extend_from_slice(&buf[..frames * channels]);
     }
     (out, sample_rate)
+}
+
+/// Opens `bytes` with `R` and returns the stream's sample rate from the
+/// parsed headers — no audio decoding (`open` parses the container/codec
+/// headers eagerly, so `info()` is valid immediately).
+fn probe_rate<R: FormatReader>(bytes: &[u8]) -> u32 {
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    match R::open(Box::new(cursor)) {
+        Ok(reader) => reader.info().sample_rate,
+        Err(_) => 0,
+    }
 }
 
 macro_rules! format_exports {
@@ -62,13 +75,13 @@ macro_rules! format_exports {
             decode_all::<$reader>(bytes).0
         }
 
-        /// Returns the stream's sample rate, or 0 on error. A second
-        /// export per format so the demo also proves
+        /// Returns the stream's sample rate from the parsed headers, or 0 on
+        /// error. A second export per format so the demo also proves
         /// `FormatReader::info()` (not just `decode()`) works through the
         /// wasm-bindgen boundary.
         #[wasm_bindgen]
         pub fn $rate(bytes: &[u8]) -> u32 {
-            decode_all::<$reader>(bytes).1
+            probe_rate::<$reader>(bytes)
         }
     };
 }

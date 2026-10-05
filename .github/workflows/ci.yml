@@ -23,32 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # tpt-av-cadence-test-utils depends on tpt-av-test-reference via a
-      # relative path (`../../tpt-av-test/...`), so the sibling repo must be
-      # checked out one level above this one for any build/test/bench to
-      # resolve its manifest.
-      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
-      # check out inside the workspace and move it up to the sibling
-      # position the workspace's path dependency (`../../tpt-av-test/...`)
-      # expects.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
-
-      - name: Install Rust (${{ matrix.rust }})
-        uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/setup-build
         with:
           toolchain: ${{ matrix.rust }}
 
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
-
       - name: Run tests
+        # Builds lib/test/example targets itself; bench targets are
+        # compile-checked by the dedicated `bench` job.
         run: cargo test --workspace
 
       # Proves tpt-av-cadence-cli's per-format feature flags actually gate
@@ -70,20 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
-      # check out inside the workspace and move it up to the sibling
-      # position the workspace's path dependency (`../../tpt-av-test/...`)
-      # expects.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
-
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/setup-build
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -103,14 +71,10 @@ jobs:
       # tpt-av-cadence-test-utils's path dependency on tpt-av-test-reference,
       # so the sibling repo must be present even though this job never
       # builds any code.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
         with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
+          toolchain: stable
+          cache: "false"
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
@@ -127,20 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
-      # check out inside the workspace and move it up to the sibling
-      # position the workspace's path dependency (`../../tpt-av-test/...`)
-      # expects.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
-
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/setup-build
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
@@ -148,13 +99,37 @@ jobs:
       - name: Build wasm32 demo
         run: cargo build -p tpt-av-cadence-wasm-demo --target wasm32-unknown-unknown --release
 
-      - name: Install wasm-bindgen-cli (pinned to the resolved wasm-bindgen crate version)
+      - name: Resolve wasm-bindgen crate version from Cargo.lock
+        id: wasm_bindgen_version
         run: |
           version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep version | head -1 | cut -d'"' -f2)
-          cargo install wasm-bindgen-cli --version "$version" --locked
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install wasm-bindgen-cli (pinned to the resolved wasm-bindgen crate version)
+        uses: taiki-e/install-action@v2
+        with:
+          # The CLI must stay in lockstep with the wasm-bindgen crate version
+          # resolved in Cargo.lock (bindings generation is version-paired).
+          tool: wasm-bindgen-cli@${{ steps.wasm_bindgen_version.outputs.version }}
 
       - name: Generate JS bindings
         run: wasm-bindgen target/wasm32-unknown-unknown/release/tpt_av_cadence_wasm_demo.wasm --out-dir tpt-av-cadence-wasm-demo/pkg --target nodejs
+
+      - name: Install wasm-opt (binaryen)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-opt
+
+      - name: Optimize wasm size (wasm-opt -Oz)
+        working-directory: tpt-av-cadence-wasm-demo/pkg
+        run: |
+          before=$(stat -c%s *.wasm)
+          echo "wasm-bindgen output: $before bytes"
+          wasm-opt -Oz -o tpt_av_cadence_wasm_demo.opt.wasm tpt_av_cadence_wasm_demo.wasm
+          mv tpt_av_cadence_wasm_demo.opt.wasm tpt_av_cadence_wasm_demo.wasm
+          after=$(stat -c%s *.wasm)
+          echo "wasm-opt -Oz output:  $after bytes"
+          echo "wasm size: $before -> $after bytes ($(( 100 - after * 100 / before ))% smaller)"
 
       - uses: actions/setup-node@v4
         with:
@@ -169,20 +144,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
-      # check out inside the workspace and move it up to the sibling
-      # position the workspace's path dependency (`../../tpt-av-test/...`)
-      # expects.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
-
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/setup-build
         with:
           toolchain: stable
           components: llvm-tools-preview
@@ -220,20 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
-      # check out inside the workspace and move it up to the sibling
-      # position the workspace's path dependency (`../../tpt-av-test/...`)
-      # expects.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
-
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/setup-build
         with:
           toolchain: stable
 
@@ -251,11 +200,17 @@ jobs:
           set -e
           : > bench-output.txt
           cargo bench -p tpt-av-cadence-wav --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-aiff --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-pcm --bench decode -- --output-format bencher | tee -a bench-output.txt
           cargo bench -p tpt-av-cadence-flac --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-flac --bench encode -- --output-format bencher | tee -a bench-output.txt
           cargo bench -p tpt-av-cadence-mp3 --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-mp3 --bench encode -- --output-format bencher | tee -a bench-output.txt
           cargo bench -p tpt-av-cadence-aac --bench decode -- --output-format bencher | tee -a bench-output.txt
           cargo bench -p tpt-av-cadence-vorbis --bench decode -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-vorbis --bench encode -- --output-format bencher | tee -a bench-output.txt
           cargo bench -p tpt-av-cadence-opus --bench celt_round_trip -- --output-format bencher | tee -a bench-output.txt
+          cargo bench -p tpt-av-cadence-opus --bench silk_round_trip -- --output-format bencher | tee -a bench-output.txt
 
       - name: Upload bench results
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -277,20 +232,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # actions/checkout refuses a `path` that escapes GITHUB_WORKSPACE, so
-      # check out inside the workspace and move it up to the sibling
-      # position the workspace's path dependency (`../../tpt-av-test/...`)
-      # expects.
-      - name: Checkout tpt-av-test (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: tpt-solutions/tpt-av-test
-          path: tpt-av-test
-
-      - name: Move tpt-av-test to sibling directory
-        run: mv tpt-av-test ..
-
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/setup-build
         with:
           toolchain: stable
 
@@ -305,7 +247,8 @@ jobs:
 
   # Nightly (scheduled) fuzz sweep. Also runs on manual dispatch, but not on
   # every push/PR — each target gets a fixed time budget rather than gating
-  # normal CI latency on fuzzing.
+  # normal CI latency on fuzzing. No rust-cache here: cargo-fuzz builds in
+  # `fuzz/target` with a nightly toolchain, which would churn the cache.
   fuzz:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -329,12 +272,17 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
-      # taiki-e/install-action's cargo-fuzz support depends on rust-fuzz/cargo-fuzz
-      # publishing a prebuilt binary for the runner's platform, which isn't
-      # guaranteed and has been observed to leave `cargo fuzz` missing from
-      # PATH without failing this step. `cargo install` always works.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # taiki-e/install-action depends on the tool publishing a prebuilt
+      # binary for the runner's platform; a missing binary has been observed
+      # to leave `cargo fuzz` absent from PATH without failing the install
+      # step. This makes that failure loud instead of an empty sweep.
+      - name: Verify cargo-fuzz is on PATH
+        run: cargo fuzz --version
 
       - name: Restore corpus cache
         uses: actions/cache@v4

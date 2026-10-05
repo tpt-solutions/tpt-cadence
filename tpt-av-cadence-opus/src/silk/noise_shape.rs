@@ -415,7 +415,9 @@ pub(crate) fn noise_shape_analysis(
     let mut ar = [0f32; MAX_NB_SUBFR * MAX_SHAPE_LPC_ORDER];
     let mut auto_corr = [0f32; MAX_SHAPE_LPC_ORDER + 1];
     let mut rc = [0f32; MAX_SHAPE_LPC_ORDER + 1];
-    let mut x_windowed = vec![0f32; shape_win_length];
+    // Fixed-capacity stack scratch (the window length is bounded by
+    // SHAPE_LPC_WIN_MAX); every use below slices to the real length.
+    let mut x_windowed = [0f32; SHAPE_LPC_WIN_MAX];
     for k in 0..geo.nb_subfr {
         /* Apply window: sine slope, flat part, cosine slope. The reference
          * uses `flat_part = 3 * fs_kHz` and splits the rest evenly; the
@@ -429,15 +431,16 @@ pub(crate) fn noise_shape_analysis(
         x_windowed[slope_part..slope_part + flat_part]
             .copy_from_slice(&src[slope_part..slope_part + flat_part]);
         apply_sine_window(
-            &mut x_windowed[slope_part + flat_part..],
+            &mut x_windowed[slope_part + flat_part..shape_win_length],
             &src[slope_part + flat_part..],
             2,
         );
+        let x_windowed = &x_windowed[..shape_win_length];
 
         if warping_q16 > 0 {
-            warped_autocorrelation(&mut auto_corr, &x_windowed, warping, SHAPING_LPC_ORDER);
+            warped_autocorrelation(&mut auto_corr, x_windowed, warping, SHAPING_LPC_ORDER);
         } else {
-            autocorrelation(&mut auto_corr[..SHAPING_LPC_ORDER + 1], &x_windowed);
+            autocorrelation(&mut auto_corr[..SHAPING_LPC_ORDER + 1], x_windowed);
         }
 
         /* Add white noise, as a fraction of energy */

@@ -258,8 +258,12 @@ fn cmd_decode(path_str: &str, out: Option<&str>) -> Result<(), String> {
         }
         None => {
             let stdout = std::io::stdout();
-            let mut out = stdout.lock();
+            // StdoutLock is unbuffered on some platforms; one write_all per
+            // decoded block beats one per sample. The byte buffer is reused
+            // across blocks.
+            let mut out = BufWriter::new(stdout.lock());
             let mut buf = vec![0.0f32; 8192 * channels];
+            let mut bytes = vec![0u8; 8192 * channels * 4];
             loop {
                 let frames = reader
                     .decoder()
@@ -268,11 +272,14 @@ fn cmd_decode(path_str: &str, out: Option<&str>) -> Result<(), String> {
                 if frames == 0 {
                     break;
                 }
-                for sample in &buf[..frames * channels] {
-                    out.write_all(&sample.to_le_bytes())
-                        .map_err(|e| e.to_string())?;
+                let samples = &buf[..frames * channels];
+                for (dst, src) in bytes.chunks_exact_mut(4).zip(samples) {
+                    dst.copy_from_slice(&src.to_le_bytes());
                 }
+                out.write_all(&bytes[..samples.len() * 4])
+                    .map_err(|e| e.to_string())?;
             }
+            out.flush().map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -284,6 +291,8 @@ fn cmd_decode(path_str: &str, out: Option<&str>) -> Result<(), String> {
 struct WavWriter<W: Write + std::io::Seek> {
     w: W,
     data_bytes: u32,
+    /// Reused i16-LE byte staging for `write_samples`.
+    bytes: Vec<u8>,
 }
 
 impl<W: Write + std::io::Seek> WavWriter<W> {
@@ -303,16 +312,28 @@ impl<W: Write + std::io::Seek> WavWriter<W> {
         w.write_all(&16u16.to_le_bytes())?; // bits per sample
         w.write_all(b"data")?;
         w.write_all(&0u32.to_le_bytes())?; // patched in `finish`
-        Ok(WavWriter { w, data_bytes: 0 })
+        Ok(WavWriter {
+            w,
+            data_bytes: 0,
+            bytes: Vec::new(),
+        })
     }
 
     fn write_samples(&mut self, samples: &[f32]) -> std::io::Result<()> {
+        // One bulk write per call through the reused byte buffer (a
+        // per-sample write_all is measurably slower even through the
+        // BufWriter). `.round()` before the cast is an intentional 1-LSB
+        // change from the previous truncating cast: it halves the worst-case
+        // conversion error (0.5 LSB instead of 1 LSB).
+        self.bytes.clear();
+        self.bytes.reserve(samples.len() * 2);
         for &s in samples {
             let clamped = s.clamp(-1.0, 1.0);
-            let v = (clamped * i16::MAX as f32) as i16;
-            self.w.write_all(&v.to_le_bytes())?;
+            let v = (clamped * i16::MAX as f32).round() as i16;
+            self.bytes.extend_from_slice(&v.to_le_bytes());
         }
-        self.data_bytes += (samples.len() * 2) as u32;
+        self.w.write_all(&self.bytes)?;
+        self.data_bytes += self.bytes.len() as u32;
         Ok(())
     }
 

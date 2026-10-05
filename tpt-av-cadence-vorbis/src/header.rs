@@ -201,6 +201,9 @@ pub fn parse_setup(packet: &[u8], id: &IdHeader) -> Result<Setup, CadenceError> 
                     amplitude_offset,
                     books: books.into_boxed_slice(),
                     maps: Vec::new(),
+                    two_cos_w: Vec::new(),
+                    lsp_scratch: Vec::new(),
+                    vec_scratch: Vec::new(),
                 }));
             }
             1 => {

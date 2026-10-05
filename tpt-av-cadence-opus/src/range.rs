@@ -412,6 +412,70 @@ impl RangeEncoder {
     /// flush it through the carry buffer, then assemble the output:
     /// range-coded bytes first, raw bits at the end (reverse production
     /// order), matching the frame layout the decoder expects.
+    /// The exact byte length [`done`][Self::done] will produce, without
+    /// cloning the coder or flushing it: `done`'s carry chain is replayed on
+    /// the two-word carry state (`rem`, `ext`), counting bytes instead of
+    /// pushing them. Every CBR sizing probe used to pay a full `Vec` clone
+    /// plus a flush for this.
+    pub fn done_len(&self) -> usize {
+        let range_end = self.val as u64 + self.rng as u64 - 1;
+        let mut b: u32 = 0;
+        loop {
+            if b >= 31 {
+                break;
+            }
+            let two_b = 1u64 << (b + 1);
+            let e = ((self.val as u64) + two_b - 1) & !(two_b - 1);
+            if e + two_b - 1 <= range_end {
+                b += 1;
+            } else {
+                break;
+            }
+        }
+        let two_b = 1u64 << b;
+        let mut end = ((self.val as u64) + two_b - 1) & !(two_b - 1);
+
+        // `count_carry` mirrors `carry_out` byte-for-byte (including the
+        // 255-streak filler logic) while only counting.
+        fn count_carry(rem: &mut i32, ext: &mut u32, c: u32, len: &mut usize) {
+            if c == 255 {
+                *ext = ext.wrapping_add(1);
+                return;
+            }
+            // (The byte value itself is irrelevant when only counting —
+            // `carry_out` would emit `rem + carry` and the 255-fillers.)
+            let _b = (c >> 8) as i32;
+            if *rem != -1 {
+                *len += 1;
+            }
+            if *ext != 0 {
+                *len += *ext as usize;
+                *ext = 0;
+            }
+            *rem = (c & 255) as i32;
+        }
+
+        let mut rem = self.rem;
+        let mut ext = self.ext;
+        let mut len = self.out.len();
+        let mut l = 31i32 - b as i32;
+        while l > 0 {
+            count_carry(&mut rem, &mut ext, (end >> 23) as u32, &mut len);
+            end = (end << 8) & 0x7FFF_FFFF;
+            l -= 8;
+        }
+        if (rem != 0 && rem != -1) || ext > 0 {
+            count_carry(&mut rem, &mut ext, 0, &mut len);
+        }
+        if rem != -1 {
+            len += 1;
+        }
+        if self.nend_bits > 0 {
+            len += 1;
+        }
+        len + self.end_bytes.len()
+    }
+
     pub fn done(mut self) -> Vec<u8> {
         let range_end = self.val as u64 + self.rng as u64 - 1;
         let mut b: u32 = 0;

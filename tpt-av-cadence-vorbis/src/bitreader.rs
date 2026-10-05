@@ -32,6 +32,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Reads `n` bits (0..=32) as an unsigned integer, LSB-first.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<u32, CadenceError> {
         debug_assert!(n <= 32);
         if n == 0 {
@@ -58,8 +59,39 @@ impl<'a> BitReader<'a> {
     }
 
     /// Reads a single bit.
+    #[inline]
     pub fn read_bit(&mut self) -> Result<bool, CadenceError> {
         Ok(self.read_bits(1)? != 0)
+    }
+
+    /// Peeks the next `n` bits (0..=32) in stream order without consuming
+    /// them; reads past the packet's end yield zero padding. This is the
+    /// hot-path companion of `read_bits` for table-driven decoders that
+    /// consume exactly the bits a lookup selected (via a plain `read_bits`,
+    /// which re-runs the bounds check and raises the same overread error).
+    #[inline]
+    pub fn peek_bits(&self, n: u32) -> u32 {
+        debug_assert!(n <= 32);
+        if n == 0 {
+            return 0;
+        }
+        let mut value: u64 = 0;
+        let mut taken = 0u32;
+        let last = self.data.len() * 8;
+        while taken < n {
+            let bit = self.bit_pos + taken as usize;
+            if bit >= last {
+                break; // zero padding past the end
+            }
+            let byte = self.data[bit / 8];
+            let off = (bit % 8) as u32;
+            let avail = 8 - off;
+            let want = (n - taken).min(avail);
+            let piece = (byte >> off) as u64 & ((1u16 << want) - 1) as u64;
+            value |= piece << taken;
+            taken += want;
+        }
+        value as u32
     }
 
     /// Reads `n` bits (0..=64) as an unsigned integer, LSB-first.

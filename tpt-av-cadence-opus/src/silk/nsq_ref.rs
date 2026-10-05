@@ -177,9 +177,13 @@ pub(crate) fn nsq(
         [indices.quant_offset_type as usize] as i32;
     let lsf_interpolation_flag = i32::from(indices.nlsf_interp_coef_q2 < 4);
 
-    let mut s_ltp = vec![0i16; ltp_mem_length + frame_length];
-    let mut s_ltp_q15 = vec![0i32; ltp_mem_length + frame_length];
-    let mut x_sc_q10 = vec![0i32; subfr_length];
+    // Fixed-capacity stack scratch instead of per-frame heap vecs; all
+    // uses slice to the same logical lengths the vecs had.
+    debug_assert!(ltp_mem_length + frame_length <= 2 * MAX_FRAME_LENGTH);
+    debug_assert!(subfr_length <= MAX_SUB_FRAME_LENGTH);
+    let mut s_ltp = [0i16; 2 * MAX_FRAME_LENGTH];
+    let mut s_ltp_q15 = [0i32; 2 * MAX_FRAME_LENGTH];
+    let mut x_sc_q10 = [0i32; MAX_SUB_FRAME_LENGTH];
     let mut pulses = [0i16; MAX_FRAME_LENGTH];
 
     nsq.s_ltp_shp_buf_idx = ltp_mem_length;
@@ -245,13 +249,13 @@ pub(crate) fn nsq(
         let xq_pos = ltp_mem_length + k * subfr_length;
         // The quantizer only WRITES xq (never reads it), so a local
         // buffer is equivalent to the reference's pointer into NSQ->xq.
-        let mut xq_slice = vec![0i16; subfr_length];
+        let mut xq_slice = [0i16; MAX_SUB_FRAME_LENGTH];
         noise_shape_quantizer(
             nsq,
             indices.signal_type,
-            &x_sc_q10,
+            &x_sc_q10[..subfr_length],
             &mut pulses[k * subfr_length..(k + 1) * subfr_length],
-            &mut xq_slice,
+            &mut xq_slice[..subfr_length],
             &mut s_ltp_q15,
             a_q12,
             b_q14,
@@ -266,7 +270,7 @@ pub(crate) fn nsq(
             subfr_length,
             frame.lpc_order,
         );
-        nsq.xq[xq_pos..xq_pos + subfr_length].copy_from_slice(&xq_slice);
+        nsq.xq[xq_pos..xq_pos + subfr_length].copy_from_slice(&xq_slice[..subfr_length]);
     }
 
     // The frame's quantized output lives at xq[ltp_mem..ltp_mem+frame].

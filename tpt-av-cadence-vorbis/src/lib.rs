@@ -311,7 +311,7 @@ impl VorbisDecoder {
             let _ = submap;
             let curve = &mut self.floors[ch][..vlen];
             let nonzero = crate::floor::floor_decode(
-                &self.setup.floors[floor_idx],
+                &mut self.setup.floors[floor_idx],
                 &self.setup.codebooks,
                 &mut br,
                 blockflag as usize,
@@ -593,6 +593,11 @@ impl Decoder for VorbisDecoder {
             let mut prev_n: Option<u64> = None;
             let mut first_audio_page_pos: Option<u64> = None;
             let mut last: Option<Candidate> = None;
+            // Reused across pages/segments: one packet accumulator (worst
+            // case ~64 KiB, the largest a page's lacing can assemble) and a
+            // stack segment buffer, instead of per-segment heap churn.
+            let mut packet: Vec<u8> = Vec::with_capacity(64 * 1024);
+            let mut seg_buf = [0u8; 255];
             loop {
                 let mut header = [0u8; 27];
                 if !read_exact_or_eof(source, &mut header)? {
@@ -616,11 +621,9 @@ impl Decoder for VorbisDecoder {
                 // durations (from each packet's mode bits) so the page's
                 // start position is known for the NEXT page's accounting.
                 let seg_pos = 27usize + nsegs;
-                let mut packet: Vec<u8> = Vec::new();
                 for &seg in &seg_table[..nsegs] {
-                    let mut buf = vec![0u8; seg as usize];
-                    source.take_exact(&mut buf)?;
-                    packet.extend_from_slice(&buf);
+                    source.take_exact(&mut seg_buf[..seg as usize])?;
+                    packet.extend_from_slice(&seg_buf[..seg as usize]);
                     if seg == 255 {
                         continue;
                     }

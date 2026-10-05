@@ -122,10 +122,43 @@ pub struct Codebook {
     /// types 1 and 2.
     values: Box<[f32]>,
     tree: Option<Tree>,
+    /// Prefix-code lookup over the next `bits` stream bits: for each peeked
+    /// value, the codeword that matches its low `len` bits (0 = miss, take
+    /// the tree walk — only codewords longer than `bits` land there). Built
+    /// at setup; turns the bit-at-a-time tree walk into one peek + one
+    /// consume for every codeword that fits.
+    fast: Option<FastTable>,
     /// Single-entry books decode as one bit + the lone entry (spec erratum
     /// 20150226).
     single_entry: Option<usize>,
     max_depth: u32,
+}
+
+/// Lookup-table width cap (2^9 slots ≈ 2.5 KiB per book at setup time).
+/// Books deeper than this keep the table for their short codewords and
+/// tree-walk only the long tail.
+const FAST_BITS: u32 = 9;
+/// Below this many used entries the tree walk is already 1–2 bits deep;
+/// a table would cost more to build than it saves.
+const FAST_MIN_ENTRIES: usize = 4;
+
+struct FastTable {
+    bits: u32,
+    symbols: Box<[u32]>,
+    /// Codeword length per slot; 0 = no codeword of length ≤ `bits` matches
+    /// this peeked value.
+    lens: Box<[u8]>,
+}
+
+/// Mirrors `code` (MSb-aligned in `len` bits) into the bit reader's LSB-first
+/// peek order: peek bit `i` is stream bit `i`, which is codeword bit
+/// `len - 1 - i`.
+fn reverse_bits(code: u32, len: u32) -> u32 {
+    let mut r = 0u32;
+    for i in 0..len {
+        r |= ((code >> i) & 1) << (len - 1 - i);
+    }
+    r
 }
 
 /// Hard cap on one codebook's value table (real books are far below this).
@@ -252,6 +285,8 @@ impl Codebook {
 
         let mut tree = None;
         let mut max_depth = 1u32;
+        // (code, len, entry) for every codeword that can fit the fast table.
+        let mut fast_entries: Vec<(u32, u32, usize)> = Vec::new();
         if used_count > 1 {
             // Kraft check: sum 2^(32-len) must equal 2^32 (complete tree).
             let mut kraft: u64 = 0;
@@ -268,11 +303,41 @@ impl Codebook {
                 if l == 0 {
                     continue;
                 }
-                t.assign_leftmost(l as u32, e)?;
+                let code = t.assign_leftmost(l as u32, e)?;
                 max_depth = max_depth.max(l as u32);
+                if l as u32 <= FAST_BITS {
+                    fast_entries.push((code, l as u32, e));
+                }
             }
             tree = Some(t);
         }
+
+        let fast = if used_count >= FAST_MIN_ENTRIES && max_depth >= 3 {
+            let bits = max_depth.min(FAST_BITS);
+            let size = 1usize << bits;
+            let mut symbols = vec![0u32; size];
+            let mut lens = vec![0u8; size];
+            for &(code, len, entry) in &fast_entries {
+                if len > bits {
+                    continue;
+                }
+                let base = reverse_bits(code, len) as usize;
+                let step = 1usize << len;
+                let mut idx = base;
+                while idx < size {
+                    symbols[idx] = entry as u32;
+                    lens[idx] = len as u8;
+                    idx += step;
+                }
+            }
+            Some(FastTable {
+                bits,
+                symbols: symbols.into_boxed_slice(),
+                lens: lens.into_boxed_slice(),
+            })
+        } else {
+            None
+        };
 
         Ok(Codebook {
             dimensions,
@@ -280,16 +345,33 @@ impl Codebook {
             lookup_type,
             values,
             tree,
+            fast,
             single_entry,
             max_depth,
         })
     }
 
     /// Reads one codeword and returns the entry number (scalar context).
+    ///
+    /// Codewords that fit the fast table decode as one peek + one consume;
+    /// longer codewords (and tables below the build threshold) take the
+    /// bit-at-a-time tree walk, which produces exactly the same entries and
+    /// errors.
     pub fn read_scalar(&self, br: &mut BitReader) -> Result<usize, CadenceError> {
         if let Some(entry) = self.single_entry {
             let _ = br.read_bit()?; // sink one bit; value tolerated as 0 or 1
             return Ok(entry);
+        }
+        if let Some(table) = &self.fast {
+            let peek = br.peek_bits(table.bits) as usize;
+            let len = table.lens[peek] as u32;
+            if len != 0 {
+                // Consuming through `read_bits` keeps the legacy bounds
+                // check: an overread raises the same error and leaves the
+                // reader in the same exhausted state as the tree walk did.
+                br.read_bits(len)?;
+                return Ok(table.symbols[peek] as usize);
+            }
         }
         let tree = self
             .tree

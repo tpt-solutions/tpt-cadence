@@ -6,6 +6,25 @@ version; 0.1.0 is the first crates.io release. Format loosely follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+- Performance pass over the open codecs (see `todo.md`'s 2026-10-06
+  session log). Decoders: WAV/AIFF/PCM bulk-slab decode with hoisted
+  format dispatch (11-14x on the container decode benches, bit-identical
+  output), Vorbis Huffman decode via a 9-bit prefix table, floor0 scratch
+  reuse with precomputed bark cosines, allocation-free Vorbis seek scan
+  and Ogg segment consumption, 64 KiB read buffering, and a buffered CLI
+  output path (its i16 conversion now rounds — an intentional 1-LSB
+  change). Encoders: MP3 analysis-matrix cosine table and ring masks,
+  per-frame VBR psy thresholds, a reworked quantizer (`|x|^0.75` hoisted
+  across the gain search, `ix^(4/3)` table — pinned by a new
+  fast-vs-reference differential test), FLAC zigzag-once residual
+  planning with swap-not-clone buffers and a reusable MD5 interleave
+  buffer, Opus `RangeEncoder::done_len()` for clone-free CBR sizing plus
+  heap-free SILK/CELT scratch and snapshots, and Vorbis transform/window
+  reuse. CI: shared setup action with rust-cache, `taiki-e/install-action`
+  for wasm-bindgen-cli/cargo-fuzz, a `wasm-opt -Oz` step, and six new
+  criterion benches (AIFF/PCM decode; FLAC/MP3/Vorbis encode; Opus SILK).
+
 ### Added
 - `tpt-av-cadence-mp3` window switching rebuilt on the ISO sequence
   `long -> start -> short -> stop`: start and stop blocks now carry real

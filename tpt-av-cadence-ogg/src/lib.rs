@@ -49,6 +49,9 @@ pub struct PageReader {
     /// Remaining lacing values of the current page.
     segments: Box<[u8; 255]>,
     segments_valid: usize,
+    /// Index of the next lacing value in `segments` (avoids shifting the
+    /// whole queue down per consumed segment).
+    segments_head: usize,
     /// Packet currently being assembled across segments/pages.
     pending: Box<[u8]>,
     pending_len: usize,
@@ -82,6 +85,7 @@ impl PageReader {
             body_pos: 0,
             segments: Box::new([0u8; 255]),
             segments_valid: 0,
+            segments_head: 0,
             pending: vec![0u8; max_packet].into_boxed_slice(),
             pending_len: 0,
             started: false,
@@ -119,6 +123,7 @@ impl PageReader {
         self.body_len = 0;
         self.body_pos = 0;
         self.segments_valid = 0;
+        self.segments_head = 0;
         self.pending_len = 0;
         self.eof = false;
         self.chain_end = false;
@@ -146,9 +151,8 @@ impl PageReader {
         loop {
             // Serve a completed packet if the current segment ends one.
             while self.segments_valid > 0 {
-                let seg = self.segments[0] as usize;
-                // Shift the segment queue down by one.
-                self.segments.copy_within(1.., 0);
+                let seg = self.segments[self.segments_head] as usize;
+                self.segments_head += 1;
                 self.segments_valid -= 1;
                 if self.pending_len + seg > self.pending.len() {
                     return Err(corrupt("packet exceeds the packet buffer"));
@@ -244,6 +248,7 @@ impl PageReader {
 
         self.segments[..nsegs].copy_from_slice(&seg_table[..nsegs]);
         self.segments_valid = nsegs;
+        self.segments_head = 0;
         self.body_len = body_len;
         self.body_pos = 0;
         self.page_index += 1;

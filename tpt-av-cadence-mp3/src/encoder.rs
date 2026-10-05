@@ -350,6 +350,24 @@ const HAN_SIZE: usize = 512;
 /// `shine_enwindow`), so this is provably the correct matched pair for
 /// this crate's decoder's synthesis filter (`crate::synth`), which
 /// implements the ISO *synthesis* side of the same standard filterbank.
+/// `cos((pi/64) * (2k+1) * (i-16))` for the analysis matrix — 32x64 f64
+/// (k = subband, i = partial-sum index) computed once with the exact
+/// expression the matrix loop evaluated, so the table is bit-identical to
+/// recomputing per call (which cost ~2048 `cos` calls per 32-sample block).
+fn matrix_cos() -> &'static [[f64; 64]; 32] {
+    static TABLE: std::sync::OnceLock<[[f64; 64]; 32]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [[0.0f64; 64]; 32];
+        for (k, row) in t.iter_mut().enumerate() {
+            for (i, c) in row.iter_mut().enumerate() {
+                *c = (std::f64::consts::PI / 64.0 * (2.0 * k as f64 + 1.0) * (i as f64 - 16.0))
+                    .cos();
+            }
+        }
+        t
+    })
+}
+
 fn analyze_block_polyphase(
     x_hist: &mut [f32; HAN_SIZE],
     off: &mut usize,
@@ -357,6 +375,10 @@ fn analyze_block_polyphase(
     out: &mut [f32; 32],
 ) {
     let win = &crate::tables::ANALYSIS_WINDOW;
+    let cos_tab = matrix_cos();
+    // HAN_SIZE is a power of two, so indexing wraps by mask (all operands
+    // are non-negative, so this equals the old `% HAN_SIZE`).
+    let ring_mask = HAN_SIZE - 1;
 
     // `shine_window_filter_subband` receives the 32 PCM samples in forward
     // order, then fills the circular buffer backwards:
@@ -364,27 +386,26 @@ fn analyze_block_polyphase(
     // is essential to the prototype filter's phase, not an implementation
     // detail that can be normalized away later.
     for (i, &sample) in new_samples.iter().enumerate() {
-        x_hist[(*off + (31 - i)) % HAN_SIZE] = sample;
+        x_hist[(*off + (31 - i)) & ring_mask] = sample;
     }
 
     let mut y = [0.0f64; 64];
     for (i, yi) in y.iter_mut().enumerate() {
         let mut acc = 0.0f64;
         for m in 0..8usize {
-            let idx = (*off + i + 64 * m) % HAN_SIZE;
+            let idx = (*off + i + 64 * m) & ring_mask;
             acc += x_hist[idx] as f64 * win[i + 64 * m];
         }
         *yi = acc;
     }
 
-    *off = (*off + 480) % HAN_SIZE;
+    *off = (*off + 480) & ring_mask;
 
     for (k, o) in out.iter_mut().enumerate() {
+        let row = &cos_tab[k];
         let mut acc = 0.0f64;
         for (i, &yi) in y.iter().enumerate() {
-            let c =
-                (std::f64::consts::PI / 64.0 * (2.0 * k as f64 + 1.0) * (i as f64 - 16.0)).cos();
-            acc += yi * c;
+            acc += yi * row[i];
         }
         *o = acc as f32;
     }
@@ -731,9 +752,25 @@ fn granule_gain(global_gain: u8, ms_stereo: bool) -> f32 {
     ldexp_q2((1 << (MAX_SCFI / 4)) as f32, MAX_SCFI - gain_exp)
 }
 
-/// Quantizes one spectral line to `|ix|` via the inverse of the decoder's
-/// `X = scf * |ix|^(4/3) * sign(ix)` relation, clamped to the largest
-/// magnitude any escape table can represent.
+/// `ix^(4/3)` for every representable `|ix|` (0..=8206) — the dequantized
+/// magnitude the decoder reconstructs. Same expression per element as the
+/// inline powf it replaces, so values are bit-identical.
+fn ix43(ix: u32) -> f32 {
+    static TABLE: std::sync::OnceLock<[f32; 8207]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0.0f32; 8207];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = (i as f32).powf(4.0 / 3.0);
+        }
+        t
+    })[ix as usize]
+}
+
+/// Reference quantizer — `( |x| / gain )^0.75`, the pre-optimization
+/// arithmetic — kept under test by
+/// [`fast_quantizer_matches_reference_outside_rounding_ties`], which pins
+/// the fast path's accepted `.round()`-tie divergence against it.
+#[cfg(test)]
 fn quantize_one(x: f32, gain: f32) -> u32 {
     if gain <= 0.0 || !x.is_finite() {
         return 0;
@@ -743,6 +780,45 @@ fn quantize_one(x: f32, gain: f32) -> u32 {
         return 8206;
     }
     (ix.round() as i64).clamp(0, 8206) as u32
+}
+
+/// `|x|^0.75` per line — the gain-independent half of the quantizer's
+/// `(x.abs() / gain).powf(0.75)`, computed once per granule instead of
+/// once per line per candidate gain. Non-finite lines map to 0, matching
+/// `quantize_one`'s guard.
+fn spec_pow45(spec: &[f32; GRANULE_SAMPLES]) -> [f32; GRANULE_SAMPLES] {
+    let mut out = [0.0f32; GRANULE_SAMPLES];
+    for (o, &s) in out.iter_mut().zip(spec) {
+        *o = if s.is_finite() {
+            s.abs().powf(0.75)
+        } else {
+            0.0
+        };
+    }
+    out
+}
+
+/// Quantizes all 576 lines against per-band gains using the precomputed
+/// `|x|^0.75` table: `|x|^0.75 * gain^-0.75` replaces the per-line
+/// divide+powf. The two forms agree to the last bits of the f32 mantissa
+/// but can differ at `.round()` ties — accepted (and covered by the
+/// encoder fidelity gates), because the inner gain search re-quantizes
+/// all 576 lines a dozen times per granule.
+fn quantize_granule_pow45(
+    x45: &[f32; GRANULE_SAMPLES],
+    gains: &[f32; MAX_SFB],
+    band_of_line: &[u8; GRANULE_SAMPLES],
+) -> [u32; GRANULE_SAMPLES] {
+    let mut inv_g45 = [0.0f32; MAX_SFB];
+    for (b, g) in gains.iter().enumerate() {
+        inv_g45[b] = if *g > 0.0 { g.powf(-0.75) } else { 0.0 };
+    }
+    let mut ix = [0u32; GRANULE_SAMPLES];
+    for (i, slot) in ix.iter_mut().enumerate() {
+        let v = x45[i] * inv_g45[band_of_line[i] as usize];
+        *slot = (v.round() as i64).clamp(0, 8206) as u32;
+    }
+    ix
 }
 
 /// Per-sample-rate long-block scalefactor-band geometry: `widths[b]` lines
@@ -1099,11 +1175,8 @@ fn quantize_granule(
     gains: &[f32; MAX_SFB],
     band_of_line: &[u8; GRANULE_SAMPLES],
 ) -> [u32; GRANULE_SAMPLES] {
-    let mut ix = [0u32; GRANULE_SAMPLES];
-    for i in 0..GRANULE_SAMPLES {
-        ix[i] = quantize_one(spec[i], gains[band_of_line[i] as usize]);
-    }
-    ix
+    let x45 = spec_pow45(spec);
+    quantize_granule_pow45(&x45, gains, band_of_line)
 }
 
 /// Cost of one `(x, y)` pair through a big_values book, in bits including
@@ -1424,6 +1497,7 @@ fn split_big_values(ix: &[u32; GRANULE_SAMPLES]) -> (usize, usize) {
 #[allow(clippy::too_many_arguments)]
 fn evaluate_granule(
     spec: &[f32; GRANULE_SAMPLES],
+    x45: &[f32; GRANULE_SAMPLES],
     layout: &BandLayout,
     global_gain: u8,
     scalefacs: &[u8; MAX_SFB],
@@ -1434,7 +1508,7 @@ fn evaluate_granule(
     sfb_bits: u64,
 ) -> GranuleCost {
     let gains = band_gains(global_gain, scalefacs, preflag, ms_stereo, layout.n_sf);
-    let mut ix = quantize_granule(spec, &gains, &layout.band_of_line);
+    let mut ix = quantize_granule_pow45(x45, &gains, &layout.band_of_line);
     // A line at the clamp ceiling was (almost surely) clamped: the quantizer
     // is too fine for this granule and the decoded amplitude would be wrong.
     let mut window_ok = !ix.iter().any(|&v| v >= 8206);
@@ -1519,7 +1593,7 @@ fn evaluate_granule(
         let mut acc = 0.0f64;
         for i in layout.line_start[band]..layout.line_end[band] {
             let s = spec[i];
-            let xq = gain * (ix[i] as f32).powf(4.0 / 3.0) * s.signum();
+            let xq = gain * ix43(ix[i]) * s.signum();
             acc += (s as f64 - xq as f64).powi(2);
         }
         *noise = acc;
@@ -1598,9 +1672,11 @@ fn inner_loop(
     block_type: u8,
     sfb_bits: u64,
 ) -> GranuleCost {
+    // The quantizer's gain-independent half is fixed for the whole search.
+    let x45 = spec_pow45(spec);
     let cost_at = |gg: u8| {
         evaluate_granule(
-            spec, layout, gg, scalefacs, compress, preflag, ms_stereo, block_type, sfb_bits,
+            spec, &x45, layout, gg, scalefacs, compress, preflag, ms_stereo, block_type, sfb_bits,
         )
     };
 
@@ -2636,6 +2712,9 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         is: Option<&IsInfo>,
     ) -> (u8, [GranulePlan; 4], u64, f64) {
         let tolerance = self.vbr_tolerance.unwrap_or(1.0);
+        // The psychoacoustic thresholds depend only on the spectra, not on
+        // the bit budget, so compute them once for the whole ladder.
+        let thresholds = self.slot_thresholds();
         let mut best: Option<(u8, [GranulePlan; 4], u64, f64)> = None;
         for idx in 1..15u8 {
             let total = self.frame_bytes_at(idx, false);
@@ -2643,7 +2722,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             if main_bits == 0 {
                 continue;
             }
-            let (plans, p23, worst) = self.plan_slots(main_bits + borrow * 8, ms, is);
+            let (plans, p23, worst) = self.plan_slots(main_bits + borrow * 8, ms, is, &thresholds);
             let candidate = (idx, plans, p23, worst);
             let done = worst <= tolerance;
             best = Some(candidate);
@@ -2688,6 +2767,27 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         };
         let b3 = (mode << 6) | (mode_ext << 4);
         [0xFF, b1, b2, b3]
+    }
+
+    /// Per-slot psychoacoustic thresholds — a function of the spectra and
+    /// band layout only, not of any bit budget, so callers that re-plan the
+    /// same frame at several budgets (the VBR ladder) compute them once.
+    fn slot_thresholds(&self) -> [[f64; MAX_SFB]; 4] {
+        let channels = self.channels as usize;
+        let mut out = [[0.0; MAX_SFB]; 4];
+        let slots = self.n_granules() * channels;
+        for (slot, out_slot) in out.iter_mut().enumerate().take(slots) {
+            let gr = slot / channels;
+            let ch = slot % channels;
+            let spec = self.spec_scratch[ch * 2 + gr];
+            let layout = if self.slot_block[slot] == 2 {
+                &self.short_layout
+            } else {
+                &self.layout
+            };
+            *out_slot = psy_thresholds(&spec, layout, self.sample_rate);
+        }
+        out
     }
 
     /// Runs the analysis filterbank + forward MDCT for one channel's 1152
@@ -2987,6 +3087,7 @@ impl<W: Write + Seek> Mp3Encoder<W> {
         budget_total: u64,
         ms: bool,
         is: Option<&IsInfo>,
+        thresholds_all: &[[f64; MAX_SFB]; 4],
     ) -> ([GranulePlan; 4], u64, f64) {
         let channels = self.channels as usize;
         let slots = self.n_granules() * channels;
@@ -3018,12 +3119,12 @@ impl<W: Write + Seek> Mp3Encoder<W> {
             } else {
                 &self.layout
             };
-            let thresholds = psy_thresholds(&spec, layout, self.sample_rate);
+            let thresholds = &thresholds_all[slot];
             let block = self.slot_block[slot];
             let cost = plan_granule(
                 &spec,
                 layout,
-                &thresholds,
+                thresholds,
                 ms,
                 budget,
                 self.lsf,
@@ -3223,8 +3324,13 @@ impl<W: Write + Seek> Mp3Encoder<W> {
                 }
             }
             let (idx, plans, p23, padding) = if let Some((padding, probe_main)) = cbr {
-                let (plans, p23, _) =
-                    self.plan_slots(probe_main as u64 * 8 + borrow * 8, ms, is_info.as_ref());
+                let thresholds = self.slot_thresholds();
+                let (plans, p23, _) = self.plan_slots(
+                    probe_main as u64 * 8 + borrow * 8,
+                    ms,
+                    is_info.as_ref(),
+                    &thresholds,
+                );
                 (self.bitrate_idx, plans, p23, padding)
             } else {
                 let (idx, plans, p23, _) = self.plan_vbr_frame(borrow, ms, is_info.as_ref());
@@ -3742,6 +3848,55 @@ impl<W: Write + Seek> Mp3Encoder<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast quantizer (`|x|^0.75 * gain^-0.75`) must agree with the
+    /// reference `( |x| / gain )^0.75` on essentially every input; the
+    /// accepted divergence is the rare `.round()` tie, never a whole step.
+    #[test]
+    fn fast_quantizer_matches_reference_outside_rounding_ties() {
+        let mut state = 0x1234_5678u32;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut spec = [0.0f32; GRANULE_SAMPLES];
+        for s in spec.iter_mut() {
+            // Amplitudes across the quantizer's realistic dynamic range.
+            *s = ((rand() & 0xffff) as f32 / 32768.0 - 0.5)
+                * 10f32.powf(((rand() % 7) as f32) - 3.0);
+        }
+        let x45 = spec_pow45(&spec);
+        let mut gains = [0.0f32; MAX_SFB];
+        for (b, g) in gains.iter_mut().enumerate() {
+            *g = 0.01 * 2f32.powi(b as i32);
+        }
+        let mut band_of_line = [0u8; GRANULE_SAMPLES];
+        for (i, b) in band_of_line.iter_mut().enumerate() {
+            *b = (i * 22 / GRANULE_SAMPLES) as u8;
+        }
+        let fast = quantize_granule_pow45(&x45, &gains, &band_of_line);
+        let mut mismatches = 0usize;
+        for i in 0..GRANULE_SAMPLES {
+            let reference = quantize_one(spec[i], gains[band_of_line[i] as usize]);
+            if fast[i] != reference {
+                mismatches += 1;
+                assert!(
+                    fast[i].abs_diff(reference) <= 1,
+                    "line {i}: fast {} vs reference {} (more than a rounding tie)",
+                    fast[i],
+                    reference
+                );
+            }
+        }
+        // Ties are the exception, not the rule: a handful of lines at most
+        // out of 576 may differ by one quantizer step.
+        assert!(
+            mismatches <= 8,
+            "{mismatches} lines differ from the reference"
+        );
+    }
     use crate::imdct;
 
     #[test]

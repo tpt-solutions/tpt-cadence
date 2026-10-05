@@ -686,6 +686,7 @@ dependencies = [
 name = "tpt-av-cadence-aiff"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "log",
  "proptest",
  "tpt-av-cadence-core",
@@ -761,6 +762,7 @@ dependencies = [
 name = "tpt-av-cadence-pcm"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "log",
  "proptest",
  "tpt-av-cadence-core",

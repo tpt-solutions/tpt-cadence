@@ -1,0 +1,54 @@
+# Shared setup for every job that builds the workspace: the sibling
+# tpt-av-test repo (path dependency of tpt-av-cadence-test-utils), the Rust
+# toolchain, and cargo build caching.
+#
+# The sibling repo must sit one level above this workspace because
+# tpt-av-cadence-test-utils depends on it via a relative path
+# (`../../tpt-av-test/...`). actions/checkout refuses a `path` that escapes
+# GITHUB_WORKSPACE, so check out inside the workspace and move it up to the
+# position the path dependency expects.
+name: "Setup build environment"
+description: "Sibling tpt-av-test checkout + Rust toolchain + cargo cache"
+inputs:
+  toolchain:
+    description: "Rust toolchain to install"
+    required: true
+  components:
+    description: "Optional toolchain components (e.g. rustfmt, clippy)"
+    required: false
+    default: ""
+  targets:
+    description: "Optional additional compilation targets"
+    required: false
+    default: ""
+  cache:
+    description: "Whether to enable Swatinem/rust-cache"
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout tpt-av-test (sibling path dependency)
+      uses: actions/checkout@v4
+      with:
+        repository: tpt-solutions/tpt-av-test
+        path: tpt-av-test
+
+    - name: Move tpt-av-test to sibling directory
+      run: mv tpt-av-test ..
+      shell: bash
+
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # Cache key covers the job, runner OS and rustc version, so matrix
+    # legs (stable vs 1.75, linux vs windows vs macos) land in separate
+    # caches without extra inputs.
+    - if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: .

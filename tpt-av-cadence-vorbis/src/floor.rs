@@ -277,6 +277,12 @@ pub struct Floor0 {
     /// Bark-scale map per block size (`bs/2` entries plus a `-1` sentinel),
     /// precomputed by `build_maps`.
     pub maps: Vec<Box<[i32]>>,
+    /// `2*cos(w*m)` per bark index, precomputed by `build_maps`.
+    pub two_cos_w: Vec<f32>,
+    /// Reused per-channel scratch (kept on the config so repeated decodes
+    /// don't allocate); sized on demand.
+    pub lsp_scratch: Vec<f32>,
+    pub vec_scratch: Vec<f32>,
 }
 
 /// Floor 1 configuration (spec 7.2.2).
@@ -322,12 +328,23 @@ impl Floor0 {
                 map
             })
             .collect();
+        // `2*cos(w*m)` for every bark index the maps can name — the decode
+        // loop's per-run `cos` becomes one table load. Same expression the
+        // loop evaluated, so output is bit-identical.
+        self.two_cos_w = (0..self.bark_map_size)
+            .map(|m| {
+                (2.0 * (std::f64::consts::PI / self.bark_map_size as f64 * m as f64).cos()) as f32
+            })
+            .collect();
     }
 
     /// Decodes one channel's floor 0 curve into `curve[0..n)`. Returns
     /// `false` when the channel is unused.
+    ///
+    /// The LSP/VQ scratch buffers are owned by `self` and reused across
+    /// calls, so packet decode stays allocation-free.
     pub fn decode(
-        &self,
+        &mut self,
         books: &[Codebook],
         br: &mut BitReader,
         blockflag: usize,
@@ -354,12 +371,16 @@ impl Floor0 {
         // produce more than `order` scalars — extras update the running
         // `last` but are otherwise dropped.
         let order = self.order;
-        let mut lsp = vec![0.0f32; order].into_boxed_slice();
+        self.lsp_scratch.clear();
+        self.lsp_scratch.resize(order, 0.0);
+        let lsp: &mut [f32] = &mut self.lsp_scratch;
         let mut lsp_len = 0usize;
         let mut last = 0.0f32;
-        let mut vec_buf = vec![0.0f32; codebook.dimensions.max(1)].into_boxed_slice();
+        self.vec_scratch.clear();
+        self.vec_scratch.resize(codebook.dimensions.max(1), 0.0);
+        let vec_buf: &mut [f32] = &mut self.vec_scratch;
         while lsp_len < order {
-            codebook.read_vector(br, &mut vec_buf)?;
+            codebook.read_vector(br, vec_buf)?;
             let dims = codebook.dimensions;
             for v in vec_buf[..dims].iter_mut() {
                 *v += last;
@@ -375,15 +396,15 @@ impl Floor0 {
         for c in lsp.iter_mut() {
             *c = 2.0 * c.cos();
         }
+        let two_cos_table: &[f32] = &self.two_cos_w;
         let map = &self.maps[blockflag];
-        let wstep = std::f64::consts::PI / self.bark_map_size as f64;
         let amp_denom = ((1u64 << self.amplitude_bits) - 1) as f64;
         let mut i = 0usize;
         while i < n {
             let iter_cond = map[i];
             let mut p = 0.5f32;
             let mut q = 0.5f32;
-            let two_cos_w = (2.0 * (wstep * iter_cond as f64).cos()) as f32;
+            let two_cos_w = two_cos_table[iter_cond as usize];
             let mut j = 0usize;
             while j + 1 < order {
                 q *= lsp[j] - two_cos_w;
@@ -605,7 +626,7 @@ impl Bark for f64 {
 
 /// Decodes a floor of either type; `false` = channel unused.
 pub fn floor_decode(
-    floor: &Floor,
+    floor: &mut Floor,
     books: &[Codebook],
     br: &mut BitReader,
     blockflag: usize,
