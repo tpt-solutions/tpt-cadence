@@ -11,6 +11,5 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-byteorder = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

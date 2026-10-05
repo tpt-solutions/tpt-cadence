@@ -3890,3 +3890,51 @@ Open work after this session:
 2. Listening-test validation of noise shaping (MP3 outer loop, Vorbis
    masking model); Vorbis adaptive Huffman books and a higher residue range.
 3. FLAC: variable block size / block-size search, more LPC windows.
+
+## Performance optimization pass (open codecs only — AAC work paused by decision)
+
+Static audit, nothing profiled yet. Every step must keep the conformance gates green
+(`cargo test --workspace`, FFmpeg crosschecks, `rt_safety` zero-alloc tests, clippy, fmt).
+Plan file: `~/.claude/plans/review-the-platform-can-glimmering-beacon.md`.
+
+### Step 0 — Baseline
+- [ ] Record `cargo bench` numbers for wav / flac / mp3 / vorbis decode and opus `celt_round_trip`
+- [ ] Add benches: AIFF + PCM decode, FLAC encode, MP3 encode (CBR + VBR), Vorbis encode, Opus SILK decode
+- [ ] Register new benches in the `bench` job list in `.github/workflows/ci.yml`
+
+### Step 1 — Zero-risk config
+- [x] Release profile: `lto = "fat"`, `codegen-units = 1`; wasm-demo `opt-level = "s"`; `[profile.bench]` (inherits release, debug symbols). `panic = "abort"` deliberately skipped (library consumers own their profile; keeps panic-free contract testable)
+- [x] Remove unused `byteorder` dependency (core, wav, workspace)
+- [ ] CI: `Swatinem/rust-cache` on all jobs
+- [ ] CI: install `cargo-fuzz` / `wasm-bindgen-cli` via `taiki-e/install-action` instead of `cargo install`
+- [ ] CI: drop redundant `cargo build --workspace --all-targets` before tests; factor duplicated sibling-checkout step
+- [ ] `wasm-opt -Oz` step in the wasm job; compare wasm size before/after
+
+### Step 2 — Bit-identical decoder wins
+- [ ] WAV / AIFF / PCM: hoist the per-sample format `match`, precompute scale, bulk-convert from a byte slab (`BufferedSource` partial-read helper in core; keep decode allocation-free; output bit-identical)
+- [ ] Vorbis `codebook.rs`: 8–10 bit lookup table for `read_scalar`, `#[inline]` bit reads
+- [ ] Vorbis `floor.rs` floor0: reuse `lsp`/`vec_buf` scratch, precompute cos terms
+- [ ] Vorbis seek scan (`lib.rs` ~619): reuse one packet `Vec` instead of per-segment alloc
+- [ ] Ogg `lib.rs` ~151: segment queue head index instead of `copy_within`
+- [ ] BufferedSource default capacity 8 KiB → 64 KiB for file-backed readers
+- [ ] CLI `main.rs` ~260–317: `BufWriter` + per-block byte buffer for stdout and WAV output; `.round()` for i16 (intentional 1-LSB change)
+- [ ] wasm-demo: `*_sample_rate` exports return after `info()`; pre-size output `Vec`
+
+### Step 3 — Bit-identical encoder wins
+- [ ] MP3 `encoder.rs` ~353–392: static cosine table for polyphase analysis, mask instead of `% HAN_SIZE` (likely biggest MP3 encode win)
+- [ ] MP3 `plan_vbr_frame` ~2632: hoist budget-independent `psy_thresholds` out of the bitrate ladder
+- [ ] FLAC `encoder.rs` ~223–296: zigzag once, derive coarser partition sums by merging pairs; swap buffers instead of cloning the residual (~479, 515); output byte-identical
+- [ ] FLAC MD5: reusable interleave buffer with 16/24-bit fast path
+- [ ] Opus: non-consuming length instead of `enc.clone().done().len()` (`celt/encoder.rs` ~649, `silk/encoder.rs` ~1312/1347)
+- [ ] Opus: hoist per-call allocations (`celt/vq.rs` 182/191, `silk/nsq_ref.rs`, `silk/noise_shape.rs` ~418, `silk/nsq_del_dec.rs` 188/451)
+- [ ] Opus SILK rate loop: swap/ring of attempts instead of cloning `RateAttempt`/NSQ state
+- [ ] Vorbis encoder: reuse `Transform::forward` / `window()` scratch, cache window shapes, derive floor curve directly instead of bit round-trip
+
+### Step 4 — Numerics-changing (golden test vs naive path first)
+- [ ] MP3 quantizer: precompute `|x|^0.75`, per-gain and `ix^(4/3)` tables, defer noise calc to final candidate (watch rounding ties; gate on encoder regression suite)
+- [ ] FLAC LPC candidate pruning via Levinson error estimate (changes output bytes — only if no byte-golden tests)
+- [ ] Opus SILK pitch search: incremental energy (arithmetic-identical); coarse-to-fine only if decisions can change
+
+### Deferred
+- MP3 `Mdct36Basis` fast DCT (exactness risk), SIMD / `target-cpu` flags (portability)
+- AAC (paused): IMDCT O(M²)→FFT, SBR `Mdct64`, Huffman `HashMap`→peek table, per-frame allocs in SBR path

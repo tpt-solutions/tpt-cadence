@@ -12,7 +12,6 @@ rust-version.workspace = true
 
 [dependencies]
 tpt-av-cadence-core = { workspace = true }
-byteorder = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]

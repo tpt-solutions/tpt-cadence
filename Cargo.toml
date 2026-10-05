@@ -28,11 +28,18 @@ rust-version = "1.75"
 tpt-av-cadence-core = { path = "tpt-av-cadence-core", version = "0.1.0" }
 tpt-av-cadence-ogg = { path = "tpt-av-cadence-ogg", version = "0.1.0" }
 tpt-av-cadence-test-utils = { path = "tpt-av-cadence-test-utils" }
-byteorder = "1.5"
 thiserror = "2"
 log = "0.4"
 proptest = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+
+[profile.release.package.tpt-av-cadence-wasm-demo]
+opt-level = "s"
+
+[profile.bench]
+inherits = "release"
+debug = true
