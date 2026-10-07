@@ -216,8 +216,9 @@ fn read_sbr_grid(sbr: &mut Sbr, br: &mut SbrBitReader, ch: usize) -> Result<(), 
             data.t_env[0] = 0;
             data.t_env[data.bs_num_env] = abs_bord_trail as u8;
             for i in 0..num_rel_trail {
-                data.t_env[data.bs_num_env - 1 - i] =
-                    data.t_env[data.bs_num_env - i] - 2 * br.bits(2) as u8 - 2;
+                data.t_env[data.bs_num_env - 1 - i] = data.t_env[data.bs_num_env - i]
+                    .checked_sub(2 * br.bits(2) as u8 + 2)
+                    .ok_or(())?;
             }
             bs_pointer = br.bits(CEIL_LOG2[data.bs_num_env] as u32) as usize;
             for i in 0..data.bs_num_env {
@@ -254,8 +255,9 @@ fn read_sbr_grid(sbr: &mut Sbr, br: &mut SbrBitReader, ch: usize) -> Result<(), 
                 data.t_env[i + 1] = data.t_env[i] + 2 * br.bits(2) as u8 + 2;
             }
             for i in 0..num_rel_trail {
-                data.t_env[data.bs_num_env - 1 - i] =
-                    data.t_env[data.bs_num_env - i] - 2 * br.bits(2) as u8 - 2;
+                data.t_env[data.bs_num_env - 1 - i] = data.t_env[data.bs_num_env - i]
+                    .checked_sub(2 * br.bits(2) as u8 + 2)
+                    .ok_or(())?;
             }
             bs_pointer = br.bits(CEIL_LOG2[data.bs_num_env] as u32) as usize;
             for i in 1..=data.bs_num_env {
