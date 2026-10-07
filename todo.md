@@ -3803,8 +3803,8 @@ Open work:
    committed (`ec068b9`), but master is 7 commits ahead of `origin`. Push
    master, run `tools/release_prep.py --prepare 0.1.0`, tag, push the tag.
    (The script only writes a local patch: it never commits, tags, or pushes.)
-2. **Future enhancements (not blocking 0.1.0)** — Vorbis block switching,
-   per-file adaptive Huffman books, and a real psychoacoustic model.
+2. **Future enhancements (not blocking 0.1.0)** — Vorbis block switching (done 09-30),
+   per-file adaptive Huffman books (done 10-07), and a real psychoacoustic model (built, unvalidated by listening).
 
 Closed since this list was written: the **LSF short-block defect** — repeated
 attack/bridge cycles in the plain MPEG-2/2.5 short-block path made this
@@ -4009,3 +4009,39 @@ smaller-than-FFmpeg property), SILK incremental pitch energy (f64
 reassociation is not arithmetic-identical), and deriving the Vorbis floor
 curve without the bit round-trip (the round-trip is the correctness
 proof).
+
+### Session log (2026-10-07): Vorbis per-file adaptive Huffman books
+
+`VorbisEncoder::new_adaptive` (streaming `new` is unchanged). `encode_block` now
+emits tokens (literal bits or book entries) instead of packed bits; streaming
+mode renders them with the static books immediately, adaptive mode holds them
+until `finish`, trains the five books from entry histograms (weights floored at
+total/65536 so every entry keeps a codeword and code length stays far under the
+32-bit limit), writes the headers (re-parsed with `parse_setup`) and then the
+packets. Cost: memory grows with the input and nothing reaches the sink before
+`finish`. Gate: `adaptive_books_decode_identically_and_shrink_the_stream`
+(decoded PCM sample-identical to static books; 3 s synthetic: mono 83-89 %,
+stereo 74-80 % of the static size) plus an FFmpeg decode of both streams
+byte-identical. Not done: the higher residue range (+-250 clamp / static
+`b3` lattice) and listening validation of the masking model and MP3 outer
+loop, which this environment cannot run. Block switching and the masking model
+were already in (fifth session, 2026-09-30).
+
+Correction (same day): the "higher residue range" item rests on a wrong
+diagnosis. A fifth partition class (coarse step 64, three-pass cascade, +-1900)
+was built and tested, then reverted: on a pure 0.5-amplitude 1 kHz tone at q10
+the largest residue is ~76 (never near the +-250 clamp), and SNR stayed 30.8 dB
+with the wider range; the extra book/class only cost ~140 B per file. The
+~31 dB tone ceiling therefore comes from floor resolution / step-to-mask ratio
+(quantization noise at floor level across the whole post region), not from
+residue range. A real fix would target the floor fit, not the books.
+
+Floor-fit follow-up (same day): read `fit_floor` — each post targets the masking
+threshold's amplitude times `floor_gain` (12 dB above the mask at q0, 8 dB
+*below* it at q10), so quantization noise is shaped to sit a fixed distance
+under the psychoacoustic mask by construction. A ~31 dB SNR on a pure tone at
+q10 is therefore the design working, not a defect; SNR is the wrong yardstick
+for a masking-driven coder. The only lever is the quality ladder
+(`FLOOR_GAIN_DB_PER_Q`/range), a product decision that needs listening tests.
+No code change. The "quality ceiling" caveat in the 09-30 log should be read
+this way.

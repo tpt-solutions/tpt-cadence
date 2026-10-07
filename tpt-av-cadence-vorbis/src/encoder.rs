@@ -28,7 +28,8 @@
 //! constants — no listening tests back it — and an objective band-SNR proxy
 //! puts it level with the envelope-tracking rule it replaced, so treat the
 //! quality ladder as calibrated for bitrate, not proven perceptually.
-//! Per-file adaptive Huffman books remain future work.
+//! Per-file adaptive Huffman books are available through
+//! `VorbisEncoder::new_adaptive` (whole-stream buffering; see there).
 //!
 //! Stream layout: one Ogg packet per page (`OggPageWriter`), granule
 //! positions trimming the final packet to the exact input length.
@@ -82,6 +83,7 @@ const BOOK_CLASS: usize = 1;
 const BOOK_B1: usize = 2;
 const BOOK_B2: usize = 3;
 const BOOK_B3: usize = 4;
+const NBOOKS: usize = 5;
 
 /// LSB-first bit packer (Vorbis bit order).
 #[derive(Default, Clone)]
@@ -268,16 +270,21 @@ impl VqBook {
                 w
             })
             .collect();
+        Self::with_weights(dim, n, step, &weights)
+    }
+
+    /// A book whose code lengths follow measured entry `weights`.
+    fn with_weights(dim: usize, n: i32, step: i32, weights: &[f64]) -> Result<Self> {
         Ok(VqBook {
-            book: EncBook::new(&weights)?,
+            book: EncBook::new(weights)?,
             dim,
             n,
             step,
         })
     }
 
-    /// Writes one vector of already-step-divided integer digits.
-    fn put(&self, bw: &mut BitWriter, digits: &[i32]) {
+    /// Entry index of one vector of already-step-divided integer digits.
+    fn entry(&self, digits: &[i32]) -> usize {
         let vals = (2 * self.n + 1) as usize;
         let mut entry = 0usize;
         let mut mul = 1usize;
@@ -285,7 +292,136 @@ impl VqBook {
             entry += (d + self.n) as usize * mul;
             mul *= vals;
         }
-        self.book.put(bw, entry);
+        entry
+    }
+}
+
+/// Which codebook a [`Tok`] indexes (`RAW` = literal bits).
+const T_RAW: u8 = 255;
+
+/// One packet element: literal bits, or a codebook entry resolved to a
+/// codeword only when the books are final (so per-file books can be trained
+/// on the whole stream before any packet is rendered).
+#[derive(Clone, Copy)]
+struct Tok {
+    book: u8,
+    n: u8,
+    v: u32,
+}
+
+impl Tok {
+    fn bits(v: u32, n: u32) -> Self {
+        Tok {
+            book: T_RAW,
+            n: n as u8,
+            v,
+        }
+    }
+
+    fn sym(book: usize, entry: usize) -> Self {
+        Tok {
+            book: book as u8,
+            n: 0,
+            v: entry as u32,
+        }
+    }
+}
+
+/// The five codebooks of the setup header, in header order.
+struct Books {
+    floor: EncBook,
+    class: EncBook,
+    b1: VqBook,
+    b2: VqBook,
+    b3: VqBook,
+}
+
+impl Books {
+    /// The fixed, hand-shaped books used by streaming encodes.
+    fn static_books() -> Result<Self> {
+        let floor_weights: Vec<f64> = (0..FLOOR_RANGE)
+            .map(|v| 1.0 / (1.0 + f64::from(v)).powf(1.3))
+            .collect();
+        let class_p = [0.5, 0.25, 0.15, 0.10];
+        let class_weights: Vec<f64> = (0..CLASSES * CLASSES)
+            .map(|e| class_p[e / CLASSES] * class_p[e % CLASSES])
+            .collect();
+        Ok(Books {
+            floor: EncBook::new(&floor_weights)?,
+            class: EncBook::new(&class_weights)?,
+            b1: VqBook::new(4, 1, 1, 0.55)?,
+            b2: VqBook::new(2, 5, 1, 2.2)?,
+            b3: VqBook::new(1, 31, 8, 4.0)?,
+        })
+    }
+
+    /// Books trained on measured per-entry usage `counts` (indexed by
+    /// `BOOK_*`). Every entry keeps a codeword (a Vorbis lattice book must
+    /// be able to name every vector); the weight floor bounds the code
+    /// length well inside the format's 32-bit limit.
+    fn trained(counts: &[Vec<u64>; NBOOKS]) -> Result<Self> {
+        fn weights(c: &[u64]) -> Vec<f64> {
+            let total: u64 = c.iter().sum();
+            let floor = (total as f64 / 65_536.0).max(1.0);
+            c.iter().map(|&x| (x as f64).max(floor)).collect()
+        }
+        let proto = Self::static_books()?;
+        Ok(Books {
+            floor: EncBook::new(&weights(&counts[BOOK_FLOOR]))?,
+            class: EncBook::new(&weights(&counts[BOOK_CLASS]))?,
+            b1: VqBook::with_weights(
+                proto.b1.dim,
+                proto.b1.n,
+                proto.b1.step,
+                &weights(&counts[BOOK_B1]),
+            )?,
+            b2: VqBook::with_weights(
+                proto.b2.dim,
+                proto.b2.n,
+                proto.b2.step,
+                &weights(&counts[BOOK_B2]),
+            )?,
+            b3: VqBook::with_weights(
+                proto.b3.dim,
+                proto.b3.n,
+                proto.b3.step,
+                &weights(&counts[BOOK_B3]),
+            )?,
+        })
+    }
+
+    fn book(&self, idx: u8) -> &EncBook {
+        match usize::from(idx) {
+            BOOK_FLOOR => &self.floor,
+            BOOK_CLASS => &self.class,
+            BOOK_B1 => &self.b1.book,
+            BOOK_B2 => &self.b2.book,
+            _ => &self.b3.book,
+        }
+    }
+
+    /// Number of entries of each book, for histogram sizing.
+    fn entry_counts(&self) -> [usize; NBOOKS] {
+        [
+            self.floor.lengths.len(),
+            self.class.lengths.len(),
+            self.b1.book.lengths.len(),
+            self.b2.book.lengths.len(),
+            self.b3.book.lengths.len(),
+        ]
+    }
+
+    /// Packs a token stream into packet bytes.
+    fn render(&self, toks: &[Tok]) -> Vec<u8> {
+        let mut bw = BitWriter::default();
+        for t in toks {
+            if t.book == T_RAW {
+                bw.write(t.v, u32::from(t.n));
+            } else {
+                self.book(t.book).put(&mut bw, t.v as usize);
+            }
+        }
+        bw.finish()
     }
 }
 
@@ -420,17 +556,25 @@ fn full_scale_amplitude(tr: &mut Transform, long_slope: &[f32]) -> f64 {
     f64::from(best)
 }
 
+/// Deferred-output state of the per-file adaptive mode.
+struct Adaptive {
+    id_packet: Vec<u8>,
+    comment_packet: Vec<u8>,
+    packets: Vec<(Vec<Tok>, i64)>,
+}
+
 /// Ogg Vorbis encoder.
 pub struct VorbisEncoder<W: Write + Send> {
     sink: W,
     channels: usize,
     page_writer: OggPageWriter,
     setup: Setup,
-    floor_book: EncBook,
-    class_book: EncBook,
-    b1: VqBook,
-    b2: VqBook,
-    b3: VqBook,
+    /// Static books: the stream's books in streaming mode, and the
+    /// provisional books used to round-trip floors in adaptive mode.
+    books: Books,
+    /// Adaptive mode: packets held as tokens until `finish` trains the
+    /// books, with the header packets to write ahead of them.
+    adaptive: Option<Adaptive>,
     /// `[short, long]` transforms and window slopes.
     transforms: [Transform; 2],
     /// Cached windows per (long, prev_long, next_long) combination — at
@@ -523,9 +667,94 @@ fn write_mapping_config(s: &mut BitWriter, ch: usize, floor: u32, residue: u32) 
     s.write(residue, 8);
 }
 
+/// Identification header packet.
+fn id_header(sample_rate: u32, channels: u16) -> Vec<u8> {
+    let mut id = BitWriter::default();
+    id.write(0, 32);
+    id.write(u32::from(channels), 8);
+    id.write(sample_rate, 32);
+    id.write(0, 32);
+    id.write(0, 32);
+    id.write(0, 32);
+    id.write(BS_SHORT_EXP | (BS_LONG_EXP << 4), 8);
+    id.write(1, 1);
+    header_packet(1, &id.finish())
+}
+
+/// Comment header packet.
+fn comment_header() -> Vec<u8> {
+    // --- Comment header ---
+    let mut cm = BitWriter::default();
+    let vendor = b"tpt-cadence";
+    cm.write(vendor.len() as u32, 32);
+    for &b in vendor {
+        cm.write(u32::from(b), 8);
+    }
+    cm.write(0, 32);
+    cm.write(1, 1);
+    header_packet(3, &cm.finish())
+}
+
+/// Setup header packet for the given books.
+fn setup_header(ch: usize, books: &Books) -> Vec<u8> {
+    // --- Setup header ---
+    let mut s = BitWriter::default();
+    s.write(4, 8); // 5 codebooks
+    write_scalar_book(&mut s, 1, &books.floor);
+    write_scalar_book(&mut s, CLASSWORDS, &books.class);
+    write_vq_book(&mut s, &books.b1);
+    write_vq_book(&mut s, &books.b2);
+    write_vq_book(&mut s, &books.b3);
+    s.write(0, 6); // one time-domain placeholder
+    s.write(0, 16);
+    // Floors: 0 = long block, 1 = short block.
+    s.write(1, 6);
+    write_floor_config(&mut s, &POSTS, 10);
+    write_floor_config(&mut s, &SHORT_POSTS, 7);
+    // Residues: 0 = long, 1 = short.
+    s.write(1, 6);
+    write_residue_config(&mut s, M);
+    write_residue_config(&mut s, SM);
+    // Mappings: 0 = long, 1 = short.
+    s.write(1, 6);
+    write_mapping_config(&mut s, ch, 0, 0);
+    write_mapping_config(&mut s, ch, 1, 1);
+    // Modes: 0 = short block (mapping 1), 1 = long block (mapping 0).
+    s.write(1, 6);
+    for (blockflag, mapping) in [(0u32, 1u32), (1, 0)] {
+        s.write(blockflag, 1);
+        s.write(0, 16);
+        s.write(0, 16);
+        s.write(mapping, 8);
+    }
+    s.write(1, 1);
+    header_packet(5, &s.finish())
+}
+
 impl<W: Write + Send> VorbisEncoder<W> {
-    /// Opens a stream. `quality` runs 0.0 (smallest) to 10.0 (best).
-    pub fn new(mut sink: W, sample_rate: u32, channels: u16, quality: f32) -> Result<Self> {
+    /// Opens a streaming stream with the fixed codebooks: packets are
+    /// written as they are produced. `quality` runs 0.0 (smallest) to 10.0
+    /// (best).
+    pub fn new(sink: W, sample_rate: u32, channels: u16, quality: f32) -> Result<Self> {
+        Self::open(sink, sample_rate, channels, quality, false)
+    }
+
+    /// Opens a stream whose Huffman codebooks are trained on the file's own
+    /// symbol statistics. The headers precede the audio and need the final
+    /// books, so every packet is held (as tokens) until [`Encoder::finish`],
+    /// which writes the whole stream: memory grows with the input, and
+    /// nothing reaches the sink before `finish`. Same audio, fewer bits.
+    pub fn new_adaptive(sink: W, sample_rate: u32, channels: u16, quality: f32) -> Result<Self> {
+        Self::open(sink, sample_rate, channels, quality, true)
+    }
+
+    fn open(
+        mut sink: W,
+        sample_rate: u32,
+        channels: u16,
+        quality: f32,
+        adaptive: bool,
+    ) -> Result<Self> {
         if !(1..=2).contains(&channels) {
             return Err(CadenceError::InvalidFormat(format!(
                 "Vorbis encoder supports 1 or 2 channels, got {channels}"
@@ -537,83 +766,27 @@ impl<W: Write + Send> VorbisEncoder<W> {
         let quality = quality.clamp(0.0, 10.0);
         let ch = usize::from(channels);
 
-        // --- Books ---
-        let floor_weights: Vec<f64> = (0..FLOOR_RANGE)
-            .map(|v| 1.0 / (1.0 + f64::from(v)).powf(1.3))
-            .collect();
-        let floor_book = EncBook::new(&floor_weights)?;
-        let class_p = [0.5, 0.25, 0.15, 0.10];
-        let class_weights: Vec<f64> = (0..CLASSES * CLASSES)
-            .map(|e| class_p[e / CLASSES] * class_p[e % CLASSES])
-            .collect();
-        let class_book = EncBook::new(&class_weights)?;
-        let b1 = VqBook::new(4, 1, 1, 0.55)?;
-        let b2 = VqBook::new(2, 5, 1, 2.2)?;
-        let b3 = VqBook::new(1, 31, 8, 4.0)?;
-
-        // --- Identification header ---
-        let mut id = BitWriter::default();
-        id.write(0, 32);
-        id.write(u32::from(channels), 8);
-        id.write(sample_rate, 32);
-        id.write(0, 32);
-        id.write(0, 32);
-        id.write(0, 32);
-        id.write(BS_SHORT_EXP | (BS_LONG_EXP << 4), 8);
-        id.write(1, 1);
-        let id_packet = header_packet(1, &id.finish());
-
-        // --- Comment header ---
-        let mut cm = BitWriter::default();
-        let vendor = b"tpt-cadence";
-        cm.write(vendor.len() as u32, 32);
-        for &b in vendor {
-            cm.write(u32::from(b), 8);
-        }
-        cm.write(0, 32);
-        cm.write(1, 1);
-        let comment_packet = header_packet(3, &cm.finish());
-
-        // --- Setup header ---
-        let mut s = BitWriter::default();
-        s.write(4, 8); // 5 codebooks
-        write_scalar_book(&mut s, 1, &floor_book);
-        write_scalar_book(&mut s, CLASSWORDS, &class_book);
-        write_vq_book(&mut s, &b1);
-        write_vq_book(&mut s, &b2);
-        write_vq_book(&mut s, &b3);
-        s.write(0, 6); // one time-domain placeholder
-        s.write(0, 16);
-        // Floors: 0 = long block, 1 = short block.
-        s.write(1, 6);
-        write_floor_config(&mut s, &POSTS, 10);
-        write_floor_config(&mut s, &SHORT_POSTS, 7);
-        // Residues: 0 = long, 1 = short.
-        s.write(1, 6);
-        write_residue_config(&mut s, M);
-        write_residue_config(&mut s, SM);
-        // Mappings: 0 = long, 1 = short.
-        s.write(1, 6);
-        write_mapping_config(&mut s, ch, 0, 0);
-        write_mapping_config(&mut s, ch, 1, 1);
-        // Modes: 0 = short block (mapping 1), 1 = long block (mapping 0).
-        s.write(1, 6);
-        for (blockflag, mapping) in [(0u32, 1u32), (1, 0)] {
-            s.write(blockflag, 1);
-            s.write(0, 16);
-            s.write(0, 16);
-            s.write(mapping, 8);
-        }
-        s.write(1, 1);
-        let setup_packet = header_packet(5, &s.finish());
+        let books = Books::static_books()?;
+        let id_packet = id_header(sample_rate, channels);
+        let comment_packet = comment_header();
+        let setup_packet = setup_header(ch, &books);
 
         let id_parsed = parse_id(&id_packet)?;
         let setup = parse_setup(&setup_packet, &id_parsed)?;
 
         let mut page_writer = OggPageWriter::new(SERIAL);
-        sink.write_all(&page_writer.write_page(&id_packet, 0, true, false))?;
-        sink.write_all(&page_writer.write_page(&comment_packet, 0, false, false))?;
-        sink.write_all(&page_writer.write_page(&setup_packet, 0, false, false))?;
+        let adaptive = if adaptive {
+            Some(Adaptive {
+                id_packet,
+                comment_packet,
+                packets: Vec::new(),
+            })
+        } else {
+            sink.write_all(&page_writer.write_page(&id_packet, 0, true, false))?;
+            sink.write_all(&page_writer.write_page(&comment_packet, 0, false, false))?;
+            sink.write_all(&page_writer.write_page(&setup_packet, 0, false, false))?;
+            None
+        };
 
         let mut transforms = [Transform::new(SN), Transform::new(N)];
         let slopes = [slope(SM), slope(M)];
@@ -628,11 +801,8 @@ impl<W: Write + Send> VorbisEncoder<W> {
             channels: ch,
             page_writer,
             setup,
-            floor_book,
-            class_book,
-            b1,
-            b2,
-            b3,
+            books,
+            adaptive,
             transforms,
             windows: [const { None }; 8],
             slopes,
@@ -767,11 +937,11 @@ impl<W: Write + Send> VorbisEncoder<W> {
     }
 
     /// Serializes floor 1 for post values `y` (audible-channel flag set).
-    fn write_floor(&self, bw: &mut BitWriter, y: &[i32], floor_idx: usize) {
+    fn write_floor(&self, bw: &mut Vec<Tok>, y: &[i32], floor_idx: usize) {
         let f1 = self.floor1(floor_idx);
-        bw.write(1, 1);
-        bw.write(y[0] as u32, FLOOR_RANGE_BITS);
-        bw.write(y[1] as u32, FLOOR_RANGE_BITS);
+        bw.push(Tok::bits(1, 1));
+        bw.push(Tok::bits(y[0] as u32, FLOOR_RANGE_BITS));
+        bw.push(Tok::bits(y[1] as u32, FLOOR_RANGE_BITS));
         for i in 2..f1.x.len() {
             let (low, high) = (f1.low[i], f1.high[i]);
             let dy = y[high] - y[low];
@@ -794,12 +964,12 @@ impl<W: Write + Send> VorbisEncoder<W> {
             } else {
                 highroom - 1 - d
             };
-            self.floor_book.put(bw, val as usize);
+            bw.push(Tok::sym(BOOK_FLOOR, val as usize));
         }
     }
 
     /// Encodes the block centered at `self.center`.
-    fn encode_block(&mut self, spec: BlockSpec) -> Vec<u8> {
+    fn encode_block(&mut self, spec: BlockSpec) -> Vec<Tok> {
         let ch = self.channels;
         let (n, m, fidx) = if spec.long { (N, M, 0) } else { (SN, SM, 1) };
         let cutoff = if spec.long {
@@ -807,12 +977,12 @@ impl<W: Write + Send> VorbisEncoder<W> {
         } else {
             (self.cutoff_bin * SM).div_ceil(M)
         };
-        let mut pkt = BitWriter::default();
-        pkt.write(0, 1); // audio packet
-        pkt.write(u32::from(spec.long), 1); // mode: 0 short, 1 long
+        let mut pkt: Vec<Tok> = Vec::new();
+        pkt.push(Tok::bits(0, 1)); // audio packet
+        pkt.push(Tok::bits(u32::from(spec.long), 1)); // mode: 0 short, 1 long
         if spec.long {
-            pkt.write(u32::from(spec.prev_long), 1);
-            pkt.write(u32::from(spec.next_long), 1);
+            pkt.push(Tok::bits(u32::from(spec.prev_long), 1));
+            pkt.push(Tok::bits(u32::from(spec.next_long), 1));
         }
 
         let wslot = Self::window_slot(spec);
@@ -840,9 +1010,9 @@ impl<W: Write + Send> VorbisEncoder<W> {
             let y = self.fit_floor(&thr, fidx);
             self.write_floor(&mut pkt, &y, fidx);
             // Decode the floor back for the exact curve.
-            let mut scratch = BitWriter::default();
+            let mut scratch = Vec::new();
             self.write_floor(&mut scratch, &y, fidx);
-            let bytes = scratch.finish();
+            let bytes = self.books.render(&scratch);
             let mut br = BitReader::new(&bytes);
             let mut curve = vec![0.0f32; m];
             self.floor1(fidx)
@@ -917,7 +1087,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
                         for i in 0..CLASSWORDS {
                             entry = entry * CLASSES + cls.get(pc + i).copied().unwrap_or(0);
                         }
-                        self.class_book.put(&mut pkt, entry);
+                        pkt.push(Tok::sym(BOOK_CLASS, entry));
                     }
                 }
                 let mut i = 0;
@@ -927,18 +1097,18 @@ impl<W: Write + Send> VorbisEncoder<W> {
                         match (cls[pc], pass) {
                             (1, 0) => {
                                 for v in part.chunks(4) {
-                                    self.b1.put(&mut pkt, v);
+                                    pkt.push(Tok::sym(BOOK_B1, self.books.b1.entry(v)));
                                 }
                             }
                             (2, 0) => {
                                 for v in part.chunks(2) {
-                                    self.b2.put(&mut pkt, v);
+                                    pkt.push(Tok::sym(BOOK_B2, self.books.b2.entry(v)));
                                 }
                             }
                             (3, 0) => {
                                 for &x in part {
                                     let c8 = (((x as f32) / 8.0).round() as i32).clamp(-31, 31);
-                                    self.b3.put(&mut pkt, &[c8]);
+                                    pkt.push(Tok::sym(BOOK_B3, self.books.b3.entry(&[c8])));
                                 }
                             }
                             (3, 1) => {
@@ -949,7 +1119,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
                                     })
                                     .collect();
                                 for v in fine.chunks(2) {
-                                    self.b2.put(&mut pkt, v);
+                                    pkt.push(Tok::sym(BOOK_B2, self.books.b2.entry(v)));
                                 }
                             }
                             _ => {}
@@ -960,10 +1130,45 @@ impl<W: Write + Send> VorbisEncoder<W> {
                 }
             }
         }
-        pkt.finish()
+        pkt
     }
 
-    fn emit(&mut self, packet: Vec<u8>, granule: i64) -> Result<()> {
+    /// Trains the books on the held packets, then writes headers and audio.
+    /// The last packet stays in `pending` so `finish` can flag end-of-stream.
+    fn write_adaptive(&mut self, a: Adaptive) -> Result<()> {
+        let mut counts: [Vec<u64>; NBOOKS] = self.books.entry_counts().map(|n| vec![0u64; n]);
+        for t in a.packets.iter().flat_map(|(toks, _)| toks) {
+            if t.book != T_RAW {
+                counts[usize::from(t.book)][t.v as usize] += 1;
+            }
+        }
+        let books = Books::trained(&counts)?;
+        let setup_packet = setup_header(self.channels, &books);
+        // Same check the streaming path gets: the header must parse back.
+        parse_setup(&setup_packet, &parse_id(&a.id_packet)?)?;
+        let w = &mut self.page_writer;
+        self.sink
+            .write_all(&w.write_page(&a.id_packet, 0, true, false))?;
+        self.sink
+            .write_all(&w.write_page(&a.comment_packet, 0, false, false))?;
+        self.sink
+            .write_all(&w.write_page(&setup_packet, 0, false, false))?;
+        for (toks, granule) in a.packets {
+            self.emit_bytes(books.render(&toks), granule)?;
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, toks: Vec<Tok>, granule: i64) -> Result<()> {
+        if let Some(a) = &mut self.adaptive {
+            a.packets.push((toks, granule));
+            return Ok(());
+        }
+        let packet = self.books.render(&toks);
+        self.emit_bytes(packet, granule)
+    }
+
+    fn emit_bytes(&mut self, packet: Vec<u8>, granule: i64) -> Result<()> {
         if let Some((p, g)) = self.pending.replace((packet, granule)) {
             self.sink
                 .write_all(&self.page_writer.write_page(&p, g, false, false))?;
@@ -1048,6 +1253,9 @@ impl<W: Write + Send> Encoder for VorbisEncoder<W> {
                 b.resize(b.len() + M, 0.0);
             }
             self.drain()?;
+        }
+        if let Some(a) = self.adaptive.take() {
+            self.write_adaptive(a)?;
         }
         if let Some((p, g)) = self.pending.take() {
             self.sink

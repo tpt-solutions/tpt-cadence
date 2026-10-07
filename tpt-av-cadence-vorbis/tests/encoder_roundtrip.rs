@@ -260,3 +260,49 @@ fn block_switching_stream_agrees_with_ffmpeg() {
     eprintln!("block-switching inter-decoder {snr:.1} dB, {shorts} short blocks");
     assert!(snr > 90.0, "inter-decoder SNR {snr}");
 }
+
+fn encode_adaptive(input: &[f32], channels: u16, rate: u32, q: f32) -> Vec<u8> {
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut enc = VorbisEncoder::new_adaptive(&mut buf, rate, channels, q).unwrap();
+        for chunk in input.chunks(1000 * channels as usize) {
+            enc.encode(chunk).unwrap();
+        }
+        enc.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// Per-file books only change the entropy coding: the decoded audio must be
+/// sample-identical to the static-book stream, and the file smaller.
+#[test]
+fn adaptive_books_decode_identically_and_shrink_the_stream() {
+    for channels in [1usize, 2] {
+        for q in [2.0f32, 6.0, 10.0] {
+            let input = signal(3 * 44100, channels, 44100.0);
+            let fixed = encode(&input, channels as u16, 44100, q);
+            let adaptive = encode_adaptive(&input, channels as u16, 44100, q);
+            eprintln!(
+                "ch={channels} q={q}: static {} B, adaptive {} B ({:.1}%)",
+                fixed.len(),
+                adaptive.len(),
+                100.0 * adaptive.len() as f64 / fixed.len() as f64
+            );
+            assert_eq!(
+                decode(fixed.clone(), channels),
+                decode(adaptive.clone(), channels),
+                "decoded audio differs"
+            );
+            assert!(adaptive.len() < fixed.len(), "adaptive did not shrink");
+        }
+    }
+}
+
+#[test]
+fn adaptive_empty_and_tiny_streams_decode() {
+    for frames in [0usize, 1, 100] {
+        let input = signal(frames, 1, 44100.0);
+        let data = encode_adaptive(&input, 1, 44100, 5.0);
+        assert_eq!(decode(data, 1).len(), frames);
+    }
+}

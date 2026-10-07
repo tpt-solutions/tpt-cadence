@@ -1,6 +1,7 @@
 //! Writes a two-second stereo test signal (a 440 Hz / 660 Hz chord with a
 //! slow tremolo) to an Ogg Vorbis file at the given quality (0-10, default 5):
-//! `cargo run -p tpt-av-cadence-vorbis --example vorbis_encode -- tone.ogg [quality]`
+//! `cargo run -p tpt-av-cadence-vorbis --example vorbis_encode -- tone.ogg [quality] [adaptive]`
+//! (`adaptive` trains per-file Huffman books; output appears only at finish).
 
 use std::f32::consts::PI;
 use std::fs::File;
@@ -21,9 +22,15 @@ fn main() {
         .map(|q| q.parse().expect("quality must be a number"))
         .unwrap_or(5.0);
 
+    let adaptive = args.next().as_deref() == Some("adaptive");
+
     let file = File::create(&path).expect("create output");
-    let mut encoder =
-        VorbisEncoder::new(file, SAMPLE_RATE, CHANNELS, quality).expect("open vorbis encoder");
+    let mut encoder = if adaptive {
+        VorbisEncoder::new_adaptive(file, SAMPLE_RATE, CHANNELS, quality)
+    } else {
+        VorbisEncoder::new(file, SAMPLE_RATE, CHANNELS, quality)
+    }
+    .expect("open vorbis encoder");
 
     let frames = SAMPLE_RATE as usize * 2;
     let mut buf = vec![0.0f32; frames * CHANNELS as usize];
