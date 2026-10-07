@@ -804,7 +804,7 @@ impl<W: Write + Send> VorbisEncoder<W> {
             books,
             adaptive,
             transforms,
-            windows: [const { None }; 8],
+            windows: std::array::from_fn(|_| None),
             slopes,
             psy,
             floor_gain: 10f64.powf(gain_db / 20.0) as f32,

@@ -123,11 +123,13 @@ jobs:
       - name: Optimize wasm size (wasm-opt -Oz)
         working-directory: tpt-av-cadence-wasm-demo/pkg
         run: |
-          before=$(stat -c%s *.wasm)
+          # wasm-bindgen --target nodejs emits <name>_bg.wasm
+          wasm=tpt_av_cadence_wasm_demo_bg.wasm
+          before=$(stat -c%s "$wasm")
           echo "wasm-bindgen output: $before bytes"
-          wasm-opt -Oz -o tpt_av_cadence_wasm_demo.opt.wasm tpt_av_cadence_wasm_demo.wasm
-          mv tpt_av_cadence_wasm_demo.opt.wasm tpt_av_cadence_wasm_demo.wasm
-          after=$(stat -c%s *.wasm)
+          wasm-opt -Oz -o "$wasm.opt" "$wasm"
+          mv "$wasm.opt" "$wasm"
+          after=$(stat -c%s "$wasm")
           echo "wasm-opt -Oz output:  $after bytes"
           echo "wasm size: $before -> $after bytes ($(( 100 - after * 100 / before ))% smaller)"
 

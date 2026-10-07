@@ -583,7 +583,6 @@ impl Decoder for VorbisDecoder {
         }
         let mut candidate: Option<Candidate> = None;
         {
-            use crate::bitreader::BitReader;
             let source = self.ogg.source_mut();
             source.seek_to(0)?;
             let mut pos = 0u64;

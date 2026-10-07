@@ -4053,3 +4053,10 @@ this way.
 - **Deviation:** the reference's stereo-correlation term in `alloc_trim` is omitted — A/B showed -1.5..-3 dB on dual-mono-like stereo without the reference's matching stereo-saving machinery.
 - **Measured** (`psychoacoustic_ab_report`, SNR adaptive vs fixed, mono/stereo, 64–128 kbps): harmonic stack up to +1.4 dB, sine up to +0.7 dB, clicks/noise neutral (±0.05 dB); gated at no worse than -0.5 dB.
 - **Open observation:** a 440 Hz sine with 1% vibrato (rapid chirp) caps at ~12.5 dB SNR independent of bitrate (80–320 B/frame) — worth investigating as a possible further CELT encoder/decoder issue. Still not done: pitch pre-filter/postfilter, tf_estimate from the transient analysis.
+
+### Decision (2026-10-07): MP3 work frozen
+
+User decision: MP3 patent status is in doubt, so no further MP3 work will be
+planned or started (same treatment as the AAC encoder). Existing MP3 code stays
+as-is; the MP3 outer-loop/psychoacoustic listening validation item is dropped.
+Revisit only if the user reopens it.
