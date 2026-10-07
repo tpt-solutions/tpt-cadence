@@ -25,6 +25,7 @@
 //!
 //! Future: SILK layer, hybrid integration, conformance vs official vectors.
 
+pub mod analysis;
 pub mod bands;
 pub mod celt_lpc;
 pub mod cwrs;

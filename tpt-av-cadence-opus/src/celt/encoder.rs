@@ -109,6 +109,7 @@
 //! the constants (tracking coefficient, slope, clamps) are documented
 //! heuristics, not libopus's analysis stack (no tonality/speech model).
 
+use super::analysis;
 use super::bands::{quant_all_bands_encode, TF_SELECT_TABLE};
 use super::decoder::{OVERLAP, SPREAD_ICDF_TBL, TRIM_ICDF};
 use super::fft::Cpx;
@@ -259,7 +260,23 @@ pub struct CeltEncoder {
     /// [`CeltEncoder::encode_frame`] call (1/8-bit units per band), exposed
     /// for tests via [`CeltEncoder::last_offsets`].
     last_offsets: [i32; NB_EBANDS],
+    /// Whether the content-adaptive analysis (per-band TF search, spread
+    /// decision, allocation trim) is active; `false` pins the original
+    /// fixed choices (no TF change, normal spread, trim 5).
+    psycho: u8,
+    /// Running spread-decision average and last decision (hysteresis state).
+    spread_average: i32,
+    last_spread: i32,
+    /// Result of the most recent analysis, exposed for tests.
+    last_alloc_trim: i32,
+    last_spread_decision: i32,
+    last_tf_changed: bool,
 }
+
+const PSYCHO_TF: u8 = 1;
+const PSYCHO_SPREAD: u8 = 2;
+const PSYCHO_TRIM: u8 = 4;
+const PSYCHO_ALL: u8 = 7;
 
 /// VBR loudness-reference tracking coefficient: the EMA weight of the
 /// current frame's loudness in the running reference (per 20 ms frame — a
@@ -302,7 +319,29 @@ impl CeltEncoder {
             last_intensity: NB_EBANDS,
             vbr_ref: None,
             last_offsets: [0; NB_EBANDS],
+            psycho: PSYCHO_ALL,
+            spread_average: 0,
+            last_spread: SPREAD_NORMAL,
+            last_alloc_trim: 5,
+            last_spread_decision: SPREAD_NORMAL,
+            last_tf_changed: false,
         }
+    }
+
+    /// Enables or disables the content-adaptive psychoacoustic analysis
+    /// (per-band TF resolution search, spread decision, allocation trim).
+    /// Enabled by default; disabling restores the fixed bitstream choices.
+    pub fn set_psychoacoustic(&mut self, enabled: bool) {
+        self.psycho = if enabled { PSYCHO_ALL } else { 0 };
+    }
+
+    /// `(alloc_trim, spread_decision, any_tf_change)` of the last frame.
+    pub fn last_analysis(&self) -> (i32, i32, bool) {
+        (
+            self.last_alloc_trim,
+            self.last_spread_decision,
+            self.last_tf_changed,
+        )
     }
 
     /// Whether the most recent [`CeltEncoder::encode_frame`] call signaled
@@ -979,34 +1018,77 @@ impl CeltEncoder {
         if tf_select_rsv {
             budget -= 1;
         }
-        for _ in p.start..p.end {
+        // Per-band TF search (libopus `tf_analysis`) for pure-CELT frames
+        // with enough budget; otherwise every band keeps the default
+        // resolution and only the table-selecting bit is chosen.
+        let effective_bytes = total_bits_bytes / 8;
+        let mut raw_tf = [0i32; NB_EBANDS];
+        let mut tf_select_want = usize::from(is_transient);
+        if self.psycho & PSYCHO_TF != 0 && p.start == 0 && effective_bytes >= 15 * channels as i32 {
+            let lambda = 80.max(20480 / effective_bytes + 2);
+            let tf_estimate = if is_transient { 0.5 } else { 0.0 };
+            tf_select_want = analysis::tf_analysis(
+                p.start,
+                p.end,
+                is_transient,
+                &mut raw_tf,
+                lambda,
+                &x_spec[..channels * n2],
+                channels,
+                n2,
+                lm,
+                tf_estimate,
+            );
+        }
+        let tf_base = if is_transient { 4usize } else { 0usize };
+        let mut curr = 0i32;
+        let mut tf_changed = false;
+        for raw in raw_tf[p.start..p.end].iter_mut() {
             if tell + logp <= budget {
-                enc.encode_bit_logp(false, logp as u32);
+                enc.encode_bit_logp((*raw ^ curr) != 0, logp as u32);
                 tell = enc.tell() as i32;
+                curr = *raw;
+                tf_changed |= curr != 0;
+            } else {
+                *raw = curr;
             }
             logp = if is_transient { 4 } else { 5 };
         }
-        // tf_select bit: only needed when TF_SELECT_TABLE[LM][base] !=
-        // TF_SELECT_TABLE[LM][base+2] (the decoder's guard, evaluated with
-        // `tf_changed == false` since every per-band bit above was false;
-        // `base = 4*is_transient`). When needed, this encoder always picks
-        // `tf_select = 1` while transient (the smaller-recombine option
-        // for LM == 3 — see the module doc comment) and `0` otherwise
-        // (matching the decoder's own default, so there's nothing useful
-        // to gain from signalling `1` there).
-        let tf_base = if is_transient { 4usize } else { 0usize };
-        let tf_select_needed =
-            tf_select_rsv && TF_SELECT_TABLE[lm][tf_base] != TF_SELECT_TABLE[lm][tf_base + 2];
+        // tf_select bit: only needed when the table's two columns differ
+        // for the decoder's `tf_changed` state (its own guard).
+        let tf_select_needed = tf_select_rsv
+            && TF_SELECT_TABLE[lm][tf_base + usize::from(tf_changed)]
+                != TF_SELECT_TABLE[lm][tf_base + 2 + usize::from(tf_changed)];
         let tf_select = if tf_select_needed {
-            enc.encode_bit_logp(is_transient, 1);
-            usize::from(is_transient)
+            enc.encode_bit_logp(tf_select_want == 1, 1);
+            tf_select_want
         } else {
             0usize
         };
-        let tf_res_val = TF_SELECT_TABLE[lm][tf_base + 2 * tf_select] as i32;
-        let tf_res = [tf_res_val; NB_EBANDS];
+        let mut tf_res = [0i32; NB_EBANDS];
+        for i in p.start..p.end {
+            tf_res[i] = TF_SELECT_TABLE[lm][tf_base + 2 * tf_select + raw_tf[i] as usize] as i32;
+        }
+        self.last_tf_changed = tf_changed;
 
-        let spread_decision = SPREAD_NORMAL;
+        let spread_decision = if self.psycho & PSYCHO_SPREAD != 0
+            && p.start == 0
+            && !is_transient
+            && effective_bytes >= 10 * channels as i32
+        {
+            analysis::spread_decision(
+                &x_spec[..channels * n2],
+                channels,
+                n2,
+                p.end,
+                lm,
+                &mut self.spread_average,
+                &mut self.last_spread,
+            )
+        } else {
+            SPREAD_NORMAL
+        };
+        self.last_spread_decision = spread_decision;
         let tell = enc.tell() as i32;
         if tell + 4 <= total_bits_bytes {
             enc.encode_icdf(spread_decision as u32, &SPREAD_ICDF_TBL, 5);
@@ -1117,7 +1199,13 @@ impl CeltEncoder {
         }
         self.last_offsets = offsets;
 
-        let alloc_trim = 5i32;
+        let alloc_trim = if self.psycho & PSYCHO_TRIM != 0 && p.start == 0 {
+            let equiv_rate = (frame_bytes as i64 * 8 * 48_000 / n2 as i64) as i32;
+            analysis::alloc_trim(&means, p.end, channels, equiv_rate)
+        } else {
+            5i32
+        };
+        self.last_alloc_trim = alloc_trim;
         if tell + (6 << 3) <= total_bits_q {
             enc.encode_icdf(alloc_trim as u32, &TRIM_ICDF, 7);
         }
@@ -2368,6 +2456,145 @@ mod tests {
             let mut pcm_out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
             decode_celt_only_packet(&mut dec, &parsed, &packet, &mut pcm_out)
                 .expect("unboosted packet must decode without error");
+        }
+    }
+
+    /// Synthetic test signal for the psychoacoustic A/B comparison.
+    fn psycho_signal(kind: usize, total: usize, ch: usize) -> Vec<f32> {
+        let mut state = 12345u32;
+        let mut out = Vec::with_capacity(total * ch);
+        for n in 0..total {
+            let t = n as f32 / 48_000.0;
+            let mut v = match kind {
+                // Tonal, speech-like harmonic stack with vibrato.
+                0 => {
+                    (1..=12)
+                        .map(|h| {
+                            let f = 180.0 * h as f32 * (1.0 + 0.01 * (6.0 * t).sin());
+                            (2.0 * std::f32::consts::PI * f * t).sin() / h as f32
+                        })
+                        .sum::<f32>()
+                        * 0.2
+                }
+                // Harmonic bed with sharp periodic clicks (transients).
+                1 => {
+                    let tone = (2.0 * std::f32::consts::PI * 330.0 * t).sin() * 0.15;
+                    let click = if n % 7000 < 200 {
+                        (((n % 7000) as f32) * 0.9).sin() * 0.7 * (1.0 - (n % 7000) as f32 / 200.0)
+                    } else {
+                        0.0
+                    };
+                    tone + click
+                }
+                4 => {
+                    (1..=12)
+                        .map(|h| {
+                            (2.0 * std::f32::consts::PI * 180.0 * h as f32 * t).sin() / h as f32
+                        })
+                        .sum::<f32>()
+                        * 0.2
+                }
+                5 => {
+                    (2.0 * std::f32::consts::PI * 440.0 * t * (1.0 + 0.01 * (6.0 * t).sin())).sin()
+                        * 0.5
+                }
+                3 => (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5,
+                // Noise-like.
+                _ => {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.4
+                }
+            };
+            v *= 1.0;
+            for c in 0..ch {
+                out.push(if c == 0 { v } else { v * 0.8 });
+            }
+        }
+        out
+    }
+
+    /// Best-delay SNR (dB) of `decoded` against `original` for channel 0.
+    fn psycho_snr(original: &[f32], decoded: &[f32], skip: usize) -> f64 {
+        let sig: f64 = original[skip..].iter().map(|&v| (v as f64).powi(2)).sum();
+        (0..400i32)
+            .map(|delay| {
+                let err: f64 = original[skip..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &a)| {
+                        let di = (skip + i) as i32 - delay;
+                        let b = if di >= 0 && (di as usize) < decoded.len() {
+                            decoded[di as usize]
+                        } else {
+                            0.0
+                        };
+                        (a as f64 - b as f64).powi(2)
+                    })
+                    .sum();
+                10.0 * (sig / err.max(1e-12)).log10()
+            })
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    fn psycho_run(psycho: u8, kind: usize, ch: usize, bytes: usize) -> (f64, (i32, i32, bool)) {
+        let frames = 40;
+        let pcm = psycho_signal(kind, frames * N2, ch);
+        let mut enc = CeltEncoder::new(ch, LM);
+        enc.psycho = psycho;
+        let mut dec = CeltDecoder::new(2, 48_000).unwrap();
+        let mut decoded = Vec::new();
+        let mut original = Vec::new();
+        let mut last = (0, 0, false);
+        let mut any_tf = false;
+        for f in 0..frames {
+            let chunk = &pcm[f * N2 * ch..(f + 1) * N2 * ch];
+            original.extend(chunk.chunks(ch).map(|c| c[0]));
+            let bytes_out = enc.encode_frame(chunk, bytes);
+            let packet = parse_packet(&bytes_out).unwrap();
+            let mut out = vec![0.0f32; N2 * OUTPUT_CHANNELS];
+            decode_celt_only_packet(&mut dec, &packet, &bytes_out, &mut out).unwrap();
+            decoded.extend(out.chunks(OUTPUT_CHANNELS).map(|c| c[0]));
+            let a = enc.last_analysis();
+            any_tf |= a.2;
+            last = (a.0, a.1, any_tf);
+        }
+        (psycho_snr(&original, &decoded, 4 * N2), last)
+    }
+
+    /// A/B report: adaptive analysis vs the original fixed choices.
+    #[test]
+    fn psychoacoustic_ab_report() {
+        for ch in [1usize, 2] {
+            for (kind, name) in [
+                (0, "harmonic"),
+                (1, "clicks"),
+                (2, "noise"),
+                (3, "sine"),
+                (4, "stack"),
+                (5, "vibsine"),
+            ] {
+                for bytes in [80usize, 160] {
+                    let (base, _) = psycho_run(0, kind, ch, bytes * ch);
+                    let (adapt, info) = psycho_run(PSYCHO_ALL, kind, ch, bytes * ch);
+                    let tf = psycho_run(PSYCHO_TF, kind, ch, bytes * ch).0 - base;
+                    let sp = psycho_run(PSYCHO_SPREAD, kind, ch, bytes * ch).0 - base;
+                    let tr = psycho_run(PSYCHO_TRIM, kind, ch, bytes * ch).0 - base;
+                    assert!(
+                        adapt - base > -0.5,
+                        "ch={ch} {name} bytes={}: adaptive analysis regressed {:.2} dB",
+                        bytes * ch,
+                        adapt - base
+                    );
+                    if name == "stack" && ch == 1 {
+                        assert!(adapt - base > 0.5, "stack should gain from alloc trim");
+                    }
+                    eprintln!(
+                        "ch={ch} {name:9} bytes={:3}: fixed {base:6.2} dB  adaptive {adapt:6.2} dB  ({:+.2}; tf {tf:+.2} spread {sp:+.2} trim {tr:+.2})  trim/spread/tf={info:?}",
+                        bytes * ch,
+                        adapt - base
+                    );
+                }
+            }
         }
     }
 }

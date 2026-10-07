@@ -4045,3 +4045,11 @@ for a masking-driven coder. The only lever is the quality ladder
 (`FLOOR_GAIN_DB_PER_Q`/range), a product decision that needs listening tests.
 No code change. The "quality ceiling" caveat in the 09-30 log should be read
 this way.
+
+### Session log (2026-10-07): CELT psychoacoustic analysis + encoder TF-input bug fix
+
+- **Bug fixed:** `quant_band_encode` (bands.rs) never applied the TF transforms to its *input* spectrum (Haar recombine, time-divide Haar, Hadamard deinterleave) — it only undid them on the reconstruction, unlike the reference's `if (encode)` paths. Short-block (transient) frames and any non-zero `tf_change` were quantized in the wrong domain. Fixing it alone lifted the fixed-policy A/B baseline (harmonic stack 8.0→9.8 dB, clicks 3.1→4.9 dB at 64 kbps mono).
+- **New `celt/analysis.rs`:** `tf_analysis` (per-band Viterbi TF search + `tf_select`), `spread_decision` (sparsity-driven with hysteresis state on the encoder), `alloc_trim` (bitrate + spectral tilt). Enabled by default for pure-CELT frames (`CeltEncoder::set_psychoacoustic(false)` restores fixed choices; hybrid keeps fixed choices).
+- **Deviation:** the reference's stereo-correlation term in `alloc_trim` is omitted — A/B showed -1.5..-3 dB on dual-mono-like stereo without the reference's matching stereo-saving machinery.
+- **Measured** (`psychoacoustic_ab_report`, SNR adaptive vs fixed, mono/stereo, 64–128 kbps): harmonic stack up to +1.4 dB, sine up to +0.7 dB, clicks/noise neutral (±0.05 dB); gated at no worse than -0.5 dB.
+- **Open observation:** a 440 Hz sine with 1% vibrato (rapid chirp) caps at ~12.5 dB SNR independent of bitrate (80–320 B/frame) — worth investigating as a possible further CELT encoder/decoder issue. Still not done: pitch pre-filter/postfilter, tf_estimate from the transient analysis.

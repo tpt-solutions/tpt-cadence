@@ -43,19 +43,28 @@ A SILK encoder (`SilkEncoder`) and hybrid SILK+CELT packets are also
 implemented: mono or adaptive mid/side stereo SILK at 8/12/16 kHz internal
 rate in 10/20/40/60 ms packets, VBR payloads plus constant-size CBR
 (`new_silk_cbr`), SILK-only and hybrid Ogg Opus streams, and stereo hybrid
-(split per-channel rate targets). Its analysis includes the reference's
-noise-shaping *analysis* — per-subframe gains from a frequency-warped
-autocorrelation, smoothed spectral tilt, harmonic shaping gain and the
-rate/distortion factor — which is worth roughly +1 dB SNR over the
-frame-level gain proxy it replaced; the shaping filter itself is not yet
-closed into the quantizer's error-feedback loop (see
-[`todo.md`](https://github.com/tpt-solutions/tpt-cadence/blob/master/todo.md) for the measurements). The encoder's simulated
-reconstruction is bit-identical to the real decoder's output, which the
-test suite pins for every rate and packet-size combination.
+(split per-channel rate targets). The SILK path follows the reference
+closely: the 4-band VAD, Burg LPC, noise-shaping analysis (warped
+autocorrelation, spectral tilt, harmonic shaping gain), the reference
+noise-shaping quantizer with error feedback, the per-frame rate-control
+loop that lands payloads on the requested budget, and the delayed-decision
+quantizer behind `set_complexity`. Packet-loss tooling is included: DTX
+(`new_silk_dtx`, 1-byte TOC-only packets decoded as comfort noise) and
+LBRR/FEC (`set_packet_loss_perc`). The encoder's simulated reconstruction is
+bit-identical to the real decoder's output, which the test suite pins for
+every rate and packet-size combination.
 
-Remaining: the per-frame rate-control ramp, the SILK shaping feedback loop
-and LBRR/FEC/DTX, psychoacoustic-model tuning, and the other format
-encoders — tracked in [`todo.md`](https://github.com/tpt-solutions/tpt-cadence/blob/master/todo.md) at the repository root.
+The CELT encoder chooses its per-band TF resolution, PVQ spread and allocation
+trim from the signal (ports of the reference analysis; `set_psychoacoustic(false)`
+restores the fixed choices). Remaining: pitch pre-filter, masking-based
+quality metrics, and the other format encoders — tracked in
+[`todo.md`](https://github.com/tpt-solutions/tpt-cadence/blob/master/todo.md) at the repository root.
+
+## Examples
+
+`examples/opus_encode.rs` writes a test tone as Ogg Opus (`celt`, `vbr`, `silk` or
+`hybrid` mode) and `examples/opus_decode.rs` decodes an Ogg Opus file; run with
+`cargo run -p tpt-av-cadence-opus --example <name>`.
 
 ## License
 

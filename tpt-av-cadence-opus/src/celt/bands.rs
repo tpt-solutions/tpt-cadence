@@ -1293,6 +1293,7 @@ fn quant_band_encode<'a>(
     let _ = lowband_scratch;
 
     for k in 0..recombine {
+        haar1(x, n0 >> k, 1 << k);
         if let Some(lb) = lowband.as_deref_mut() {
             haar1(lb, n >> k, 1 << k);
         }
@@ -1302,6 +1303,7 @@ fn quant_band_encode<'a>(
     n_b <<= recombine;
 
     while (n_b & 1) == 0 && tf_change < 0 {
+        haar1(x, n_b, b_blocks);
         if let Some(lb) = lowband.as_deref_mut() {
             haar1(lb, n_b, b_blocks);
         }
@@ -1315,6 +1317,7 @@ fn quant_band_encode<'a>(
     let n_b0 = n_b;
 
     if b0 > 1 {
+        deinterleave_hadamard(x, n_b >> recombine, b0 << recombine, long_blocks, htmp);
         if let Some(lb) = lowband.as_deref_mut() {
             deinterleave_hadamard(lb, n_b >> recombine, b0 << recombine, long_blocks, htmp);
         }
