@@ -15,6 +15,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `lsf_transient_short_blocks_agree_with_ffmpeg` (22.05/24/16/11.025 kHz,
   mono and stereo, 110-123 dB inter-decoder SNR).
 
+### Changed
+
+- Performance pass (2026-10-06, documentation of landed work only): the analysis
+  filterbank uses a precomputed cosine matrix and ring masks. VBR psychoacoustic
+  thresholds are computed per frame. The quantizer has a fast path that hoists
+  `|x|^0.75` across the gain search and uses an `ix^(4/3)` table. A differential
+  test pins the fast path against the reference quantizer.
+
 ### Fixed
 
 - **Repeated-transient LSF (MPEG-2/2.5) short-block divergence.** On
