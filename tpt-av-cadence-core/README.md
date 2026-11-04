@@ -16,7 +16,11 @@ decoder implements:
   for real-time PCM extraction.
 - **`StreamInfo`**, `Format`, `SampleFormat`, `ChannelLayout` — shared metadata
   and format enums.
-- **`CadenceError`** — the unified error type returned by every decoder.
+- **`Encoder`** — the matching write-side trait (`encode()` takes interleaved
+  `f32` samples, `finish()` flushes and patches container headers). Every
+  format writer in the suite implements it.
+- **`CadenceError`** — the unified error type returned by every decoder and
+  encoder.
 
 ## Usage
 
