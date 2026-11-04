@@ -25,10 +25,14 @@ own dependency resolution.
 |---|---|
 | `opus_packet` | Opus packet framing (`parse_packet`) |
 | `opus_decode` | full `OpusDecoder::decode_packet` (SILK/CELT/hybrid) |
+| `opus_ogg_decode` | Ogg Opus reader (`OggOpusReader`) end to end |
 | `vorbis_stream` | Ogg Vorbis container + decode |
 | `ogg_pages` | the shared Ogg page/packet layer |
-| `mp3_stream` | MP3 probe + decode |
-| `flac_stream` | FLAC frame decode |
-| `aiff_stream` | AIFF chunk parser + decode |
-| `wav_stream` | RIFF/WAVE parser + decode |
+| `mp3_decode` | MP3 probe + decode |
+| `flac_decode` | FLAC frame decode |
+| `aiff_decode` | AIFF chunk parser + decode |
+| `wav_decode` | RIFF/WAVE parser + decode |
 | `aac_adts` | AAC-LC ADTS probe + decode |
+
+The target names are the `[[bin]]` names in `fuzz/Cargo.toml`, so
+`cargo fuzz run <name>` takes exactly these.
