@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `VorbisEncoder` (`encode`/`finish`, implements the core `Encoder` trait): Ogg
+  Vorbis I writer for 1 or 2 channels at quality 0..=10. It uses floor 1 and
+  coupled residue type 1, with square-polar stereo coupling. The headers are
+  round-tripped through `parse_setup` at construction, and the exact input length
+  is recovered by granule trimming. FFmpeg cross-check: 136 dB inter-decoder
+  agreement, mono and stereo, 44.1 and 48 kHz.
+- Block switching (2048/256-sample blocks, a second mode/mapping/floor/residue
+  set, a transient detector, and a pre-echo test).
+- Psychoacoustic masking model (Bark bands, Schroeder spreading, tonality-dependent
+  offsets, absolute threshold of hearing) driving the floor. The model is standard
+  but unvalidated by listening tests, so perceptual quality is unconfirmed.
+- `VorbisEncoder::new_adaptive`: per-file adaptive Huffman codebooks. This
+  buffers the whole stream, so nothing is written before `finish()`. The streaming
+  `VorbisEncoder::new` keeps the static books.
+- Examples: `vorbis_encode`, `vorbis_decode`. Criterion bench: `encode`.
 - Ogg Vorbis I decoder (implemented across prior sessions on the shared
   `tpt-av-cadence-ogg` page layer; this session brought it to conformance):
   codebook decode with canonical Huffman trees, floor 0/1 curves, residue
@@ -26,6 +41,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Removed the private `ogg` module (page/packet layer): it now lives in
   the shared `tpt-av-cadence-ogg` crate, where Opus (RFC 7845) reuses it.
   Behavior is unchanged.
+
+### Changed
+
+- Performance pass (2026-10-06): `read_scalar` uses a 9-bit prefix table with
+  bit-identical error behavior. `floor0` reuses scratch with precomputed bark
+  cosines. The seek scan and Ogg segment queue no longer allocate per segment.
+  The encoder caches its 8 window shapes and reuses FFT scratch.
 
 ### Fixed
 

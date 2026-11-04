@@ -10,7 +10,15 @@ shared `tpt-av-cadence-ogg` page/packet layer.
   FFT-based synthesis MDCT, FFmpeg-compatible overlap-add, block-size
   switching, granule end-trimming, decode-and-discard seek
 - Core `Decoder`/`FormatReader` impls (`VorbisDecoder`/`VorbisFormatReader`)
-- `VorbisEncoder` (floor 1, coupled residue type 1, quality 0..=10; FFmpeg-verified). Block switching and a psychoacoustic model are future work.
+- `VorbisEncoder` (floor 1, coupled residue type 1, quality 0..=10; FFmpeg-verified):
+  - Block switching (2048/256) and a Bark-band masking model driving the floor
+  - Per-file adaptive Huffman books via `VorbisEncoder::new_adaptive` (whole-stream
+    buffering; nothing is written before `finish`). The streaming `VorbisEncoder::new`
+    keeps the static books.
+
+The masking constants have not been validated by listening tests, so perceptual
+quality is unconfirmed; SNR is not the right yardstick for a masking-driven coder.
+See `todo.md` in the repository root.
 
 Conformance (`tests/conformance.rs`): six bundled libvorbis fixtures
 (mono/stereo, 32/44.1/48 kHz, quality −1…4, heavy block switching) decode
