@@ -12,11 +12,16 @@ so the caller supplies the format up front.
 
 ```rust
 use std::fs::File;
-use tpt_av_cadence_core::Decoder;
-use tpt_av_cadence_pcm::{PcmFormat, PcmReader};
+use tpt_av_cadence_core::{Decoder, SampleFormat};
+use tpt_av_cadence_pcm::{ByteOrder, PcmFormat, PcmReader};
 
 let file = File::open("raw.pcm")?;
-let format = PcmFormat::signed_16le(44_100, 2); // sample rate, channels
+let format = PcmFormat {
+    sample_format: SampleFormat::Int16,
+    byte_order: ByteOrder::Little,
+    channels: 2,
+    sample_rate: 44_100,
+};
 let mut reader = PcmReader::open_with_format(Box::new(file), format)?;
 
 let info = reader.info();
@@ -30,8 +35,31 @@ loop {
 }
 ```
 
-(Exact `PcmFormat` constructors depend on the version in this crate — see
-`src/lib.rs` for the full set of supported sample layouts.)
+`PcmFormat` has public fields (`sample_format`, `byte_order`, `channels`,
+`sample_rate`). The `decode` example in `examples/pcm_decode.rs` maps
+command-line names such as `s16le` or `f32be` onto them.
+
+## Encoding
+
+`PcmEncoder` writes the same headerless layout. Sample conversion follows the
+`PcmFormat` you supply. Runnable example:
+`cargo run -p tpt-av-cadence-pcm --example pcm_encode -- tone.raw`.
+
+```rust
+use std::fs::File;
+use tpt_av_cadence_core::{Encoder, SampleFormat};
+use tpt_av_cadence_pcm::{ByteOrder, PcmEncoder, PcmFormat};
+
+let format = PcmFormat {
+    sample_format: SampleFormat::Int16,
+    byte_order: ByteOrder::Little,
+    channels: 2,
+    sample_rate: 44_100,
+};
+let mut enc = PcmEncoder::new(File::create("out.raw")?, format)?;
+enc.encode(&interleaved_f32)?;
+enc.finish()?;
+```
 
 ## License
 
