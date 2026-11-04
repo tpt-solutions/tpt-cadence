@@ -293,9 +293,14 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
 
+      # Pin the target explicitly. The prebuilt cargo-fuzz binary from
+      # taiki-e/install-action is a musl build and defaults --target to
+      # x86_64-unknown-linux-musl, which needs the musl std target and
+      # conflicts with the ASan build (sanitizers reject crt-static). The
+      # runner is glibc, so build for the gnu host triple.
       - name: Fuzz ${{ matrix.target }} (5 min)
         working-directory: fuzz
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=300
 
       - name: Upload crash artifacts
         if: failure()
