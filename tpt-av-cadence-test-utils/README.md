@@ -16,6 +16,16 @@ It anchors conformance testing across the other crates:
 - WAV is cross-checked against FFmpeg via `assert_bit_exact_vs_ffmpeg`; tests
   skip gracefully when FFmpeg is not installed locally.
 
+Modules:
+
+- `reference`: FFmpeg availability checks, `decode_with_ffmpeg`, and
+  `assert_bit_exact_vs_ffmpeg`.
+- `md5`: MD5 used to check FLAC output against the IETF testbench digests.
+- `quality`: perceptual and segmental metrics. `a_weighted_snr_db` weights the
+  error spectrum with IEC 61672 A-weighting. `segmental_snr_db` is the ITU-T
+  P.561 segmental SNR. The SILK encoder's perceptual regression gate uses both.
+- `fuzz`: input mutation helpers shared by the robustness tests.
+
 ## License
 
 Dual-licensed under either of
