@@ -28,6 +28,21 @@ loop {
 }
 ```
 
+## Encoding
+
+```rust
+use std::fs::File;
+use tpt_av_cadence_core::{Encoder, SampleFormat};
+use tpt_av_cadence_wav::WavEncoder;
+
+// 44.1 kHz, stereo, 16-bit integer output.
+let mut enc = WavEncoder::new(File::create("out.wav")?, 44_100, 2, SampleFormat::Int16)?;
+enc.encode(&interleaved_f32)?; // samples in [-1.0, 1.0]
+enc.finish()?;                 // patches the RIFF and data sizes
+```
+
+Runnable example: `cargo run -p tpt-av-cadence-wav --example wav_encode -- tone.wav`.
+
 ## License
 
 Dual-licensed under either of
