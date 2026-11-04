@@ -32,14 +32,14 @@ Order is the publish order. "Deps" lists internal crates that must be live first
 
 | # | Crate | Deps | Decision | Dry-run | Published | Date | Notes |
 |---|-------|------|----------|---------|-----------|------|-------|
-| 1 | `tpt-av-cadence-core` | none | **Publish** | [ ] | [ ] | | Traits, `StreamInfo`, error types. Everything else depends on it. |
-| 2 | `tpt-av-cadence-ogg` | core | **Publish** | [ ] | [ ] | | Ogg container (RFC 3533). Needed by vorbis and opus. |
-| 3 | `tpt-av-cadence-pcm` | core | **Publish** | [ ] | [ ] | | Raw headerless PCM. |
-| 4 | `tpt-av-cadence-wav` | core | **Publish** | [ ] | [ ] | | RIFF/WAVE PCM and float. |
-| 5 | `tpt-av-cadence-aiff` | core | **Publish** | [ ] | [ ] | | AIFF/AIFC. |
-| 6 | `tpt-av-cadence-flac` | core | **Publish** | [ ] | [ ] | | FLAC decoder and encoder. |
-| 7 | `tpt-av-cadence-vorbis` | core, ogg | **Publish** | [ ] | [ ] | | Ogg Vorbis I decoder and encoder. |
-| 8 | `tpt-av-cadence-opus` | core, ogg | **Publish** | [ ] | [ ] | | Opus decoder and encoder, Ogg Opus. |
+| 1 | `tpt-av-cadence-core` | none | **Publish** | [x] | [x] | 2026-11-04 | Traits, `StreamInfo`, error types. Everything else depends on it. |
+| 2 | `tpt-av-cadence-ogg` | core | **Publish** | [x] | [x] | 2026-11-04 | Ogg container (RFC 3533). Needed by vorbis and opus. |
+| 3 | `tpt-av-cadence-pcm` | core | **Publish** | [x] | [x] | 2026-11-04 | Raw headerless PCM. |
+| 4 | `tpt-av-cadence-wav` | core | **Publish** | [x] | [x] | 2026-11-04 | RIFF/WAVE PCM and float. |
+| 5 | `tpt-av-cadence-aiff` | core | **Publish** | [x] | [x] | 2026-11-04 | AIFF/AIFC. |
+| 6 | `tpt-av-cadence-flac` | core | **Publish** | [x] | [x] | 2026-11-04 | FLAC decoder and encoder. |
+| 7 | `tpt-av-cadence-vorbis` | core, ogg | **Publish** | [x] | [x] | 2026-11-04 | Ogg Vorbis I decoder and encoder. |
+| 8 | `tpt-av-cadence-opus` | core, ogg | **Publish** | [x] | [x] | 2026-11-04 | Opus decoder and encoder, Ogg Opus. |
 | 9 | `tpt-av-cadence-aac` | core | **Hold** | — | — | | Patent doubt. AAC encoder rejected 2026-09-26. See [On hold](#on-hold). |
 | 10 | `tpt-av-cadence-mp3` | core | **Hold** | — | — | | Patent doubt. MP3 work frozen 2026-10-07; crate contains an encoder. See [On hold](#on-hold). |
 | — | `tpt-av-cadence-cli` | all | **Never** | — | — | | `publish = false`. |
@@ -84,4 +84,4 @@ wording first.
 
 ## Log
 
-- 2026-11-04: Tracker created. Eight crates marked for publish; `aac` and `mp3` on hold; `cli`, `test-utils`, and `wasm-demo` marked never. Nothing published yet.
+- 2026-11-04: Published 0.1.0 of core, ogg, pcm, wav, aiff, flac, vorbis, opus to crates.io (crates.io rate limit on new crates forced retries for flac, vorbis, opus). Tracker created. Eight crates marked for publish; `aac` and `mp3` on hold; `cli`, `test-utils`, and `wasm-demo` marked never. 
