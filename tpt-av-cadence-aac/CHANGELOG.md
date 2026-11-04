@@ -8,12 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Parametric stereo (HE-AACv2) synthesis** (`sbr/ps.rs`, `sbr/ps_synth.rs`):
+  IID/ICC/IPD/OPD parsing and QMF-domain synthesis. Explicit AOT 29 streams and
+  implicitly signaled mono-core streams (first in-band PS payload) output stereo.
+  Validated against FFmpeg with `al_sbr_ps_04_new` at 129.2 dB whole-stream and
+  `al_sbr_ps_06_new` at a reduced gate (about 56 dB; one residual frame, see
+  `todo.md`).
+- 960/120-sample frames (`frameLengthFlag`): the ASC's GASpecificConfig flag
+  selects the short transform and scalefactor-band tables. Like the reference,
+  960-frame streams carry no SBR/PS. Conformance item `al04sf_48` now decodes.
 - Explicit HE-AAC `AudioSpecificConfig` signaling: AOT 5 hierarchical configs
   now preserve the AAC-LC core rate, expose the SBR extension/output rate,
   validate `sbrPresentFlag` and reserved frequency indices, and activate the
   existing SBR synthesis path from the first raw block. AOT 29 metadata is
-  parsed and identifies PS signaling, while the decoder rejects it explicitly
-  until PS synthesis is implemented.
+  parsed and identifies PS signaling; PS synthesis runs for those streams.
 
 - **SBR (Spectral Band Replication) — HE-AAC support.** A new `sbr` module
   ports the reference decoder's enhancement pipeline: SBR header/grid/
@@ -30,14 +38,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   filterbank and the frequency-table derivation are regression-tested
   against values produced by an independent build of the reference C
   code; the FATE HE-AAC sample (al_sbr_cm_48_2) decodes at 48 kHz with
-  full-length output and ~22 dB SNR versus FFmpeg's decode (gated >=20 dB
-  in the conformance test; the residual gap is documented in the README).
-  Known limitation: Parametric Stereo is not synthesized; PS IID/ICC/IPD/OPD
-  parameters are parsed and validated, but the payload currently falls back
-  to mono and explicit AOT 29 signaling is rejected.
+  full-length output. The sign fix listed under Fixed closed its original
+  ~22 dB SNR gap.
+  Known limitation (since resolved in part, see parametric stereo above):
+  the PS path is synthesized, but `al_sbr_ps_06_new` still has one residual
+  frame.
 
 ### Fixed
 
+- SBR grid border underflow panic on malformed VARVAR/FIXVAR frames: trailing
+  `t_env` borders now use `checked_sub` and return an error. Fuzz regression
+  in `tests/fuzz_regressions.rs`.
+- Channel elements are now processed per element (BEFORE_TNS coupling, TNS on
+  both channels, BETWEEN_TNS coupling, both IMDCTs, AFTER_IMDCT coupling). A
+  CPE's coupling no longer spills onto the next element or the LFE. Conformance
+  item `al07` now passes its gate.
+- Refill-retried block parses are idempotent: noise LCG, channel and CCE-scratch
+  window-shape state, coupled flags, and `window_seq_prev` are snapshotted and
+  restored per attempt, so a CCE is no longer applied twice. `al06`, `al15`,
+  and `al22` now pass their gates.
+- The CCE scratch channel no longer swaps with, and corrupts, real channel 0's
+  overlap-add state. PCE SIDE/BACK positions are split into separate rows.
+- CCE coupling targets are matched by PCE declaration-order index rather than
+  the raw element instance tag, matching the reference for PCEs whose element
+  order differs from output order.
+- Implicit PS also engages for stereo-signaled (channel config 2) streams whose
+  blocks carry a single SCE. Staging under `Order::Element` emits the PS-expanded
+  second channel, so the caller's interleaving stays aligned.
+- `BitReader::set_pos` no longer leaves a stale `overread` flag after correcting
+  a rounded-up read. Previously this rejected valid frames as corrupt.
+- SBR window-table sign bug: fixing it closed the ~22 dB fidelity gap on the
+  FATE HE-AAC sample.
 - The data-stream element count is EIGHT bits with a 255 escape byte
   (ISO/IEC 14496-3 Table 4.8), not four bits with a 15 escape; the
   misreading desynchronized every frame containing a non-trivial data

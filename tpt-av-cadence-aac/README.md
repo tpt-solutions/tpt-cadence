@@ -10,8 +10,11 @@ trips at 8-48 kHz in mono and stereo (123.6-125.5 dB measured), and on
 raw-framed streams (bit-identical to the ADTS path). HE-AAC/SBR reaches
 roughly 117-126 dB SNR on self-generated stereo fixtures and roughly
 117-133 dB per channel on a self-generated 5.1 fixture after the QMF-window
-and per-channel-element SBR-state fixes. Four official CCE/PCE coupling
-items still decode at reduced fidelity. See `tests/conformance.rs`.
+and per-channel-element SBR-state fixes. All eight FATE-mirrored official LC
+items pass their gates, including the multichannel CCE/PCE coupling items
+(al15 under a documented peak allowance). HE-AACv2 parametric stereo is
+synthesized; one frame of `al_sbr_ps_06_new` is still open. See
+`tests/conformance.rs`.
 
 ## Supported
 
@@ -25,8 +28,8 @@ items still decode at reduced fidelity. See `tests/conformance.rs`.
   sniffed channel order (see the channel-order note below).
 - **Real-world conformance:** the official ISO/IEC conformance items
   mirrored in FFmpeg's FATE suite decode through the MP4/esds entry point
-  (opt-in test, `AAC_FATE_SAMPLES_DIR`); four items pass at >120 dB SNR
-  and the multichannel coupling items at documented partial fidelity.
+  (opt-in test, `AAC_FATE_SAMPLES_DIR`), including the two HE-AACv2 PS items
+  and the 960-sample-frame item.
 - **Tools:** the full LC tool set — Huffman spectral coding with escapes,
   scalefactor deltas, Temporal Noise Shaping, Perceptual Noise Substitution,
   M/S and intensity stereo, all four window sequences with sine and KBD
@@ -36,7 +39,15 @@ items still decode at reduced fidelity. See `tests/conformance.rs`.
   extension output rate and full enhancement-band synthesis — QMF
   analysis/synthesis filterbanks, patch construction, envelope/noise mapping
   with the limiter, chirp-controlled inverse filtering, and sinusoid addition.
-  See "Not supported" for the PS and multichannel limitations.
+  See "Not supported" for the remaining limitations.
+- **Parametric stereo (HE-AACv2):** explicit AOT 29 signaling and implicit
+  PS. A mono-core stream whose first in-band SBR payload carries PS flips to
+  stereo output, and stereo-signaled streams carrying a single SCE are
+  expanded the same way. PS parameters are parsed and synthesized in the QMF
+  domain.
+- **Frame lengths:** 1024-sample frames and 960-sample frames
+  (`frameLengthFlag`, 120-sample short blocks). 960-frame streams carry no SBR
+  or PS, matching the reference decoder.
 - **Seek:** decode-and-discard, sample-frame accurate at transform (1024
   sample) granularity. `seek()` may block and allocate; it is not real-time
   safe (per the core `Decoder` contract).
@@ -46,14 +57,12 @@ items still decode at reduced fidelity. See `tests/conformance.rs`.
 
 ## Not supported
 
-- **Parametric stereo (HE-AACv2):** implicit PS payloads are skipped, so a
-  mono-core stream decodes as mono. Explicit AOT 29 signaling is parsed by
-  `AudioSpecificConfig` but rejected by `AacDecoder` rather than silently
-  downmixed. Four official CCE/PCE coupling conformance items still decode at
-  reduced fidelity while their interaction with program-config state is
-  investigated.
-- **960/480-sample frames** (GASpecificConfig `frameLengthFlag = 1`) and
-  gain control — not part of AAC-LC.
+- **PS fidelity:** `al_sbr_ps_06_new` matches FFmpeg at about 56 dB over the
+  whole stream, but frame 189 of 212 (about 33 dB, on both channels) differs
+  because carried PS synthesis state entering that frame is not yet identical.
+  PS parameter parsing is verified bit-identical to FFmpeg. See `todo.md`.
+- **480-sample frames** (LD/ELD, not AAC-LC) and gain control are not
+  supported.
 - **LTP data** is parsed for bitstream alignment (LC streams may carry it)
   but not applied, matching the reference decoder's LC behavior.
 
