@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Examples: `opus_encode` (`celt`, `vbr`, `silk`, or `hybrid` mode), `opus_decode`.
+  Criterion bench: `silk_round_trip`.
 - CELT encoder (`celt::encoder::CeltEncoder`) and Ogg Opus writer
   (`OggOpusEncoder`, implementing the core `Encoder` trait): 48 kHz
   mono/stereo, fullband, all four CELT frame sizes. Transient detection
@@ -58,6 +60,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   continuity, unseekable-source seek rejection) plus an `#[ignore]`d test
   muxing an official SILK-only vector's packets into Ogg pages and
   checking bit-exact PCM against the bundled `.dec`.
+
+### Changed
+
+- Performance pass (2026-10-06): `RangeEncoder::done_len()` replaces
+  `enc.clone().done().len()` in every CBR sizing probe, so sizing no longer clones
+  the encoder. The alg-quant, NSQ, noise-shape, and delayed-decision scratch, plus
+  the SILK snapshots, moved to fixed arrays, which removes per-frame heap
+  allocation from that state.
 
 ### Fixed
 
