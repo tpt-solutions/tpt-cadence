@@ -5,7 +5,7 @@ AIFF/AIFC (big-endian IFF) parser and decoder for the `tpt-cadence` audio codec 
 **Status:** ✅ Stable, bit-exact conformance tested. Supports the classic AIFF
 encodings (signed 8/16/24/32-bit big-endian PCM) and the AIFF-C compression
 types `NONE`, `twos` (big-endian PCM), `sowt` (little-endian PCM), `FL32`,
-`in24`, and `ni24`. Compressed types such as `ima4`, `ULAW`, and `ALAW` are
+`FL64`, `in24`, and `ni24`. Compressed types such as `ima4`, `ULAW`, and `ALAW` are
 rejected with `CadenceError::UnsupportedFeature`.
 
 ## Usage
@@ -24,6 +24,23 @@ loop {
         break;
     }
 }
+```
+
+## Encoding
+
+`AiffEncoder` writes an AIFF-C file. Integer sample formats use the `NONE`
+compression type, and `Float32`/`Float64` use `FL32`/`FL64`. The `SSND` and
+`FORM` sizes are patched in `finish()`. Runnable example:
+`cargo run -p tpt-av-cadence-aiff --example aiff_encode -- tone.aiff`.
+
+```rust
+use std::fs::File;
+use tpt_av_cadence_core::{Encoder, SampleFormat};
+use tpt_av_cadence_aiff::AiffEncoder;
+
+let mut enc = AiffEncoder::new(File::create("out.aif")?, 44_100, 2, SampleFormat::Int16)?;
+enc.encode(&interleaved_f32)?;
+enc.finish()?;
 ```
 
 ## License

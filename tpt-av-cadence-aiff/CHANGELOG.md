@@ -14,6 +14,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   compression types `NONE`, `twos`, `sowt`, `FL32`, `in24`, and `ni24`.
 - `ima4`, `ULAW`, and `ALAW` are explicitly rejected as unsupported.
 - Bit-exact conformance tests.
+- `AiffEncoder` (`encode`/`finish`): writes AIFF-C with `NONE` for 8/16/24/32-bit
+  integer input and `FL32`/`FL64` for float input. Example: `aiff_encode`.
+- Decoder accepts `FL64` (64-bit float) as well as `FL32`.
+
+### Changed
+
+- Bulk-slab decode with format dispatch hoisted out of the per-sample loop
+  (11-14x on the container decode benches, bit-identical output; performance
+  pass, 2026-10-06).
 
 ### Added
 
