@@ -5,8 +5,8 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # Nightly fuzz run (03:00 UTC) — see the `fuzz` job below.
-    - cron: "0 3 * * *"
+    # Weekly fuzz run (Sundays 03:00 UTC) — see the `fuzz` job below.
+    - cron: "0 3 * * 0"
   workflow_dispatch:
 
 env:
@@ -188,31 +188,27 @@ jobs:
         with:
           toolchain: stable
 
+      # On push/dispatch the run step below compiles the same targets, so the
+      # separate compile-check is only needed for PRs and scheduled runs.
       - name: Compile-check all benches
+        if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
         run: cargo bench --workspace --no-run
 
       - name: Run benches
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        # `cargo bench --workspace` also invokes each crate's plain lib
-        # unittest binary (not just its `[[bench]]` target), and that
-        # binary's default libtest harness doesn't understand criterion's
-        # `--output-format` flag — so each `[[bench]]` target is run
-        # explicitly by name instead of blanket `--workspace`.
+        # One cargo invocation for all 12 bench targets instead of one per
+        # target: cargo startup and dependency resolution happen once, and
+        # the whole set is built with the same feature unification as the
+        # compile-check. `--bench NAME` selects only the named `[[bench]]`
+        # targets, so each crate's lib unittest binary (whose libtest harness
+        # rejects criterion's `--output-format`) is not invoked.
+        # `pipefail` makes a failing bench fail the step despite the `tee`.
         run: |
-          set -e
-          : > bench-output.txt
-          cargo bench -p tpt-av-cadence-wav --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-aiff --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-pcm --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-flac --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-flac --bench encode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-mp3 --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-mp3 --bench encode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-aac --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-vorbis --bench decode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-vorbis --bench encode -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-opus --bench celt_round_trip -- --output-format bencher | tee -a bench-output.txt
-          cargo bench -p tpt-av-cadence-opus --bench silk_round_trip -- --output-format bencher | tee -a bench-output.txt
+          set -o pipefail
+          cargo bench --workspace \
+            --bench decode --bench encode \
+            --bench celt_round_trip --bench silk_round_trip \
+            -- --output-format bencher | tee bench-output.txt
 
       - name: Upload bench results
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -247,7 +243,7 @@ jobs:
           name: conformance-dashboard-${{ github.sha }}
           path: CONFORMANCE.md
 
-  # Nightly (scheduled) fuzz sweep. Also runs on manual dispatch, but not on
+  # Weekly (scheduled) fuzz sweep. Also runs on manual dispatch, but not on
   # every push/PR — each target gets a fixed time budget rather than gating
   # normal CI latency on fuzzing. No rust-cache here: cargo-fuzz builds in
   # `fuzz/target` with a nightly toolchain, which would churn the cache.
