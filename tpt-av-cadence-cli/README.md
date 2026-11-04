@@ -23,6 +23,20 @@ metadata — so it isn't covered by this tool; see
 `tpt-av-cadence-pcm/examples/pcm_decode.rs`, which takes the sample format,
 channel count, and sample rate on the command line instead.
 
-`decode` writes a plain 16-bit PCM WAV (hand-rolled in `main.rs`): the suite
-doesn't ship any encoders yet, so this is the simplest way to get a
-universally-playable file out of any supported input.
+`decode` writes a plain 16-bit PCM WAV through a small buffered writer in
+`main.rs`. It is a convenience for playing any supported input, not a
+general encoder. For encoding, use the per-format encoders (`WavEncoder`,
+`FlacEncoder`, `Mp3Encoder`, `VorbisEncoder`, `OggOpusEncoder`, and others),
+which each have an example.
+
+## Feature flags
+
+Every format is on by default. To build a smaller binary, select formats
+explicitly:
+
+```sh
+cargo build -p tpt-av-cadence-cli --no-default-features --features wav,flac
+```
+
+Available features: `wav`, `aiff`, `flac`, `mp3`, `aac`, `opus`, `vorbis`.
+Headerless PCM is not a feature because the CLI does not auto-detect it.
