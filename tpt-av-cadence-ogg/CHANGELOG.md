@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   granule + BOS/EOS metadata per completed packet, byte-position reset for
   seek support, and chained-link (fresh BOS) end-of-link detection.
 - `page_crc`: the Ogg CRC-32, exposed for test-side page muxing.
+- `OggPageWriter`: page writer for one logical stream (`write_page`), used by the
+  Ogg Vorbis and Ogg Opus encoders. Note: an earlier draft of the Ogg Opus
+  writer emitted its final page with `bos=true`, which made `PageReader` drop the
+  last frame as a chained link. That was fixed in `216592d`.
 - Extracted from `tpt-av-cadence-vorbis`'s private `ogg` module so Opus
   (RFC 7845) can share the same container layer.
 

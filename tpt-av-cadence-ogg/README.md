@@ -13,8 +13,11 @@ Provides:
   one logical stream, carrying the granule position and BOS/EOS flags of
   the page each packet completed on; supports seek (byte-position reset)
   and chained-link detection.
-- `page_crc`: the Ogg CRC-32 (poly 0x04c11db7, MSB-first), exposed for
-  test-side page muxing.
+- `OggPageWriter`: builds the page sequence for one logical stream
+  (`write_page(packet, granule, bos, eos)` returns the page bytes). The Ogg
+  Vorbis and Ogg Opus encoders use it.
+- `page_crc`: the Ogg CRC-32 (poly 0x04c11db7, MSB-first), used by the writer
+  and exposed for test-side page muxing.
 
 Header semantics (`OpusHead`, Vorbis identification/comment headers) are
 codec-specific and live in the codec crates.
